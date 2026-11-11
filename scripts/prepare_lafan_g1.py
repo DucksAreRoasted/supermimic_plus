@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import subprocess
+import os
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,7 @@ def main() -> None:
   args = parser.parse_args()
 
   args.root.parent.mkdir(parents=True, exist_ok=True)
+  os.environ["PATH"] = f"{Path.home() / '.local/bin'}:{os.environ['PATH']}"
   if not args.root.exists() or not any(args.root.glob("**/*.csv")):
     if not shutil.which("modelscope"):
       subprocess.run(["uv", "tool", "install", "modelscope-hub"], check=True)
