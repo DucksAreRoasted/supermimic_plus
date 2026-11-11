@@ -10,7 +10,12 @@ CLIP="${CLIP:-walk1_subject1}"
 RUN_ROOT="${RUN_ROOT:-logs/g1_critic_comparison}"
 
 MOTION_FILE="$DATA_ROOT/npz/$CLIP.npz"
-if [[ ! -f "$MOTION_FILE" ]]; then
+if [[ "$MOTION_FILE" == *'*'* || "$MOTION_FILE" == *'?'* ]]; then
+  compgen -G "$MOTION_FILE" >/dev/null || {
+    echo "No motion files matched $MOTION_FILE; run scripts/prepare_lafan_g1.py first." >&2
+    exit 1
+  }
+elif [[ ! -f "$MOTION_FILE" ]]; then
   echo "Missing $MOTION_FILE; run scripts/prepare_lafan_g1.py first." >&2
   exit 1
 fi
