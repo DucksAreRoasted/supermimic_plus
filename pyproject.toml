@@ -9,7 +9,7 @@ description = "SuperTrack implementation."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "mjlab",
     "ruff>=0.14.10",
