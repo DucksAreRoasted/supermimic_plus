@@ -15,21 +15,21 @@
 
 将单个 critic 改为两个参数独立的 critic：
 
-\[
+$$
 V_{\theta_1}(s), \quad V_{\theta_2}(s)
-\]
+$$
 
 训练时两个网络都回归同一个 target，actor 更新和 advantage 计算使用保守值：
 
-\[
-V_{\mathrm{safe}}(s)=\min(V_{\theta_1}(s),V_{\theta_2}(s))
-\]
+$$
+V_{\mathrm{safe}}(s) = \min\bigl(V_{\theta_1}(s),\, V_{\theta_2}(s)\bigr)
+$$
 
 对于基于 action 的目标，也可以使用 TD3/SAC 风格的 clipped minimum：
 
-\[
-y_t=r_t+\gamma(1-d_t)\min(Q_{\theta_1}(s_{t+1},a_{t+1}),Q_{\theta_2}(s_{t+1},a_{t+1}))
-\]
+$$
+y_t = r_t + \gamma(1 - d_t)\, \min\bigl(Q_{\theta_1}(s_{t+1}, a_{t+1}),\, Q_{\theta_2}(s_{t+1}, a_{t+1})\bigr)
+$$
 
 在当前 PPO critic 上，最小可行改动是：
 
@@ -45,15 +45,15 @@ y_t=r_t+\gamma(1-d_t)\min(Q_{\theta_1}(s_{t+1},a_{t+1}),Q_{\theta_2}(s_{t+1},a_{
 
 当前 critic 只估计期望回报：
 
-\[
-V(s)=E[G_t\mid s]
-\]
+$$
+V(s) = \mathbb{E}\left[ G_t \mid s \right]
+$$
 
 但 motion tracking 的回报可能因为接触失败、终止概率、姿态误差和动作平滑度而呈现较大方差，甚至具有多峰特征。可以让 critic 预测多个 return quantile：
 
-\[
-\{q_{\tau}(s)\}_{\tau\in\mathcal{T}}
-\]
+$$
+\left\{ q_{\tau}(s) \right\}_{\tau \in \mathcal{T}}
+$$
 
 建议首先尝试 8～16 个 quantiles，并使用 quantile Huber loss 训练。actor 可以使用：
 
@@ -92,24 +92,26 @@ critic_input = [
 
 如果计算资源允许，可以使用 5 个较小的 critic，而不是 2 个较大的 critic：
 
-\[
-\bar V(s)=\mathrm{mean}_i V_i(s),\qquad
-\sigma_V(s)=\mathrm{std}_i V_i(s)
-\]
+$$
+\begin{aligned}
+\bar V(s) &= \mathrm{mean}_i\, V_i(s),\\
+\sigma_V(s) &= \mathrm{std}_i\, V_i(s)
+\end{aligned}
+$$
 
 actor 使用带不确定性惩罚的保守 value：
 
-\[
-V_{\mathrm{safe}}(s)=\bar V(s)-\beta\sigma_V(s)
-\]
+$$
+V_{\mathrm{safe}}(s) = \bar V(s) - \beta\, \sigma_V(s)
+$$
 
-其中 \(\beta\) 在训练早期取较大值，随着 world model 稳定逐步衰减。
+其中 $\beta$ 在训练早期取较大值，随着 world model 稳定逐步衰减。
 
 对应的 conservative advantage 可以写成：
 
-\[
-A_{\mathrm{safe}}=\bar V-\beta\sigma_V
-\]
+$$
+A_{\mathrm{safe}} = \bar V - \beta\, \sigma_V
+$$
 
 这个机制能够主动抑制 actor 进入 critic 不确定、world model 可能失真的状态区域。
 
@@ -134,7 +136,7 @@ self.critic(obs["critic"]).clamp(max=self._v_max)
 
 ```text
 value_clip_fraction
- target_percentile_01 / target_percentile_99
+target_percentile_01 / target_percentile_99
 critic_td_error
 advantage_std
 V1_minus_V2
@@ -144,16 +146,16 @@ V1_minus_V2
 
 长 imagined rollout 使用纯 Monte Carlo return 时方差较大；只使用一步 TD 又可能产生较大偏差。可以混合 multi-step TD 和 GAE：
 
-\[
-y=\lambda GAE+(1-\lambda)TD(k)
-\]
+$$
+y = \lambda\, \mathrm{GAE} + (1 - \lambda)\, \mathrm{TD}(k)
+$$
 
 建议根据 world model 质量调整：
 
 - 真实数据阶段：更偏向 Monte Carlo target；
 - imagined rollout 阶段：优先使用 3～5 step TD；
-- world model 早期：较短 rollout、较低 \(\lambda\)；
-- world model 稳定后：逐步增加 rollout horizon 和 \(\lambda\)。
+- world model 早期：较短 rollout、较低 $\lambda$；
+- world model 稳定后：逐步增加 rollout horizon 和 $\lambda$。
 
 这样可以让 critic 的 target 随模型质量变化，而不是始终使用固定的 GAE 配置。
 
@@ -202,13 +204,13 @@ TD 残差保留 soft done 的折扣含义，不与 GAE target 回归误差混用
 
 1. 尝试 8～16 quantile 的 distributional critic；
 2. 比较 quantile critic 与 value ensemble；
-3. 根据验证环境性能调节不确定性惩罚系数 \(\beta\)。
+3. 根据验证环境性能调节不确定性惩罚系数 $\beta$。
 
 ### 阶段 4：优化 target
 
 1. 引入 3～5 step TD target；
 2. 与 GAE 混合；
-3. 根据 world model 训练阶段动态调整 horizon 和 \(\lambda\)。
+3. 根据 world model 训练阶段动态调整 horizon 和 $\lambda$。
 
 ## 实验与消融
 
