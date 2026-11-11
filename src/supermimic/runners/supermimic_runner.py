@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import os
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -39,7 +39,7 @@ from supermimic.utils.helpers import (
   unpack_obs_dims,
 )
 from supermimic.utils.logger import Logger
-from supermimic.utils.wandb_artifacts import download_model_dir, log_model_artifact
+from supermimic.utils.wandb_artifacts import download_model_dir
 
 
 @dataclass
@@ -460,39 +460,16 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir = Path("logs", self.task_id, *extra_parts, timestamp)
     log_dir.mkdir(parents=True, exist_ok=True)
+    self.logger.set_log_dir(str(log_dir))
     print(f"[INFO] Logging to {log_dir}")
     return log_dir
 
-  def _init_wandb(self, log_dir: Path, name_suffix: str = "") -> None:
-    """Initialize the W&B run and link the registry artifacts."""
-    wandb_config = {
-      "env_cfg": asdict(self.env.cfg),
-      "runner_cfg": asdict(self.cfg),
-    }
-
-    default_name = f"{self.task_id}{name_suffix}-{log_dir.name}"
-    wandb.init(
-      project=self.cfg.wandb_project,
-      name=self.cfg.run_name or default_name,
-      config=wandb_config,
-    )
-
-    if self.registry_name:
-      api = wandb.Api()
-      for name in self.registry_name.split(","):
-        name = name.strip()
-        if ":" not in name:
-          name = name + ":latest"
-        print(f"[INFO] Linking registry artifact: {name}")
-        artifact = api.artifact(name)
-        wandb.run.use_artifact(artifact)
-
   def _cleanup(self) -> None:
-    """Close environment and finish W&B run."""
+    """Close environment and TensorBoard writer."""
     env_close_fn = getattr(self.env, "close", None)
     if env_close_fn:
       env_close_fn()
-    wandb.finish()
+    self.logger.close()
 
 
 class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
@@ -515,7 +492,12 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     ):
       print(f"  {ts.name}: [{lo}, {hi}) — goal_dim={ts.goal_dim}")
     _, critic_input_dim = self._policy_input_dims()
-    critic = build_mlp(
+    critic1 = build_mlp(
+      critic_input_dim,
+      self.cfg.critic_hidden_dims,
+      output_dim=1,
+    ).to(self.device)
+    critic2 = build_mlp(
       critic_input_dim,
       self.cfg.critic_hidden_dims,
       output_dim=1,
@@ -534,7 +516,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       termination_softness=self.cfg.termination_softness,
       device=self.device,
     )
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1":
       self.wm_env.step = torch.compile(self.wm_env.step)
       self.wm_env.reset = torch.compile(self.wm_env.reset)
 
@@ -542,7 +524,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     if isinstance(policy_cfg, ActorCriticPolicyLearnerCfg):
       self.policy_learner = ActorCriticPolicyLearner(
-        actor, critic, self.wm_env, policy_cfg, device=self.device
+        actor, critic1, critic2, self.wm_env, policy_cfg, device=self.device
       )
     else:
       self.policy_learner = BpttPolicyLearner(
@@ -653,7 +635,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
   def run(self) -> None:
     log_dir = self._create_log_dir()
-    self._init_wandb(log_dir)
+    print(f"[INFO] TensorBoard logs: {log_dir}")
 
     self.env.reset()
     self._seed_sim_history()
@@ -674,9 +656,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     policy_learn_time = 0.0
     loss_dict: dict[str, torch.Tensor] = {}
     log_count = 0
-    uploader = ThreadPoolExecutor(max_workers=1)
-    upload: Future | None = None
-
     for step in range(self.cfg.max_iterations):
       num_collected_steps += self.step()
 
@@ -722,10 +701,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         num_collected_steps = 0
 
       if step % self.cfg.save_interval == 0:
-        assert wandb.run is not None  # _init_wandb ran before the loop
         # The previous version must be logged before its files are overwritten.
-        if upload is not None:
-          upload.result()
         world_model_path = str(log_dir / "world_model.pt")
         actor_path = str(log_dir / "actor.pt")
         torch.save(self._wm.bundle(), world_model_path)
@@ -745,10 +721,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
             actor=self.policy_learner.actor,
             env=self.env.unwrapped,
             path=str(log_dir),
-            run_name=wandb.run.name,
+            run_name=self.cfg.run_name or self.task_id,
             term_widths=self._representation.proprio_term_widths(self._num_actions),
           )
-        upload = uploader.submit(log_model_artifact, checkpoint_files)
+        print(f"[INFO] Saved checkpoint: {', '.join(checkpoint_files)}")
 
-    uploader.shutdown()
     self._cleanup()

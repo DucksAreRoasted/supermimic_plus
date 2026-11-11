@@ -218,3 +218,4 @@ __marimo__/
 **/logs/
 **/wandb/*
 **/artifacts/
+data/modelscope/

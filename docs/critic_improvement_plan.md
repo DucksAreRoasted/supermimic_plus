@@ -167,6 +167,30 @@ y=\lambda GAE+(1-\lambda)TD(k)
 4. 去掉或替换硬 `v_max` 截断；
 5. 增加 value、TD error 和 critic disagreement 日志。
 
+#### 阶段 1 监控实现
+
+`ActorCriticPolicyLearner` 将以下标量以 `Policy/` 前缀送入现有 W&B
+和控制台日志。除 `value_function` 为优化过程的平均 Huber loss 外，
+监控使用每个 imagined batch 拟合 critic 前的快照；多个 batch 的指标取算术平均，
+包括各 batch 的标准差、分位数和极值，并非合并所有样本后重新计算。
+
+| 指标 | 含义 |
+| --- | --- |
+| `value_mean/std/min/max` | 保守值 `min(V1, V2)` 的分布 |
+| `value_1_mean`, `value_2_mean` | 两个 critic 各自的均值 |
+| `critic_td_error`, `critic_td_error_abs/rms` | 一步 TD 残差的均值、绝对均值、均方根；残差为 `r + gamma * (1-done) * V_next - V` |
+| `critic_disagreement_mean/var/abs` | `V1 - V2` 的均值、总体方差、绝对均值 |
+| `advantage_std` | `GAE return - V` 的总体标准差 |
+| `target_mean/std`, `target_percentile_01/99` | GAE target 的均值、总体标准差、线性插值分位数 |
+| `value_above_bound_fraction` | 两个 critic 的原始输出超过 `max_step_reward / (1-gamma)` 的样本比例；仅有限奖励上界且 `gamma < 1` 时记录 |
+
+超界比例只监测，不执行截断，因此不命名为 `value_clip_fraction`。
+TD 残差保留 soft done 的折扣含义，不与 GAE target 回归误差混用。
+所有诊断均返回无梯度的设备标量，分位数使用固定形状排序与插值，避免在更新中引入主机同步。
+新增测试覆盖手算 TD/GAE、双 critic 差异、超界比例和无有限上界的场景。
+已在 runner 中分别构造两个在线 critic，并在 learner 构造时拒绝参数存储共享；
+尚未完成真实训练和 CUDA graph 性能验证。
+
 ### 阶段 2：加入 world model awareness
 
 1. 计算并维护 prediction error EMA；

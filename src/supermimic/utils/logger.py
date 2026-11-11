@@ -5,12 +5,11 @@ import time
 from collections import deque
 
 import torch
-import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 
 class Logger:
-  """Episode statistics of the real env, logged as one W&B row and one console
-  block per log call."""
+  """Episode statistics of the real env, logged to TensorBoard and console."""
 
   def __init__(
     self,
@@ -18,11 +17,19 @@ class Logger:
     num_envs: int,
     max_episode_length: int,
     device: str,
+    log_dir: str | None = None,
   ) -> None:
     self.run_name = run_name
     self.num_envs = num_envs
     self.max_episode_length = max_episode_length
     self.device = device
+    self.writer = SummaryWriter(log_dir) if log_dir else None
+
+  def set_log_dir(self, log_dir: str) -> None:
+    """Attach the TensorBoard writer after the runner creates its run directory."""
+    if self.writer is not None:
+      self.writer.close()
+    self.writer = SummaryWriter(log_dir)
 
     self.tot_timesteps = 0
     self.tot_time = 0.0
@@ -177,7 +184,10 @@ class Logger:
       row["Train/mean_reward"] = statistics.mean(self.rewbuffer)
       row["Train/mean_episode_length"] = statistics.mean(self.lenbuffer)
     row |= {k if "/" in k else f"Episode/{k}": v for k, v in extras.items()}
-    wandb.log(row, step=it)
+    if self.writer is not None:
+      for key, value in row.items():
+        self.writer.add_scalar(key, value, it)
+      self.writer.flush()
     print(
       self._build_console_log(
         it,
@@ -194,3 +204,7 @@ class Logger:
       )
     )
     self.ep_extras.clear()
+
+  def close(self) -> None:
+    if self.writer is not None:
+      self.writer.close()
