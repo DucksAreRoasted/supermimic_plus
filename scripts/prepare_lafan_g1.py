@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -24,6 +25,8 @@ def main() -> None:
 
   args.root.parent.mkdir(parents=True, exist_ok=True)
   if not args.root.exists() or not any(args.root.glob("**/*.csv")):
+    if not shutil.which("modelscope"):
+      subprocess.run(["uv", "tool", "install", "modelscope"], check=True)
     subprocess.run(
       [
         "modelscope",
