@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
@@ -158,15 +159,22 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     device: str = "cpu",
   ):
     super().__init__(policy, wm_env, cfg, device)
-    self.critic = critic
-    self.critic_optimizers = build_optimizers([critic], self.cfg.lr, device=device)
-    self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)
+    self.critics = nn.ModuleList([critic, deepcopy(critic)])
+    self.critic_optimizers = build_optimizers([self.critics], self.cfg.lr, device=device)
+
+  @property
+  def critic(self) -> nn.Module:
+    """Primary critic kept as a compatibility view for existing callers."""
+    return self.critics[0]
+
+  def _values(self, obs: torch.Tensor) -> torch.Tensor:
+    return torch.stack([module(obs) for module in self.critics], dim=0)
 
   def _bootstrap(
     self, obs: TensorDict, survival: torch.Tensor, term_prob: torch.Tensor
   ) -> torch.Tensor:
-    self.critic.requires_grad_(False)
-    value = self.critic(obs["critic"]).clamp(max=self._v_max).squeeze(-1)
+    self.critics.requires_grad_(False)
+    value = self._values(obs["critic"]).amin(dim=0).squeeze(-1)
     alive = survival if self.cfg.survival_masking else 1.0 - term_prob
     return self.cfg.gamma**self.cfg.horizon * value * alive
 
@@ -175,8 +183,10 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
   ) -> dict[str, torch.Tensor]:
     steps = torch.stack(rollout)
     with torch.no_grad():
-      values = self.critic(steps["critic"])
-      last_value = self.critic(last_obs["critic"])
+      values = self._values(steps["critic"])
+      last_value = self._values(last_obs["critic"])
+      values = values.amin(dim=0)
+      last_value = last_value.amin(dim=0)
     returns = gae_returns(
       values,
       last_value,
@@ -184,19 +194,21 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       steps["done"].unsqueeze(-1),
       self.cfg.gamma,
       self.cfg.lam,
-    ).clamp(max=self._v_max)
+    )
     obs, returns = steps["critic"].flatten(0, 1), returns.flatten(0, 1)
     perm = torch.randperm(len(returns) // 4 * 4, device=returns.device)
-    self.critic.requires_grad_(True)
+    self.critics.requires_grad_(True)
     losses = []
     for _ in range(5):
       for idx in perm.view(4, -1):
-        loss = (returns[idx] - self.critic(obs[idx])).pow(2).mean()
+        prediction = self._values(obs[idx])
+        target = returns[idx].unsqueeze(0).expand_as(prediction)
+        loss = torch.nn.functional.huber_loss(prediction, target)
         _optimize_step(
-          self.critic_optimizers, loss, self.critic.parameters(), max_norm=1.0
+          self.critic_optimizers, loss, self.critics.parameters(), max_norm=1.0
         )
         losses.append(loss.detach())
     return {"value_function": torch.stack(losses).mean()}
 
   def _graph_state(self) -> list[torch.Tensor]:
-    return super()._graph_state() + graph_state([self.critic], self.critic_optimizers)
+    return super()._graph_state() + graph_state([self.critics], self.critic_optimizers)
