@@ -219,3 +219,4 @@ __marimo__/
 **/wandb/*
 **/artifacts/
 data/modelscope/
+third_party/
