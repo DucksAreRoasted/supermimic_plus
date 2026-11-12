@@ -685,8 +685,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         collect_time = elapsed_time - total_train_time
 
         self.logger.log(
-          it=log_count,
-          total_it=self.cfg.max_iterations // self.cfg.log_interval,
+          it=step,
+          total_it=self.cfg.max_iterations,
           collect_time=collect_time,
           wm_learn_time=wm_learn_time,
           policy_learn_time=policy_learn_time,
@@ -700,7 +700,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         policy_learn_time = 0
         num_collected_steps = 0
 
-      if step % self.cfg.save_interval == 0:
+      if (step + 1) % self.cfg.save_interval == 0 or step + 1 == self.cfg.max_iterations:
         # The previous version must be logged before its files are overwritten.
         world_model_path = str(log_dir / "world_model.pt")
         actor_path = str(log_dir / "actor.pt")
