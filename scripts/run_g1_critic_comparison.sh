@@ -3,10 +3,11 @@ set -euo pipefail
 
 # Override these for the target server.
 NUM_ENVS="${NUM_ENVS:-4096}"
-MAX_ITERATIONS="${MAX_ITERATIONS:-10000}"
+MAX_ITERATIONS="${MAX_ITERATIONS:-1000000}"
 DEVICE="${DEVICE:-cuda:0}"
+SEED="${SEED:-42}"
 DATA_ROOT="${DATA_ROOT:-data/modelscope/LAFAN1_Retargeting_Dataset}"
-CLIP="${CLIP:-walk1_subject1}"
+CLIP="${CLIP:-*}"
 RUN_ROOT="${RUN_ROOT:-logs/g1_critic_comparison}"
 
 MOTION_FILE="$DATA_ROOT/npz/$CLIP.npz"
@@ -25,13 +26,14 @@ common_args=(
   --motion-file "$MOTION_FILE"
   --num-envs "$NUM_ENVS"
   --device "$DEVICE"
+  --env.seed "$SEED"
   --runner.max-iterations "$MAX_ITERATIONS"
-  --runner.log-interval 100
-  --runner.save-interval "$MAX_ITERATIONS"
+  --runner.log-interval 10
+  --runner.save-interval 1000
   --runner.replay-ratio 16
-  --runner.wm.num-batches 1
-  --runner.wm.batch-size 4096
-  --runner.wm.horizon 32
+  --runner.wm.num-batches 10
+  --runner.wm.batch-size 2048
+  --runner.wm.horizon 8
   --runner.policy.num-batches 1
   --runner.policy.batch-size 4096
   --runner.policy.horizon 32
@@ -40,14 +42,16 @@ common_args=(
 export SUPERMIMIC_DISABLE_COMPILE="${SUPERMIMIC_DISABLE_COMPILE:-0}"
 mkdir -p "$RUN_ROOT"
 
-echo "=== Original single critic ==="
+echo "Motion files: $MOTION_FILE (one shared policy across all matched clips)"
+echo "Matched training budget: $MAX_ITERATIONS iterations per variant; seed=$SEED"
+echo "=== Official single critic: unmodified MSE + value/return clamp ==="
 uv run src/supermimic/scripts/train.py "${common_args[@]}" \
-  --runner.policy.twin-critic False \
-  --runner.run-name g1-single-critic
+  --runner.critic-variant official \
+  --runner.run-name g1-official-single-critic-lafan
 
 echo "=== Stage 1 twin critic ==="
 uv run src/supermimic/scripts/train.py "${common_args[@]}" \
-  --runner.policy.twin-critic True \
-  --runner.run-name g1-twin-critic
+  --runner.critic-variant twin \
+  --runner.run-name g1-twin-critic-lafan
 
 echo "TensorBoard: tensorboard --logdir logs"

@@ -259,6 +259,15 @@ class SuperMimicViewerMixin:
         _, _, dones, _ = self.env.step(actions)
         self._step_count += 1
         self._stats_steps += 1
+        if self._step_count == 100:
+          print("[INFO] Playback verified: 100 policy simulation steps", flush=True)
+
+        if not self.show_wm_prediction:
+          if dones.any():
+            self.reset_env_supermimic()
+          else:
+            self.step_in_rollout += 1
+          return True
 
         # Predict Next State (WM)
         wm_goal, _ = self.representation.compute_wm_goal(
@@ -330,6 +339,7 @@ class SuperMimicViewerMixin:
       return True
     except Exception as exc:
       self._last_error = f"{type(exc).__name__}: {exc}"
+      print(f"[ERROR] Playback paused: {self._last_error}", flush=True)
       self.pause()
       return False
 
@@ -346,9 +356,11 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     sim_context: SimContext,
     task_specs: list[TaskSpec],
     initial_task: str = "motion",
+    show_wm_prediction: bool = True,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
+    self.show_wm_prediction = show_wm_prediction
     self.setup_supermimic(
       dynamics,
       representation,
@@ -377,9 +389,11 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     sim_context: SimContext,
     task_specs: list[TaskSpec],
     initial_task: str = "motion",
+    show_wm_prediction: bool = True,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
+    self.show_wm_prediction = show_wm_prediction
     self.setup_supermimic(
       dynamics,
       representation,

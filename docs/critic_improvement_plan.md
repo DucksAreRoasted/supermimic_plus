@@ -1,5 +1,27 @@
 # SuperMimic Critic 改进方案
 
+## 固定官方基线
+
+单 critic 指官方提交 `5efbf114e11f725c31d83e217be987c13c0e4ce2` 的原版实现。
+`src/supermimic/learners/policy_learner.py` 与该提交逐字节一致，保留 MSE、
+bootstrap value clamp 和 GAE return clamp；不向此文件加入实验逻辑或诊断。
+文件 SHA-256 由 `tests/test_official_baseline.py` 固定。
+
+`--runner.critic-variant official` 默认选择官方类；`twin` 选择独立文件
+`twin_policy_learner.py` 中的 `TwinActorCriticPolicyLearner`。Huber、取消
+clamp、双 critic 和以下新增监控均只属于实验分支。官方分支只初始化一个
+critic，避免额外网络初始化消耗随机数；保存的 critic 也保持官方 state_dict 格式。
+
+两组共同采用官方默认超参数：4096 个环境、replay ratio 16、WM 每次 10 个
+2048×8 batch、policy 每次 1 个 4096×32 batch、gamma=0.99、lambda=0.95。
+默认上限为 1,000,000 次迭代，每 1000 次保存。允许通过 `MAX_ITERATIONS`
+明确缩短实验，但这种情况应记录为训练预算覆盖，不能再称默认训练预算。
+
+默认任务是同一个策略联合学习本地 LAFAN 的 40 段动作（`npz/*.npz`），
+不是每段单独训练。两组使用同一个 motion glob；多动作数据集是明确的
+实验数据选择，不改变官方单 critic 的算法。旧 40k 的 single checkpoint
+来自 Huber + 无 clamp 的旧实验，不能追溯改名为官方基线，也没有被覆盖。
+
 ## 目标
 
 当前 SuperMimic 的 critic 主要是一个基于 privileged observation 的普通 MLP，用 rollout return 做回归，并在 actor 更新后单独拟合。这个设计可以工作，但在 world model 持续变化、imagined rollout 较多的情况下，容易出现 value 高估、对分布外状态过度自信，以及长时序回报方差过大的问题。
@@ -171,7 +193,7 @@ $$
 
 #### 阶段 1 监控实现
 
-`ActorCriticPolicyLearner` 将以下标量以 `Policy/` 前缀送入现有 W&B
+`TwinActorCriticPolicyLearner` 将以下标量以 `Policy/` 前缀送入现有 TensorBoard
 和控制台日志。除 `value_function` 为优化过程的平均 Huber loss 外，
 监控使用每个 imagined batch 拟合 critic 前的快照；多个 batch 的指标取算术平均，
 包括各 batch 的标准差、分位数和极值，并非合并所有样本后重新计算。

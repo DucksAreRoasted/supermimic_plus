@@ -22,6 +22,7 @@ from supermimic.learners.policy_learner import (
   BpttPolicyLearner,
   BpttPolicyLearnerCfg,
 )
+from supermimic.learners.twin_policy_learner import TwinActorCriticPolicyLearner
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
@@ -69,6 +70,8 @@ ActorCriticCfg = Annotated[
 
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
+  critic_variant: Literal["official", "twin"] = "official"
+  """Official single critic is unchanged; twin is an isolated experiment."""
   max_iterations: int = 1000000
   replay_ratio: int = 16
   latent_dim: int = 32
@@ -497,11 +500,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self.cfg.critic_hidden_dims,
       output_dim=1,
     ).to(self.device)
-    critic2 = build_mlp(
-      critic_input_dim,
-      self.cfg.critic_hidden_dims,
-      output_dim=1,
-    ).to(self.device)
+    critic2 = None
+    if self.cfg.critic_variant == "twin":
+      critic2 = build_mlp(
+        critic_input_dim,
+        self.cfg.critic_hidden_dims,
+        output_dim=1,
+      ).to(self.device)
 
     policy_cfg = self.cfg.policy
 
@@ -523,9 +528,15 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     self._configure_reset_sampling()
 
     if isinstance(policy_cfg, ActorCriticPolicyLearnerCfg):
-      self.policy_learner = ActorCriticPolicyLearner(
-        actor, critic1, critic2, self.wm_env, policy_cfg, device=self.device
-      )
+      if self.cfg.critic_variant == "official":
+        self.policy_learner = ActorCriticPolicyLearner(
+          actor, critic1, self.wm_env, policy_cfg, device=self.device
+        )
+      else:
+        assert critic2 is not None
+        self.policy_learner = TwinActorCriticPolicyLearner(
+          actor, critic1, critic2, self.wm_env, policy_cfg, device=self.device
+        )
     else:
       self.policy_learner = BpttPolicyLearner(
         actor, self.wm_env, policy_cfg, device=self.device
@@ -700,7 +711,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         policy_learn_time = 0
         num_collected_steps = 0
 
-      if (step + 1) % self.cfg.save_interval == 0 or step + 1 == self.cfg.max_iterations:
+      if (
+        step + 1
+      ) % self.cfg.save_interval == 0 or step + 1 == self.cfg.max_iterations:
         # The previous version must be logged before its files are overwritten.
         world_model_path = str(log_dir / "world_model.pt")
         actor_path = str(log_dir / "actor.pt")
@@ -708,6 +721,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         torch.save(self.policy_learner.actor.state_dict(), actor_path)
         checkpoint_files = [world_model_path, actor_path]
         critics = getattr(self.policy_learner, "critics", None)
+        if critics is None:
+          critics = getattr(self.policy_learner, "critic", None)
         if critics is not None:
           critic_path = str(log_dir / "critic.pt")
           torch.save(critics.state_dict(), critic_path)

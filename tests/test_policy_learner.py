@@ -86,7 +86,6 @@ def test_actor_critic_bootstraps_the_surviving_last_state():
   learner = ActorCriticPolicyLearner(
     _DummyActor(),
     _ConstantCritic(1.0),
-    _ConstantCritic(1.0),
     _TwoStepEnv(),
     ActorCriticPolicyLearnerCfg(horizon=2, gamma=0.99, survival_masking=True),
   )
@@ -110,62 +109,3 @@ def test_gae_returns_discount_by_soft_done():
   )
 
   assert torch.allclose(returns, torch.tensor([[1.495], [1.0]]))
-
-
-def test_critic_diagnostics_use_prefit_values_and_soft_done():
-  env = _TwoStepEnv()
-  env.max_step_reward = 0.5
-  learner = ActorCriticPolicyLearner(
-    _DummyActor(),
-    _ConstantCritic(1.0),
-    _ConstantCritic(3.0),
-    env,
-    ActorCriticPolicyLearnerCfg(horizon=2, gamma=0.5, lam=1.0),
-  )
-  with torch.no_grad():
-    learner.critics[1].value.fill_(3.0)
-
-  stats = learner.update()
-
-  # Conservative V=1; one-step TD errors are 0.25 and 0.5.
-  # GAE targets are 1.375 and 1.5, each repeated for two environments.
-  expected = {
-    "value_mean": 1.0,
-    "value_std": 0.0,
-    "value_min": 1.0,
-    "value_max": 1.0,
-    "value_1_mean": 1.0,
-    "value_2_mean": 3.0,
-    "critic_td_error": 0.375,
-    "critic_td_error_abs": 0.375,
-    "critic_td_error_rms": (0.15625) ** 0.5,
-    "critic_disagreement_mean": -2.0,
-    "critic_disagreement_var": 0.0,
-    "critic_disagreement_abs": 2.0,
-    "advantage_std": 0.0625,
-    "target_mean": 1.4375,
-    "target_std": 0.0625,
-    "target_percentile_01": 1.375,
-    "target_percentile_99": 1.5,
-    "value_above_bound_fraction": 0.5,
-  }
-  for name, value in expected.items():
-    actual = stats[f"Policy/{name}"]
-    assert actual.ndim == 0
-    assert not actual.requires_grad
-    assert actual.item() == pytest.approx(value)
-
-
-@pytest.mark.parametrize("gamma", [0.99, 1.0])
-def test_critic_diagnostics_without_finite_value_bound(gamma):
-  learner = ActorCriticPolicyLearner(
-    _DummyActor(),
-    _ConstantCritic(1.0),
-    _ConstantCritic(1.0),
-    _TwoStepEnv(),
-    ActorCriticPolicyLearnerCfg(horizon=2, gamma=gamma, num_batches=2),
-  )
-  stats = learner.update()
-  assert "Policy/value_above_bound_fraction" not in stats
-  assert stats["Policy/critic_disagreement_abs"].item() == 0.0
-  assert all(torch.isfinite(value) for value in stats.values())
