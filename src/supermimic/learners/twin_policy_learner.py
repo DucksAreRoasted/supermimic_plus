@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -32,12 +33,25 @@ class TwinActorCriticPolicyLearner(BpttPolicyLearner):
     wm_env: WorldModelEnv,
     cfg: ActorCriticPolicyLearnerCfg,
     device: str = "cpu",
+    actor_aggregation: Literal["mean", "min", "kappa"] = "mean",
+    aggregation_kappa: float = 0.0,
   ):
     super().__init__(policy, wm_env, cfg, device)
     self.critics = nn.ModuleList([critic1, critic2])
     self._assert_independent_critics()
     self.critic_optimizers = build_optimizers(
       [self.critics], self.cfg.lr, device=device
+    )
+    if actor_aggregation not in {"mean", "min", "kappa"}:
+      raise ValueError(f"unknown actor aggregation: {actor_aggregation}")
+    if not 0.0 <= aggregation_kappa <= 1.0:
+      raise ValueError("aggregation_kappa must be in [0, 1]")
+    self.actor_aggregation = actor_aggregation
+    self.aggregation_kappa = aggregation_kappa
+    self._v_max = (
+      float("inf")
+      if self.cfg.gamma >= 1
+      else self.wm_env.max_step_reward / (1 - self.cfg.gamma)
     )
 
   @property
@@ -47,6 +61,16 @@ class TwinActorCriticPolicyLearner(BpttPolicyLearner):
 
   def _values(self, obs: torch.Tensor) -> torch.Tensor:
     return torch.stack([module(obs) for module in self.critics], dim=0)
+
+  def _aggregate_for_actor(self, values: torch.Tensor) -> torch.Tensor:
+    values = values.clamp(max=self._v_max)
+    if self.actor_aggregation == "mean":
+      return values.mean(dim=0)
+    if self.actor_aggregation == "min":
+      return values.amin(dim=0)
+    mean = values.mean(dim=0)
+    half_disagreement = (values[0] - values[1]).abs() / 2
+    return mean - self.aggregation_kappa * half_disagreement
 
   def _assert_independent_critics(self) -> None:
     """Reject accidental parameter storage sharing at the construction seam."""
@@ -61,7 +85,7 @@ class TwinActorCriticPolicyLearner(BpttPolicyLearner):
     self, obs: TensorDict, survival: torch.Tensor, term_prob: torch.Tensor
   ) -> torch.Tensor:
     self.critics.requires_grad_(False)
-    value = self._values(obs["critic"]).amin(dim=0).squeeze(-1)
+    value = self._aggregate_for_actor(self._values(obs["critic"])).squeeze(-1)
     alive = survival if self.cfg.survival_masking else 1.0 - term_prob
     return self.cfg.gamma**self.cfg.horizon * value * alive
 
@@ -71,17 +95,21 @@ class TwinActorCriticPolicyLearner(BpttPolicyLearner):
     steps = torch.stack(rollout)
     with torch.no_grad():
       twin_values = self._values(steps["critic"])
-      last_value = self._values(last_obs["critic"])
-      values = twin_values.amin(dim=0)
-      last_value = last_value.amin(dim=0)
-    returns = gae_returns(
-      values,
-      last_value,
-      steps["reward"].unsqueeze(-1),
-      steps["done"].unsqueeze(-1),
-      self.cfg.gamma,
-      self.cfg.lam,
-    )
+      last_values = self._values(last_obs["critic"])
+      returns = torch.stack([
+        gae_returns(
+          twin_values[i],
+          last_values[i],
+          steps["reward"].unsqueeze(-1),
+          steps["done"].unsqueeze(-1),
+          self.cfg.gamma,
+          self.cfg.lam,
+        )
+        for i in range(2)
+      ]).clamp(max=self._v_max)
+      values = twin_values.mean(dim=0)
+      last_value = last_values.mean(dim=0)
+    critic_returns = returns
     # Snapshot diagnostics before fitting, using the same conservative values
     # and soft termination discounts as GAE. Keep scalars on device for logging.
     with torch.no_grad():
@@ -111,8 +139,8 @@ class TwinActorCriticPolicyLearner(BpttPolicyLearner):
         "critic_td_error_abs": td_error.abs().mean(),
         "critic_td_error_rms": td_error.square().mean().sqrt(),
         "advantage_std": (returns - values).std(correction=0),
-        "target_mean": returns.mean(),
-        "target_std": returns.std(correction=0),
+        "target_mean": critic_returns.mean(),
+        "target_std": critic_returns.std(correction=0),
         **percentiles,
       }
       difference = twin_values[0] - twin_values[1]
@@ -125,15 +153,16 @@ class TwinActorCriticPolicyLearner(BpttPolicyLearner):
       if self.cfg.gamma < 1 and math.isfinite(self.wm_env.max_step_reward):
         v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)
         stats["value_above_bound_fraction"] = (twin_values > v_max).float().mean()
-    obs, returns = steps["critic"].flatten(0, 1), returns.flatten(0, 1)
-    perm = torch.randperm(len(returns) // 4 * 4, device=returns.device)
+    obs = steps["critic"].flatten(0, 1)
+    flat_returns = critic_returns.flatten(1, 2)
+    perm = torch.randperm(len(obs) // 4 * 4, device=obs.device)
     self.critics.requires_grad_(True)
     losses = []
     for _ in range(5):
       for idx in perm.view(4, -1):
         prediction = self._values(obs[idx])
-        target = returns[idx].unsqueeze(0).expand_as(prediction)
-        loss = torch.nn.functional.huber_loss(prediction, target)
+        target = flat_returns[:, idx]
+        loss = torch.nn.functional.mse_loss(prediction, target)
         _optimize_step(
           self.critic_optimizers, loss, self.critics.parameters(), max_norm=1.0
         )

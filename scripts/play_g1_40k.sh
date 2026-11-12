@@ -17,9 +17,10 @@ esac
 
 # Inference does not need training-time compilation or its first-frame delay.
 export TORCH_COMPILE_DISABLE=1
-# Compatible GLX display on this desktop; CUDA physics/inference stay on the GPU.
-export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
-export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-mesa}"
+# This desktop's primary GLX provider is NVIDIA; offload is not needed.
+# Preserve explicit software-rendering overrides for troubleshooting.
+export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-0}"
+export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
 exec .venv/bin/python -u src/supermimic/scripts/play.py SuperMimic-GenCoord-G1 \
   --model-dir "logs/SuperMimic-GenCoord-G1/$run" \
   --motion-file "outputs/server_40k_20261113/raw/data/modelscope/LAFAN1_Retargeting_Dataset/npz/$clip.npz" \

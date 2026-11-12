@@ -71,6 +71,8 @@ ActorCriticCfg = Annotated[
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
   critic_variant: Literal["official", "twin"] = "official"
+  twin_actor_aggregation: Literal["mean", "min", "kappa"] = "mean"
+  twin_aggregation_kappa: float = 0.0
   """Official single critic is unchanged; twin is an isolated experiment."""
   max_iterations: int = 1000000
   replay_ratio: int = 16
@@ -535,7 +537,14 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       else:
         assert critic2 is not None
         self.policy_learner = TwinActorCriticPolicyLearner(
-          actor, critic1, critic2, self.wm_env, policy_cfg, device=self.device
+          actor,
+          critic1,
+          critic2,
+          self.wm_env,
+          policy_cfg,
+          device=self.device,
+          actor_aggregation=self.cfg.twin_actor_aggregation,
+          aggregation_kappa=self.cfg.twin_aggregation_kappa,
         )
     else:
       self.policy_learner = BpttPolicyLearner(

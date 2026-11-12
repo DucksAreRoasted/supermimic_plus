@@ -50,9 +50,13 @@ class PlayConfig:
   """Also show world-model predictions; the green ghost is always the reference."""
   max_steps: int | None = None
   """Close after this many simulation steps; None keeps the viewer running."""
+  frame_rate: float = 30.0
+  """Display refresh rate; physics still advances at its configured 50 Hz."""
 
 
 def play(task_id: str, cfg: PlayConfig) -> None:
+  if cfg.frame_rate <= 0:
+    raise ValueError("frame_rate must be positive")
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -156,6 +160,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       task_specs=actor.task_specs,
       initial_task=cfg.initial_task,
       show_wm_prediction=cfg.world_model_ghost,
+      frame_rate=cfg.frame_rate,
     ).run(num_steps=cfg.max_steps)
   else:
     SuperMimicViserViewer(
@@ -170,6 +175,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       task_specs=actor.task_specs,
       initial_task=cfg.initial_task,
       show_wm_prediction=cfg.world_model_ghost,
+      frame_rate=cfg.frame_rate,
     ).run(num_steps=cfg.max_steps)
 
   env.close()

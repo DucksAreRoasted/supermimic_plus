@@ -7,6 +7,7 @@ predictions as ghost entities on top of the ground-truth simulation.
 from __future__ import annotations
 
 import copy
+import threading
 
 import mujoco
 import numpy as np
@@ -345,6 +346,20 @@ class SuperMimicViewerMixin:
 
 
 class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
+  def setup(self) -> None:
+    # launch_passive owns a daemon render thread. Retain it until shutdown so
+    # the GL context finishes destroying before the environment is released.
+    existing_threads = set(threading.enumerate())
+    super().setup()
+    self._render_threads = [
+      thread for thread in threading.enumerate() if thread not in existing_threads
+    ]
+
+  def close(self) -> None:
+    super().close()
+    for thread in getattr(self, "_render_threads", ()):
+      thread.join(timeout=5.0)
+
   def __init__(
     self,
     env,

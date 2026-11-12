@@ -76,10 +76,10 @@ bash scripts/play_g1_40k.sh single walk1_subject1
 The solid robot follows the policy; the green translucent robot shows the
 reference motion at the same frame. Space pauses, Enter resets, and R toggles
 the reference visualization. The launcher uses CUDA for physics and inference
-and Mesa software rendering for compatibility with this desktop's GLX setup.
-This can run slower than real time. `LIBGL_ALWAYS_SOFTWARE=0` and
-`__GLX_VENDOR_LIBRARY_NAME=nvidia` can override the rendering defaults on a
-compatible display.
+and NVIDIA OpenGL for rendering. The display refreshes at 30 FPS while physics
+keeps its 50 Hz control rate; `--frame-rate 60` requests a higher display rate.
+For explicit software-rendering troubleshooting only, set
+`LIBGL_ALWAYS_SOFTWARE=1 __GLX_VENDOR_LIBRARY_NAME=mesa` before the command.
 
 Other local checkpoints using the standard runner architecture can be loaded
 with `play.py TASK --model-dir PATH --motion-file FILE --viewer native`.
