@@ -370,11 +370,15 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     num_steps_rollout,
     sim_context: SimContext,
     task_specs: list[TaskSpec],
+    motion_names: list[str] | None = None,
     initial_task: str = "motion",
     show_wm_prediction: bool = True,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
+    self.motion_names = motion_names or []
+    self._selected_clip_idx = 0
+    self.user_key_callback = self._motion_key_callback
     self.show_wm_prediction = show_wm_prediction
     self.setup_supermimic(
       dynamics,
@@ -389,6 +393,36 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
   def reset_environment(self) -> None:
     super().reset_environment()
     self.reset_wm_visualizer()
+    if self.motion_names:
+      with self._mj_lock:
+        self._apply_selected_clip()
+
+  def _motion_key_callback(self, key: int) -> None:
+    """Cycle local reference clips without touching simulation state on the GL thread."""
+    from mjlab.viewer.native.keys import KEY_LEFT_BRACKET, KEY_RIGHT_BRACKET
+
+    if not self.motion_names:
+      return
+    if key == KEY_RIGHT_BRACKET:
+      self._selected_clip_idx = (self._selected_clip_idx + 1) % len(self.motion_names)
+      self.request_reset()
+    elif key == KEY_LEFT_BRACKET:
+      self._selected_clip_idx = (self._selected_clip_idx - 1) % len(self.motion_names)
+      self.request_reset()
+
+  def _apply_selected_clip(self) -> None:
+    motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+    motion = motion_cmd.motion
+    idx = self._selected_clip_idx
+    clip_start = 0 if idx == 0 else motion.motion_ends[idx - 1].item()
+    clip_end = motion.motion_ends[idx].item()
+    frame = torch.randint(clip_start, clip_end, (1,)).item()
+    motion_cmd.reset_to_frame(torch.tensor([0], device=self.env.device), frame)
+    base_env = self.env.unwrapped
+    base_env.scene.write_data_to_sim()
+    base_env.sim.forward()
+    base_env.sim.sense()
+    base_env.observation_manager.compute(update_history=True)
 
 
 class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):

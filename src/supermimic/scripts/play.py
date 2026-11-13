@@ -158,6 +158,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       num_steps_rollout=cfg.num_steps_rollout,
       sim_context=wm.sim_context,
       task_specs=actor.task_specs,
+      motion_names=motion_names,
       initial_task=cfg.initial_task,
       show_wm_prediction=cfg.world_model_ghost,
       frame_rate=cfg.frame_rate,
