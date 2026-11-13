@@ -302,6 +302,8 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     self._pending_norm_updates: list[tuple] = []
     self._sim_history: torch.Tensor | None = None
+    # Keep only one finite simulator-return window. Storing every 4096-env
+    # critic observation on GPU would grow without bound over a long run.
     self._sim_calibration_obs: list[torch.Tensor] = []
     self._sim_calibration_rewards: list[torch.Tensor] = []
     self._sim_calibration_dones: list[torch.Tensor] = []
@@ -666,6 +668,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         self._sim_calibration_obs.append(critic_obs)
         self._sim_calibration_rewards.append(rewards.detach())
         self._sim_calibration_dones.append(dones.detach().float())
+        max_window = max(1, self.cfg.sim_calibration_horizon)
+        del self._sim_calibration_obs[:-max_window]
+        del self._sim_calibration_rewards[:-max_window]
+        del self._sim_calibration_dones[:-max_window]
       self._advance_sim_history(next_obs["actor"].to(self.device), dones)
       terminated = self.env.unwrapped.termination_manager.terminated
       self.logger.process_env_step(rewards, terminated, extras)
