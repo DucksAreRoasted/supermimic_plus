@@ -395,11 +395,41 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     self.setup_wm_visualizer(wm_vis_model)
 
   def reset_environment(self) -> None:
+    # Changing clips requests an environment reset. Preserve the user's
+    # free-camera pose across that reset; mjlab may otherwise restore the
+    # automatic tracking camera while rebuilding the scene.
+    camera_pose = None
+    if self.viewer is not None:
+      cam = self.viewer.cam
+      camera_pose = (
+        cam.type,
+        cam.trackbodyid,
+        cam.fixedcamid,
+        cam.lookat.copy(),
+        cam.azimuth,
+        cam.elevation,
+        cam.distance,
+      )
     super().reset_environment()
     self.reset_wm_visualizer()
     if self.motion_names:
       with self._mj_lock:
         self._apply_selected_clip()
+    if self.viewer is not None and camera_pose is not None:
+      cam = self.viewer.cam
+      (
+        cam.type,
+        cam.trackbodyid,
+        cam.fixedcamid,
+        lookat,
+        cam.azimuth,
+        cam.elevation,
+        cam.distance,
+      ) = camera_pose
+      cam.lookat[:] = lookat
+      cam.type = mujoco.mjtCamera.mjCAMERA_FREE.value
+      cam.trackbodyid = -1
+      cam.fixedcamid = -1
 
   def _motion_key_callback(self, key: int) -> None:
     """Cycle local reference clips without touching simulation state on the GL thread."""
