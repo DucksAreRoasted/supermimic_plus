@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import glob
 from dataclasses import dataclass
 
 import mjlab.tasks  # noqa: F401
@@ -67,7 +68,17 @@ def main() -> None:
     else:
       args.env.commands["motion"].motion_file = os.path.expanduser(args.motion_file)
     args.registry_name = None  # avoid linking a stale registry artifact for lineage
-    print(f"[INFO] Using local motion file: {args.motion_file}")
+    configured = args.env.commands["motion"].motion_file
+    configured_files = configured if isinstance(configured, list) else [configured]
+    matched = []
+    for pattern in configured_files:
+      matches = sorted(glob.glob(str(pattern)))
+      if not matches:
+        raise FileNotFoundError(f"No motion files matched: {pattern}")
+      matched.extend(matches)
+    if not matched:
+      raise FileNotFoundError(f"No motion files matched: {args.motion_file}")
+    print(f"[INFO] Using {len(matched)} local motion file(s): {args.motion_file}")
   else:
     motion_file = download_registry_motions(args.registry_name)
     if motion_file is not None:

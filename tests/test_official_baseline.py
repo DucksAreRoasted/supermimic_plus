@@ -104,7 +104,9 @@ def test_comparison_launcher_uses_official_recipe_and_one_shared_motion_glob(tmp
   assert len(runs) == 2
   for variant, args in zip(("official", "twin"), runs, strict=True):
     options = dict(zip(args[3::2], args[4::2], strict=True))
-    assert options["--motion-file"] == str(clips / "*.npz")
+    motion_files = options["--motion-file"].split(",")
+    assert len(motion_files) == 40
+    assert motion_files == sorted(str(path) for path in clips.glob("*.npz"))
     assert options["--runner.critic-variant"] == variant
     assert options["--num-envs"] == "4096"
     assert options["--env.seed"] == "42"

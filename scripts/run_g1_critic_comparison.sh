@@ -21,9 +21,18 @@ elif [[ ! -f "$MOTION_FILE" ]]; then
   exit 1
 fi
 
+# Pass one parser argument regardless of how many files the glob matches.
+# tyro accepts a comma-separated motion_file and train.py expands each entry.
+mapfile -t MATCHED_MOTIONS < <(compgen -G "$MOTION_FILE" | sort)
+if (( ${#MATCHED_MOTIONS[@]} == 0 )); then
+  echo "No motion files matched $MOTION_FILE" >&2
+  exit 1
+fi
+MOTION_FILE_CSV=$(IFS=,; echo "${MATCHED_MOTIONS[*]}")
+
 common_args=(
   SuperMimic-GenCoord-G1
-  --motion-file "$MOTION_FILE"
+  --motion-file "$MOTION_FILE_CSV"
   --num-envs "$NUM_ENVS"
   --device "$DEVICE"
   --env.seed "$SEED"
