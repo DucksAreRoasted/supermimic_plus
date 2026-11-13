@@ -23,6 +23,9 @@ from supermimic.learners.policy_learner import (
   BpttPolicyLearnerCfg,
 )
 from supermimic.learners.twin_policy_learner import TwinActorCriticPolicyLearner
+from supermimic.learners.sim_calibrated_learner import (
+  SimulatorCalibratedActorCriticLearner,
+)
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
@@ -70,9 +73,12 @@ ActorCriticCfg = Annotated[
 
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
-  critic_variant: Literal["official", "twin"] = "official"
+  critic_variant: Literal["official", "twin", "sim-calibrated"] = "official"
   twin_actor_aggregation: Literal["mean", "min", "kappa"] = "mean"
   twin_aggregation_kappa: float = 0.0
+  sim_calibration_weight: float = 0.1
+  sim_calibration_horizon: int = 32
+  sim_calibration_interval: int = 1
   """Official single critic is unchanged; twin is an isolated experiment."""
   max_iterations: int = 1000000
   replay_ratio: int = 16
@@ -293,6 +299,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     self._pending_norm_updates: list[tuple] = []
     self._sim_history: torch.Tensor | None = None
+    self._sim_calibration_obs: list[torch.Tensor] = []
+    self._sim_calibration_rewards: list[torch.Tensor] = []
+    self._sim_calibration_dones: list[torch.Tensor] = []
 
   def _seed_sim_history(self) -> None:
     """Seed the real-sim obs-history ring with the noised current sensor."""
@@ -530,8 +539,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     self._configure_reset_sampling()
 
     if isinstance(policy_cfg, ActorCriticPolicyLearnerCfg):
-      if self.cfg.critic_variant == "official":
-        self.policy_learner = ActorCriticPolicyLearner(
+      if self.cfg.critic_variant in {"official", "sim-calibrated"}:
+        learner_cls = (
+          SimulatorCalibratedActorCriticLearner
+          if self.cfg.critic_variant == "sim-calibrated"
+          else ActorCriticPolicyLearner
+        )
+        self.policy_learner = learner_cls(
           actor, critic1, self.wm_env, policy_cfg, device=self.device
         )
       else:
@@ -612,6 +626,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       actor_td = self._build_sim_obs_td(
         rep_state, aux_state, sim_actor_obs, motion_times, sim_ctx
       )
+      critic_obs = obs["critic"].to(self.device).detach()
 
       actions = self.policy_learner.actor(actor_td)
       actions = actions + torch.randn_like(actions) * self.policy_learner.cfg.noise
@@ -626,6 +641,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         actor_td=actor_td,
         extra_fields=extra_fields,
       )
+      if self.cfg.critic_variant == "sim-calibrated":
+        self._sim_calibration_obs.append(critic_obs)
+        self._sim_calibration_rewards.append(rewards.detach())
+        self._sim_calibration_dones.append(dones.detach().float())
       self._advance_sim_history(next_obs["actor"].to(self.device), dones)
       terminated = self.env.unwrapped.termination_manager.terminated
       self.logger.process_env_step(rewards, terminated, extras)
@@ -647,6 +666,24 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     self._flush_normalization()
     return self.env.num_envs
+
+  def _sim_calibration_update(self, step: int) -> dict[str, torch.Tensor]:
+    if self.cfg.critic_variant != "sim-calibrated":
+      return {}
+    horizon = self.cfg.sim_calibration_horizon
+    if len(self._sim_calibration_obs) < horizon:
+      return {}
+    if step % self.cfg.sim_calibration_interval != 0:
+      return {}
+    obs = torch.stack(self._sim_calibration_obs[-horizon:])
+    rewards = torch.stack(self._sim_calibration_rewards[-horizon:])
+    dones = torch.stack(self._sim_calibration_dones[-horizon:])
+    return self.policy_learner.calibrate_from_simulator(
+      obs,
+      rewards,
+      dones,
+      self.cfg.sim_calibration_weight,
+    )
 
   def _update_actor_normalization(self, actor_inputs: tuple[TensorDict, ...]) -> None:
     self.policy_learner.actor.train()
@@ -694,6 +731,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
         start_policy_time = time.time()
         policy_logs = self.policy_learner.update()
+        policy_logs.update(self._sim_calibration_update(step))
         policy_learn_time += time.time() - start_policy_time
 
         loss_dict.update(wm_logs)

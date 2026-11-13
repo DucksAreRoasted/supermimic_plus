@@ -37,6 +37,11 @@ run_case twin-mean mean 0.0
 run_case twin-min min 1.0
 run_case twin-kappa kappa 0.5
 
-echo "Simulator-calibrated critic: reserved for the next smoke stage; it requires
-real simulator critic observations and multi-step return targets, which are not
-yet wired into the captured policy update. No silent placeholder run is made."
+echo "=== sim-calibrated ==="
+uv run src/supermimic/scripts/train.py "${common[@]}" \
+  --runner.critic-variant sim-calibrated \
+  --runner.sim-calibration-weight 0.1 \
+  --runner.sim-calibration-horizon 2 \
+  --runner.run-name smoke-sim-calibrated 2>&1 | tee "$RUN_ROOT/sim-calibrated.log"
+grep -q "Learning iteration" "$RUN_ROOT/sim-calibrated.log"
+grep -q "Saved checkpoint" "$RUN_ROOT/sim-calibrated.log"

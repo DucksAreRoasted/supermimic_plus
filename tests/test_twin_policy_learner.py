@@ -12,6 +12,7 @@ from supermimic.learners.policy_learner import (
 from supermimic.learners.twin_policy_learner import (
   TwinActorCriticPolicyLearner as ActorCriticPolicyLearner,
 )
+from supermimic.learners.sim_calibrated_learner import SimulatorCalibratedActorCriticLearner
 
 NUM_ENVS = 2
 
@@ -112,6 +113,21 @@ def test_gae_returns_discount_by_soft_done():
   )
 
   assert torch.allclose(returns, torch.tensor([[1.495], [1.0]]))
+
+
+def test_simulator_calibration_returns_stop_at_done():
+  learner = SimulatorCalibratedActorCriticLearner(
+    _DummyActor(),
+    _ConstantCritic(1.0),
+    _TwoStepEnv(),
+    ActorCriticPolicyLearnerCfg(gamma=0.5),
+  )
+  rewards = torch.tensor([[1.0], [2.0], [3.0]])
+  dones = torch.tensor([[0.0], [1.0], [0.0]])
+  assert torch.allclose(
+    learner.simulator_returns(rewards, dones),
+    torch.tensor([[2.0], [2.0], [3.0]]),
+  )
 
 
 def test_critic_diagnostics_use_prefit_values_and_soft_done():
