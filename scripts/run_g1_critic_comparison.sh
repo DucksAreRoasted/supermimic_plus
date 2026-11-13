@@ -61,6 +61,8 @@ uv run src/supermimic/scripts/train.py "${common_args[@]}" \
 echo "=== Stage 1 twin critic ==="
 uv run src/supermimic/scripts/train.py "${common_args[@]}" \
   --runner.critic-variant twin \
+  --runner.twin-actor-aggregation "${TWIN_AGGREGATION:-mean}" \
+  --runner.twin-aggregation-kappa "${TWIN_KAPPA:-0.0}" \
   --runner.run-name g1-twin-critic-lafan
 
 echo "TensorBoard: tensorboard --logdir logs"
