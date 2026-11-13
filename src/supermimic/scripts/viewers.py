@@ -351,6 +351,10 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     # the GL context finishes destroying before the environment is released.
     existing_threads = set(threading.enumerate())
     super().setup()
+    # Use a free world camera for local playback so mouse orbit/pan/zoom works
+    # directly. The native viewer's automatic tracking camera otherwise locks
+    # the orbit center to the robot body.
+    self._set_camera_world()
     self._render_threads = [
       thread for thread in threading.enumerate() if thread not in existing_threads
     ]
