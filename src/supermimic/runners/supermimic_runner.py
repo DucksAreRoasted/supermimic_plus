@@ -79,6 +79,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   sim_calibration_weight: float = 0.1
   sim_calibration_horizon: int = 32
   sim_calibration_interval: int = 1
+  init_model_dir: str | None = None
+  """Optional local actor/world-model/critic checkpoint to warm-start from."""
   """Official single critic is unchanged; twin is an isolated experiment."""
   max_iterations: int = 1000000
   replay_ratio: int = 16
@@ -263,6 +265,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     self._init_common()
     self._init_policy()
+    self._load_initial_model()
 
     self.logger = Logger(
       run_name=cfg.run_name,
@@ -408,6 +411,24 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
   def _init_policy(self) -> None:
     """Subclasses implement this to create their policy learner."""
     raise NotImplementedError
+
+  def _load_initial_model(self) -> None:
+    if self.cfg.init_model_dir is None:
+      return
+    model_dir = Path(self.cfg.init_model_dir).expanduser()
+    required = [model_dir / "actor.pt", model_dir / "world_model.pt", model_dir / "critic.pt"]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+      raise FileNotFoundError(f"Warm-start checkpoint is missing: {missing}")
+    actor = self.policy_learner.actor
+    actor.load_state_dict(torch.load(required[0], map_location=self.device, weights_only=True), strict=True)
+    self._wm.load_bundle(torch.load(required[1], map_location=self.device, weights_only=True))
+    critics = getattr(self.policy_learner, "critics", None)
+    if critics is None:
+      critics = getattr(self.policy_learner, "critic", None)
+    assert critics is not None
+    critics.load_state_dict(torch.load(required[2], map_location=self.device, weights_only=True), strict=True)
+    print(f"[INFO] Warm-started actor, world model, and critic from {model_dir}")
 
   def _step_and_store(
     self,
