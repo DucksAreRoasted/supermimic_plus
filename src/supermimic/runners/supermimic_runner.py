@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+import re
+import shlex
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,10 +26,10 @@ from supermimic.learners.policy_learner import (
   BpttPolicyLearner,
   BpttPolicyLearnerCfg,
 )
-from supermimic.learners.twin_policy_learner import TwinActorCriticPolicyLearner
 from supermimic.learners.sim_calibrated_learner import (
   SimulatorCalibratedActorCriticLearner,
 )
+from supermimic.learners.twin_policy_learner import TwinActorCriticPolicyLearner
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
@@ -493,13 +497,56 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     raise NotImplementedError
 
   def _create_log_dir(self, *extra_parts: str) -> Path:
-    """Create and return a timestamped log directory."""
+    """Create a labelled run directory and write its immutable manifest.
+
+    Timestamp-only directories made it too easy to confuse official, twin,
+    and calibration runs after copying results between machines.  Keep the
+    timestamp for uniqueness, but put the explicit run label before it and
+    record the complete launch metadata alongside TensorBoard/checkpoint
+    files.
+    """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = Path("logs", self.task_id, *extra_parts, timestamp)
+    raw_label = self.cfg.run_name or self._default_run_label()
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_label).strip("-._")
+    label = label[:160] or "unnamed-experiment"
+    log_dir = Path("logs", self.task_id, label, *extra_parts, timestamp)
     log_dir.mkdir(parents=True, exist_ok=True)
     self.logger.set_log_dir(str(log_dir))
     print(f"[INFO] Logging to {log_dir}")
+    manifest = {
+      "task_id": self.task_id,
+      "run_name": self.cfg.run_name,
+      "run_label": label,
+      "critic_variant": getattr(self.cfg, "critic_variant", None),
+      "twin_actor_aggregation": getattr(self.cfg, "twin_actor_aggregation", None),
+      "twin_aggregation_kappa": getattr(self.cfg, "twin_aggregation_kappa", None),
+      "max_iterations": getattr(self.cfg, "max_iterations", None),
+      "num_envs": self.env.num_envs,
+      "device": self.device,
+      "representation": getattr(self.cfg, "representation", None),
+      "actor_obs": getattr(self.cfg, "actor_obs", None),
+      "init_model_dir": getattr(self.cfg, "init_model_dir", None),
+      "created_at": datetime.now().astimezone().isoformat(),
+      "command": shlex.join(sys.argv),
+    }
+    (log_dir / "run_manifest.json").write_text(
+      json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+      encoding="utf-8",
+    )
+    print(f"[INFO] Run manifest: {log_dir / 'run_manifest.json'}")
     return log_dir
+
+  def _default_run_label(self) -> str:
+    """Build a useful label when a caller did not provide ``run_name``."""
+    variant = getattr(self.cfg, "critic_variant", "unknown")
+    aggregation = getattr(self.cfg, "twin_actor_aggregation", None)
+    label = f"{self.task_id}-{variant}"
+    if variant == "twin" and aggregation:
+      label += f"-{aggregation}"
+    max_iterations = getattr(self.cfg, "max_iterations", None)
+    if max_iterations is not None:
+      label += f"-{max_iterations}it"
+    return label
 
   def _cleanup(self) -> None:
     """Close environment and TensorBoard writer."""

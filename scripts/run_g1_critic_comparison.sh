@@ -8,7 +8,8 @@ DEVICE="${DEVICE:-cuda:0}"
 SEED="${SEED:-42}"
 DATA_ROOT="${DATA_ROOT:-data/modelscope/LAFAN1_Retargeting_Dataset}"
 CLIP="${CLIP:-*}"
-RUN_ROOT="${RUN_ROOT:-logs/g1_critic_comparison}"
+EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-g1-critic-comparison-${MAX_ITERATIONS}it-seed${SEED}}"
+RUN_ROOT="${RUN_ROOT:-logs/${EXPERIMENT_LABEL}}"
 
 MOTION_FILE="$DATA_ROOT/npz/$CLIP.npz"
 if [[ "$MOTION_FILE" == *'*'* || "$MOTION_FILE" == *'?'* ]]; then
@@ -56,13 +57,15 @@ echo "Matched training budget: $MAX_ITERATIONS iterations per variant; seed=$SEE
 echo "=== Official single critic: unmodified MSE + value/return clamp ==="
 uv run src/supermimic/scripts/train.py "${common_args[@]}" \
   --runner.critic-variant official \
-  --runner.run-name g1-official-single-critic-lafan
+  --runner.run-name "${EXPERIMENT_LABEL}-official-single-critic-lafan" \
+  2>&1 | tee "$RUN_ROOT/${EXPERIMENT_LABEL}-official-single-critic-lafan.log"
 
 echo "=== Stage 1 twin critic ==="
 uv run src/supermimic/scripts/train.py "${common_args[@]}" \
   --runner.critic-variant twin \
   --runner.twin-actor-aggregation "${TWIN_AGGREGATION:-mean}" \
   --runner.twin-aggregation-kappa "${TWIN_KAPPA:-0.0}" \
-  --runner.run-name g1-twin-critic-lafan
+  --runner.run-name "${EXPERIMENT_LABEL}-twin-${TWIN_AGGREGATION:-mean}-critic-lafan" \
+  2>&1 | tee "$RUN_ROOT/${EXPERIMENT_LABEL}-twin-${TWIN_AGGREGATION:-mean}-critic-lafan.log"
 
 echo "TensorBoard: tensorboard --logdir logs"
