@@ -603,7 +603,14 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       termination_softness=self.cfg.termination_softness,
       device=self.device,
     )
-    if torch.cuda.is_available() and os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1":
+    # The simulator-calibrated learner computes separate actor gradients for
+    # cosine diagnostics.  CUDA-graph capture rejects the retained graphs
+    # required by that diagnostic, so keep this variant eager and capture-safe.
+    if (
+      torch.cuda.is_available()
+      and os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1"
+      and self.cfg.critic_variant != "sim-calibrated"
+    ):
       self.wm_env.step = torch.compile(self.wm_env.step)
       self.wm_env.reset = torch.compile(self.wm_env.reset)
 
