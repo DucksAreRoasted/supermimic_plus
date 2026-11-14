@@ -12,18 +12,9 @@ from supermimic.learners.policy_learner import ActorCriticPolicyLearner, gae_ret
 class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
   def __init__(self, *args, sim_lambda: float = 1.0, **kwargs):
     super().__init__(*args, **kwargs)
-    # The base learner compiles the actor on CUDA.  Separate retained-gradient
-    # probes require an eager actor graph, so unwrap the compiled module here.
-    if hasattr(self.actor, "_orig_mod"):
-      self.actor = self.actor._orig_mod
-      self.actor_params = list(self.actor.parameters())
-      self._rollout_actor = self.actor
     self.sim_lambda = sim_lambda
     self._simulator_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     self._actor_updates = 0
-    # Separate gradient probes retain the actor graph, which is incompatible
-    # with the donated buffers used by CapturedUpdate/CUDA Graph replay.
-    self._captured_update = self._update_from
 
   def _beta_v(self) -> float:
     return min(1.0, 0.25 + 0.75 * self._actor_updates / 2000.0)
