@@ -56,18 +56,37 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
         survival = survival * (1 - term_prob)
     terminal = self._bootstrap(obs, survival, term_prob)
     total_return = reward_ret + terminal
-    grads_r = torch.autograd.grad(reward_ret.mean(), self.actor_params, retain_graph=True, allow_unused=True)
-    grads_v = torch.autograd.grad(terminal.mean() if isinstance(terminal, torch.Tensor) else total_return.mean(), self.actor_params, retain_graph=True, allow_unused=True)
-    flat_r = [g.reshape(-1) for g in grads_r if g is not None]
-    flat_v = [g.reshape(-1) for g in grads_v if g is not None]
-    if flat_r and flat_v:
-      cosine = torch.nn.functional.cosine_similarity(
-        torch.cat(flat_r), torch.cat(flat_v), dim=0
-      )
-    else:
-      cosine = torch.zeros((), device=total_return.device)
     loss = (-total_return + aux_loss).mean()
     grad_norm = _optimize_step(self.actor_optimizers, loss, self.actor_params, 1.0, cfg.grad_clip_value)
+
+    def _diagnostic_rollout(terminal_only: bool):
+      diag_obs = self.wm_env.reset(start)
+      diag_return, diag_survival = 0.0, 1.0
+      diag_term = torch.zeros_like(diag_survival)
+      for t in range(cfg.horizon):
+        diag_actions = self._rollout_actor(diag_obs)
+        diag_obs, diag_reward, diag_term, _ = self.wm_env.step(diag_actions)
+        if not terminal_only:
+          diag_return = diag_return + cfg.gamma**t * diag_survival * diag_reward
+        if cfg.survival_masking:
+          diag_survival = diag_survival * (1 - diag_term)
+      if terminal_only:
+        return self._bootstrap(diag_obs, diag_survival, diag_term).mean()
+      return diag_return.mean()
+
+    # Each probe owns its graph and uses the default non-retained backward.
+    grads_r = torch.autograd.grad(
+      _diagnostic_rollout(False), self.actor_params, allow_unused=True
+    )
+    grads_v = torch.autograd.grad(
+      _diagnostic_rollout(True), self.actor_params, allow_unused=True
+    )
+    flat_r = [g.reshape(-1) for g in grads_r if g is not None]
+    flat_v = [g.reshape(-1) for g in grads_v if g is not None]
+    cosine = (
+      torch.nn.functional.cosine_similarity(torch.cat(flat_r), torch.cat(flat_v), dim=0)
+      if flat_r and flat_v else torch.zeros((), device=total_return.device)
+    )
     self._actor_updates += 1
     return {
       "return": total_return.mean().detach(),
