@@ -15,6 +15,9 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     self.sim_lambda = sim_lambda
     self._simulator_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     self._actor_updates = 0
+    # Separate gradient probes retain the actor graph, which is incompatible
+    # with the donated buffers used by CapturedUpdate/CUDA Graph replay.
+    self._captured_update = self._update_from
 
   def _beta_v(self) -> float:
     return min(1.0, 0.25 + 0.75 * self._actor_updates / 2000.0)
