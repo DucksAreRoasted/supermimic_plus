@@ -62,7 +62,7 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     def _diagnostic_rollout(terminal_only: bool):
       diag_obs = self.wm_env.reset(start)
       diag_return, diag_survival = 0.0, 1.0
-      diag_term = torch.zeros_like(diag_survival)
+      diag_term = None
       for t in range(cfg.horizon):
         diag_actions = self._rollout_actor(diag_obs)
         diag_obs, diag_reward, diag_term, _ = self.wm_env.step(diag_actions)
@@ -70,7 +70,7 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
           diag_return = diag_return + cfg.gamma**t * diag_survival * diag_reward
         if cfg.survival_masking:
           diag_survival = diag_survival * (1 - diag_term)
-      if terminal_only:
+      if terminal_only and diag_term is not None:
         return self._bootstrap(diag_obs, diag_survival, diag_term).mean()
       return diag_return.mean()
 
