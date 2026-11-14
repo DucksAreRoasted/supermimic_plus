@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from tensordict import TensorDict
 
 from supermimic.learners.learner_utils import _optimize_step
 from supermimic.learners.policy_learner import ActorCriticPolicyLearner, gae_returns
@@ -13,6 +14,60 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     super().__init__(*args, **kwargs)
     self.sim_lambda = sim_lambda
     self._simulator_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    self._actor_updates = 0
+
+  def _beta_v(self) -> float:
+    return min(1.0, 0.25 + 0.75 * self._actor_updates / 2000.0)
+
+  def _bootstrap(self, obs, survival, term_prob):
+    value = super()._bootstrap(obs, survival, term_prob)
+    return self._beta_v() * value
+
+  def _train_batch(self, start):
+    cfg = self.cfg
+    obs = self.wm_env.reset(start)
+    survival = 1.0
+    rollout = []
+    for _ in range(cfg.horizon):
+      actions = self._rollout_actor(obs)
+      next_obs, reward, term_prob, _ = self.wm_env.step(actions)
+      rollout.append(TensorDict({"critic": obs["critic"].detach(), "reward": reward.detach(), "done": term_prob.detach()}, batch_size=reward.shape))
+      if cfg.survival_masking:
+        survival = survival * (1 - term_prob)
+      obs = next_obs
+    critic_logs = self._fit_critic(rollout, obs)
+    obs = self.wm_env.reset(start)
+    reward_ret, aux_loss, survival = 0.0, 0.0, 1.0
+    for t in range(cfg.horizon):
+      actions = self._rollout_actor(obs)
+      obs, reward, term_prob, _ = self.wm_env.step(actions)
+      reward_ret = reward_ret + cfg.gamma**t * survival * reward
+      aux_loss = aux_loss + getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
+      if cfg.survival_masking:
+        survival = survival * (1 - term_prob)
+    terminal = self._bootstrap(obs, survival, term_prob)
+    total_return = reward_ret + terminal
+    grads_r = torch.autograd.grad(reward_ret.mean(), self.actor_params, retain_graph=True, allow_unused=True)
+    grads_v = torch.autograd.grad(terminal.mean() if isinstance(terminal, torch.Tensor) else total_return.mean(), self.actor_params, retain_graph=True, allow_unused=True)
+    flat_r = [g.reshape(-1) for g in grads_r if g is not None]
+    flat_v = [g.reshape(-1) for g in grads_v if g is not None]
+    if flat_r and flat_v:
+      cosine = torch.nn.functional.cosine_similarity(
+        torch.cat(flat_r), torch.cat(flat_v), dim=0
+      )
+    else:
+      cosine = torch.zeros((), device=total_return.device)
+    loss = (-total_return + aux_loss).mean()
+    grad_norm = _optimize_step(self.actor_optimizers, loss, self.actor_params, 1.0, cfg.grad_clip_value)
+    self._actor_updates += 1
+    return {
+      "return": total_return.mean().detach(),
+      "grad_norm": grad_norm,
+      "actor_beta_v": torch.tensor(self._beta_v(), device=total_return.device),
+      "actor_gradient_cosine": cosine.detach(),
+      **critic_logs,
+      **getattr(self.actor, "auxiliary_stats", lambda: {})(),
+    }
 
   def set_simulator_batch(
     self,
