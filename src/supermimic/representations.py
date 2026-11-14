@@ -7,6 +7,8 @@ Two representations are provided:
 
 from __future__ import annotations
 
+import os
+
 import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Literal
@@ -234,7 +236,11 @@ def assemble_anchor_window(
   return rel_pos, rel_ori
 
 
-_compiled_assemble_goal = torch.compile(_assemble_goal)
+_compiled_assemble_goal = (
+  _assemble_goal
+  if os.getenv("SUPERMIMIC_DISABLE_COMPILE") == "1"
+  else torch.compile(_assemble_goal)
+)
 
 
 class StateRepresentation(nn.Module, ABC):
