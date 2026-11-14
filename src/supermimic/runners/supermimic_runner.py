@@ -657,6 +657,25 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     }
     return build_actor_obs_td(goals, self._collection_history(sensor))
 
+  def _build_critic_obs(
+    self,
+    rep_state: torch.Tensor,
+    aux_state: torch.Tensor,
+    motion_times: torch.Tensor,
+    sim_ctx: torch.Tensor,
+  ) -> torch.Tensor:
+    """Build the same privileged critic layout used by imagined rollouts.
+
+    The simulator's native ``obs["critic"]`` is a separate 286-D observation
+    and cannot be fed to the 771-D world-model critic.  Calibration must use
+    the representation state, WM goal window, and simulator context in the
+    exact order used by :meth:`WorldModelEnv._critic_obs`.
+    """
+    wm_goal, _ = self._representation.compute_wm_goal(
+      self.motion, motion_times, aux_state
+    )
+    return torch.cat([rep_state, wm_goal, sim_ctx], dim=-1)
+
   def _configure_reset_sampling(self) -> None:
     self._sampler: ReturnSampler | None = None
     env_mode = self.motion_cmd.cfg.sampling_mode
@@ -696,7 +715,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       actor_td = self._build_sim_obs_td(
         rep_state, aux_state, sim_actor_obs, motion_times, sim_ctx
       )
-      critic_obs = obs["critic"].to(self.device).detach()
+      critic_obs = self._build_critic_obs(
+        rep_state, aux_state, motion_times, sim_ctx
+      ).detach()
 
       actions = self.policy_learner.actor(actor_td)
       actions = actions + torch.randn_like(actions) * self.policy_learner.cfg.noise
