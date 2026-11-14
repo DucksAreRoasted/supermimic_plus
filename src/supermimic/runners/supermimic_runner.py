@@ -82,6 +82,7 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   twin_aggregation_kappa: float = 0.0
   sim_calibration_weight: float = 0.1
   sim_calibration_horizon: int = 32
+  sim_calibration_lambda: float = 1.0
   sim_calibration_interval: int = 1
   init_model_dir: str | None = None
   """Optional local actor/world-model/critic checkpoint to warm-start from."""
@@ -615,9 +616,14 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           if self.cfg.critic_variant == "sim-calibrated"
           else ActorCriticPolicyLearner
         )
+        learner_kwargs = {}
+        if self.cfg.critic_variant == "sim-calibrated":
+          learner_kwargs["sim_lambda"] = self.cfg.sim_calibration_lambda
         self.policy_learner = learner_cls(
-          actor, critic1, self.wm_env, policy_cfg, device=self.device
+          actor, critic1, self.wm_env, policy_cfg, device=self.device, **learner_kwargs
         )
+        if self.cfg.critic_variant == "sim-calibrated":
+          self.policy_learner.sim_calibration_weight = self.cfg.sim_calibration_weight
       else:
         assert critic2 is not None
         self.policy_learner = TwinActorCriticPolicyLearner(
@@ -732,16 +738,28 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         actor_td=actor_td,
         extra_fields=extra_fields,
       )
+      terminated = self.env.unwrapped.termination_manager.terminated
       if self.cfg.critic_variant == "sim-calibrated":
-        self._sim_calibration_obs.append(critic_obs)
+        next_full_state = next_obs["full_state"].to(self.device)
+        next_rep_state = self._representation.represent(next_full_state)
+        next_aux_state = self._representation.extract_aux_state(next_full_state)
+        next_sim_ctx = self._sim_context.read(self.env.unwrapped)
+        next_critic_obs = self._build_critic_obs(
+          next_rep_state,
+          next_aux_state,
+          self.motion_cmd.time_steps.to(self.device),
+          next_sim_ctx,
+        ).detach()
+        if not self._sim_calibration_obs:
+          self._sim_calibration_obs.append(critic_obs)
+        self._sim_calibration_obs.append(next_critic_obs)
         self._sim_calibration_rewards.append(rewards.detach())
-        self._sim_calibration_dones.append(dones.detach().float())
+        self._sim_calibration_dones.append(terminated.detach().float())
         max_window = max(1, self.cfg.sim_calibration_horizon)
-        del self._sim_calibration_obs[:-max_window]
+        del self._sim_calibration_obs[: -(max_window + 1)]
         del self._sim_calibration_rewards[:-max_window]
         del self._sim_calibration_dones[:-max_window]
       self._advance_sim_history(next_obs["actor"].to(self.device), dones)
-      terminated = self.env.unwrapped.termination_manager.terminated
       self.logger.process_env_step(rewards, terminated, extras)
 
       if self._sampler is not None:
@@ -761,24 +779,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     self._flush_normalization()
     return self.env.num_envs
-
-  def _sim_calibration_update(self, step: int) -> dict[str, torch.Tensor]:
-    if self.cfg.critic_variant != "sim-calibrated":
-      return {}
-    horizon = self.cfg.sim_calibration_horizon
-    if len(self._sim_calibration_obs) < horizon:
-      return {}
-    if step % self.cfg.sim_calibration_interval != 0:
-      return {}
-    obs = torch.stack(self._sim_calibration_obs[-horizon:])
-    rewards = torch.stack(self._sim_calibration_rewards[-horizon:])
-    dones = torch.stack(self._sim_calibration_dones[-horizon:])
-    return self.policy_learner.calibrate_from_simulator(
-      obs,
-      rewards,
-      dones,
-      self.cfg.sim_calibration_weight,
-    )
 
   def _update_actor_normalization(self, actor_inputs: tuple[TensorDict, ...]) -> None:
     self.policy_learner.actor.train()
@@ -825,8 +825,20 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         wm_learn_time += time.time() - start_wm_time
 
         start_policy_time = time.time()
+        if self.cfg.critic_variant == "sim-calibrated":
+          horizon = self.cfg.sim_calibration_horizon
+          if (
+            step % self.cfg.sim_calibration_interval == 0
+            and
+            len(self._sim_calibration_obs) == horizon + 1
+            and len(self._sim_calibration_rewards) == horizon
+          ):
+            self.policy_learner.set_simulator_batch(
+              torch.stack(self._sim_calibration_obs),
+              torch.stack(self._sim_calibration_rewards),
+              torch.stack(self._sim_calibration_dones),
+            )
         policy_logs = self.policy_learner.update()
-        policy_logs.update(self._sim_calibration_update(step))
         policy_learn_time += time.time() - start_policy_time
 
         loss_dict.update(wm_logs)
