@@ -37,6 +37,7 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
       self.cfg.gamma,
       self.cfg.lam,
     ).clamp(max=self._v_max)
+    self.critic.requires_grad_(True)
     imagined_obs = steps["critic"].flatten(0, 1)
     imagined_targets = imagined_returns.flatten(0, 1).detach()
     imagined_loss = torch.nn.functional.mse_loss(
@@ -64,7 +65,6 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
       sim_return = sim_targets.mean()
 
     total_loss = imagined_loss + sim_weight * sim_loss
-    self.critic.requires_grad_(True)
     grad_norm = _optimize_step(
       self.critic_optimizers,
       total_loss,
