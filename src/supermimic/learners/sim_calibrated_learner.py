@@ -17,6 +17,7 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     if hasattr(self.actor, "_orig_mod"):
       self.actor = self.actor._orig_mod
       self.actor_params = list(self.actor.parameters())
+      self._rollout_actor = self.actor
     self.sim_lambda = sim_lambda
     self._simulator_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     self._actor_updates = 0
