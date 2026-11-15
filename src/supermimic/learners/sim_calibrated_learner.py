@@ -15,6 +15,14 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     self.sim_lambda = sim_lambda
     self._simulator_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     self._actor_updates = 0
+    action_term = self.wm_env.env.unwrapped.action_manager.get_term(
+      self.wm_env.env.unwrapped.action_manager.active_terms[0]
+    )
+    device = self.actor_params[0].device
+    self._action_scale = action_term.scale.to(device).float().reshape(-1)
+    self._action_offset = action_term._offset.to(device).float().reshape(-1)
+    self._base_rollout_actor = self._rollout_actor
+    self._rollout_actor = self._reference_residual_actor
     # The simulator batch is injected dynamically between policy updates;
     # capturing the update before/after that branch changes is unsafe.
     self._captured_update = self._update_from
@@ -23,6 +31,13 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     # Keep the original Actor objective intact: the calibrated Critic should
     # improve the terminal value estimate without attenuating its bootstrap.
     return 1.0
+
+  def _reference_residual_actor(self, obs):
+    residual = self._base_rollout_actor(obs)
+    # Motion goal content is frame-major [joint_pos, joint_vel].
+    q_ref = obs["goal_motion"][..., : residual.shape[-1]]
+    ref_action = (q_ref - self._action_offset) / self._action_scale
+    return torch.clamp(ref_action + 0.2 * residual, -1.0, 1.0)
 
   def _bootstrap(self, obs, survival, term_prob):
     value = super()._bootstrap(obs, survival, term_prob)
