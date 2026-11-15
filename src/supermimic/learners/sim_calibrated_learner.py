@@ -20,8 +20,12 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
       action_manager.active_terms[0]
     )
     device = self.actor_params[0].device
-    self._action_scale = action_term.scale.to(device).float().reshape(-1)
-    self._action_offset = action_term._offset.to(device).float().reshape(-1)
+    self._action_scale = action_term.scale.to(device).float()
+    self._action_offset = action_term._offset.to(device).float()
+    if self._action_scale.ndim > 1:
+      self._action_scale = self._action_scale[0]
+    if self._action_offset.ndim > 1:
+      self._action_offset = self._action_offset[0]
     self._base_rollout_actor = self._rollout_actor
     self._rollout_actor = self._reference_residual_actor
     # The simulator batch is injected dynamically between policy updates;
