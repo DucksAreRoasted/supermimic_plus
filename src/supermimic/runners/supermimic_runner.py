@@ -31,6 +31,7 @@ from supermimic.learners.sim_calibrated_learner import (
 )
 from supermimic.learners.twin_policy_learner import TwinActorCriticPolicyLearner
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
+from supermimic.mirror import joint_mirror_permutation
 from supermimic.models import Dynamics, MultiEncoderAE, ReferenceResidualPolicy, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
@@ -74,6 +75,8 @@ class BaseRunnerCfg:
   """Center raw Actor actions on the current reference joint pose."""
   reference_residual_scale: float = 0.25
   """Raw-action residual amplitude around the reference pose."""
+  mirror_augmentation: bool = False
+  """Augment generalized-coordinate world-model windows with a joint mirror."""
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -321,8 +324,27 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       num_envs=self.env.num_envs,
       device=self.device,
     )
+    mirror_perm = None
+    if self.cfg.mirror_augmentation and self.cfg.representation == "gencoord":
+      mj_model = self.env.unwrapped.sim.mj_model
+      joint_names = [
+        mj_model.joint(i).name
+        for i in range(mj_model.njnt)
+        if mj_model.joint(i).type != 0
+      ]
+      perm, pairs = joint_mirror_permutation(joint_names)
+      if len(perm) != self._num_actions:
+        raise ValueError(
+          f"Mirror joint count {len(perm)} does not match action count {self._num_actions}"
+        )
+      mirror_perm = torch.tensor(perm, device=self.device)
+      print(f"[INFO] Mirror augmentation enabled: {len(pairs)} joints")
     self.world_model_learner = WorldModelLearner(
-      self._dynamics, self._representation, self.cfg.wm, device=self.device
+      self._dynamics,
+      self._representation,
+      self.cfg.wm,
+      device=self.device,
+      mirror_perm=mirror_perm,
     )
 
     self._pending_norm_updates: list[tuple] = []
