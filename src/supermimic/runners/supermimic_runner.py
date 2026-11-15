@@ -31,6 +31,7 @@ from supermimic.learners.sim_calibrated_learner import (
 )
 from supermimic.learners.twin_policy_learner import TwinActorCriticPolicyLearner
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
+from supermimic.mirror import joint_mirror_permutation
 from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
@@ -301,8 +302,20 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       num_envs=self.env.num_envs,
       device=self.device,
     )
+    mj_model = self.env.unwrapped.sim.mj_model
+    joint_names = [
+      mj_model.joint(i).name
+      for i in range(mj_model.njnt)
+      if mj_model.joint(i).type != 0
+    ]
+    mirror_perm, mirror_pairs = joint_mirror_permutation(joint_names)
+    print(f"[INFO] Mirror augmentation enabled for {len(mirror_pairs)} joints")
     self.world_model_learner = WorldModelLearner(
-      self._dynamics, self._representation, self.cfg.wm, device=self.device
+      self._dynamics,
+      self._representation,
+      self.cfg.wm,
+      device=self.device,
+      mirror_perm=torch.tensor(mirror_perm, device=self.device),
     )
 
     self._pending_norm_updates: list[tuple] = []
