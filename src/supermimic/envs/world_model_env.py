@@ -49,7 +49,6 @@ class WorldModelEnv(ABC):
     device: str = "cpu",
   ) -> None:
     self.device = device
-    self._env = env
     self.dynamics = dynamics
     self.representation = representation
     self.num_envs = batch_size

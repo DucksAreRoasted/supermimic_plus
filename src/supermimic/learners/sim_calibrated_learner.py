@@ -15,19 +15,6 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     self.sim_lambda = sim_lambda
     self._simulator_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     self._actor_updates = 0
-    action_manager = self.wm_env._env.unwrapped.action_manager
-    action_term = action_manager.get_term(
-      action_manager.active_terms[0]
-    )
-    device = self.actor_params[0].device
-    self._action_scale = action_term.scale.to(device).float()
-    self._action_offset = action_term._offset.to(device).float()
-    if self._action_scale.ndim > 1:
-      self._action_scale = self._action_scale[0]
-    if self._action_offset.ndim > 1:
-      self._action_offset = self._action_offset[0]
-    self._base_rollout_actor = self._rollout_actor
-    self._rollout_actor = self._reference_residual_actor
     # The simulator batch is injected dynamically between policy updates;
     # capturing the update before/after that branch changes is unsafe.
     self._captured_update = self._update_from
@@ -36,18 +23,6 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     # Keep the original Actor objective intact: the calibrated Critic should
     # improve the terminal value estimate without attenuating its bootstrap.
     return 1.0
-
-  def _reference_residual_actor(self, obs):
-    residual = torch.nan_to_num(self._base_rollout_actor(obs), nan=0.0, posinf=0.0, neginf=0.0)
-    # Motion goal content is frame-major [joint_pos, joint_vel].
-    q_ref = obs["goal_motion"][..., : residual.shape[-1]]
-    ref_action = (q_ref - self._action_offset) / self._action_scale.clamp_min(1e-6)
-    ref_action = torch.nan_to_num(ref_action, nan=0.0, posinf=0.0, neginf=0.0).clamp(-0.95, 0.95)
-    residual_scale = min(0.2, 0.2 * self._actor_updates / 2000.0)
-    action = torch.clamp(ref_action + residual_scale * residual.tanh(), -0.99, 0.99)
-    if not torch.isfinite(action).all():
-      raise FloatingPointError("reference-residual actor produced non-finite action")
-    return action
 
   def _bootstrap(self, obs, survival, term_prob):
     value = super()._bootstrap(obs, survival, term_prob)

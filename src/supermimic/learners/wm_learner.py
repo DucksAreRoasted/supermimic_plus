@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -53,13 +52,11 @@ class WorldModelLearner:
     representation: StateRepresentation,
     cfg: WorldModelLearnerCfg,
     device: str = "cpu",
-    mirror_perm: torch.Tensor | None = None,
   ) -> None:
     self.dynamics = dynamics
     self.representation = representation
     self.cfg = cfg
     self.device = device
-    self.mirror_perm = mirror_perm
 
     self._all_params = list(dynamics.parameters())
     self.optimizers = build_optimizers([dynamics], self.cfg.lr, device=self.device)
@@ -70,13 +67,12 @@ class WorldModelLearner:
       for name, attr in representation.LOSS_WEIGHT_CONFIG.items()
     }
 
-    compile_enabled = os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1"
-    self._compiled_rollout = torch.compile(self._rollout) if compile_enabled else self._rollout
-    self._compiled_compute_losses = torch.compile(self._compute_losses) if compile_enabled else self._compute_losses
-    self._compiled_represent = torch.compile(self.representation.represent) if compile_enabled else self.representation.represent
-    self._captured_update = (
-      CapturedUpdate(self._update_from, lambda: graph_state([dynamics, representation], self.optimizers))
-      if compile_enabled else self._update_from
+    self._compiled_rollout = torch.compile(self._rollout)
+    self._compiled_compute_losses = torch.compile(self._compute_losses)
+    self._compiled_represent = torch.compile(self.representation.represent)
+    self._captured_update = CapturedUpdate(
+      self._update_from,
+      lambda: graph_state([dynamics, representation], self.optimizers),
     )
 
   def update_normalization(self, states: torch.Tensor, actions: torch.Tensor) -> None:
@@ -113,16 +109,6 @@ class WorldModelLearner:
     stats = []
 
     for td in batches.unbind(0):
-      if self.mirror_perm is not None:
-        mirrored = td.clone()
-        state = mirrored["state"].clone()
-        action = mirrored["action"].clone()
-        state[..., 7:36] = state[..., 7:36][..., self.mirror_perm]
-        state[..., 42:71] = state[..., 42:71][..., self.mirror_perm]
-        action = action[..., self.mirror_perm]
-        mirrored["state"] = state
-        mirrored["action"] = action
-        td = torch.stack([td, mirrored], 0).flatten(0, 1)
       full_states = td["state"]
       actions = td["action"]
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import torch
@@ -29,9 +28,6 @@ class BpttPolicyLearnerCfg:
   survival_masking: bool = True
   beta2: float = 0.95  # faster Adam EMA recovery after gradient spikes
   grad_clip_value: float = 0.1  # per-parameter gradient element clipping
-  progress_lr_start: float = 1.0
-  progress_lr_end: float = 0.5
-  progress_lr_steps: int = 40000
 
 
 @dataclass
@@ -80,10 +76,7 @@ class BpttPolicyLearner:
       [self.actor], self.cfg.lr, betas=(0.9, self.cfg.beta2), device=device
     )
     self._rollout_actor = (
-      torch.compile(self.actor)
-      if torch.device(device).type == "cuda"
-      and os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1"
-      else self.actor
+      torch.compile(self.actor) if torch.device(device).type == "cuda" else self.actor
     )
     self._captured_update = CapturedUpdate(self._update_from, self._graph_state)
 
@@ -96,15 +89,6 @@ class BpttPolicyLearner:
     return self._captured_update(torch.stack(starts))
 
   def _update_from(self, starts: TensorDict) -> dict[str, torch.Tensor]:
-    progress = min(1.0, self._actor_updates / max(1, self.cfg.progress_lr_steps)) if hasattr(self, "_actor_updates") else 0.0
-    multiplier = self.cfg.progress_lr_start + (self.cfg.progress_lr_end - self.cfg.progress_lr_start) * progress
-    for optimizer in self.actor_optimizers:
-      for group in optimizer.param_groups:
-        lr = group["lr"]
-        if torch.is_tensor(lr):
-          lr.fill_(self.cfg.lr * multiplier)
-        else:
-          group["lr"] = self.cfg.lr * multiplier
     totals: dict[str, torch.Tensor] = {}
     for start in starts.unbind(0):
       for k, v in self._train_batch(start).items():
