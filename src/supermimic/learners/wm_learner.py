@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -69,12 +70,13 @@ class WorldModelLearner:
       for name, attr in representation.LOSS_WEIGHT_CONFIG.items()
     }
 
-    self._compiled_rollout = torch.compile(self._rollout)
-    self._compiled_compute_losses = torch.compile(self._compute_losses)
-    self._compiled_represent = torch.compile(self.representation.represent)
-    self._captured_update = CapturedUpdate(
-      self._update_from,
-      lambda: graph_state([dynamics, representation], self.optimizers),
+    compile_enabled = os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1"
+    self._compiled_rollout = torch.compile(self._rollout) if compile_enabled else self._rollout
+    self._compiled_compute_losses = torch.compile(self._compute_losses) if compile_enabled else self._compute_losses
+    self._compiled_represent = torch.compile(self.representation.represent) if compile_enabled else self.representation.represent
+    self._captured_update = (
+      CapturedUpdate(self._update_from, lambda: graph_state([dynamics, representation], self.optimizers))
+      if compile_enabled else self._update_from
     )
 
   def update_normalization(self, states: torch.Tensor, actions: torch.Tensor) -> None:
