@@ -65,7 +65,12 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     terminated: torch.Tensor,
   ) -> None:
     """Set one fixed H+1-state simulator window for the next critic update."""
-    self._simulator_batch = (critic_obs.detach(), rewards.detach(), terminated.detach())
+    device = self.actor_params[0].device
+    self._simulator_batch = (
+      critic_obs.detach().to(device),
+      rewards.detach().to(device),
+      terminated.detach().to(device),
+    )
 
   def _fit_critic(self, rollout, last_obs) -> dict[str, torch.Tensor]:
     sim_weight = getattr(self, "sim_calibration_weight", 0.0)
