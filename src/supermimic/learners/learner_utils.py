@@ -44,6 +44,8 @@ def _optimize_step(
   clip_value: float = 0.0,
 ) -> torch.Tensor | None:
   """Run one optimizer step: zero_grad -> backward -> optional clip -> step."""
+  if not torch.isfinite(loss).all():
+    raise FloatingPointError("non-finite loss before optimizer step")
   for optimizer in optimizers:
     optimizer.zero_grad(set_to_none=True)
   loss.backward()

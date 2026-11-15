@@ -38,11 +38,16 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     return 1.0
 
   def _reference_residual_actor(self, obs):
-    residual = self._base_rollout_actor(obs)
+    residual = torch.nan_to_num(self._base_rollout_actor(obs), nan=0.0, posinf=0.0, neginf=0.0)
     # Motion goal content is frame-major [joint_pos, joint_vel].
     q_ref = obs["goal_motion"][..., : residual.shape[-1]]
-    ref_action = (q_ref - self._action_offset) / self._action_scale
-    return torch.clamp(ref_action + 0.2 * residual, -1.0, 1.0)
+    ref_action = (q_ref - self._action_offset) / self._action_scale.clamp_min(1e-6)
+    ref_action = torch.nan_to_num(ref_action, nan=0.0, posinf=0.0, neginf=0.0).clamp(-0.95, 0.95)
+    residual_scale = min(0.2, 0.2 * self._actor_updates / 2000.0)
+    action = torch.clamp(ref_action + residual_scale * residual.tanh(), -0.99, 0.99)
+    if not torch.isfinite(action).all():
+      raise FloatingPointError("reference-residual actor produced non-finite action")
+    return action
 
   def _bootstrap(self, obs, survival, term_prob):
     value = super()._bootstrap(obs, survival, term_prob)
