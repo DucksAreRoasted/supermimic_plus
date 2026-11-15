@@ -20,7 +20,9 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     self._captured_update = self._update_from
 
   def _beta_v(self) -> float:
-    return min(1.0, 0.25 + 0.75 * self._actor_updates / 2000.0)
+    # Keep the original Actor objective intact: the calibrated Critic should
+    # improve the terminal value estimate without attenuating its bootstrap.
+    return 1.0
 
   def _bootstrap(self, obs, survival, term_prob):
     value = super()._bootstrap(obs, survival, term_prob)
