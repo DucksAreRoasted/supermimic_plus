@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -79,7 +80,10 @@ class BpttPolicyLearner:
       [self.actor], self.cfg.lr, betas=(0.9, self.cfg.beta2), device=device
     )
     self._rollout_actor = (
-      torch.compile(self.actor) if torch.device(device).type == "cuda" else self.actor
+      torch.compile(self.actor)
+      if torch.device(device).type == "cuda"
+      and os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1"
+      else self.actor
     )
     self._captured_update = CapturedUpdate(self._update_from, self._graph_state)
 
