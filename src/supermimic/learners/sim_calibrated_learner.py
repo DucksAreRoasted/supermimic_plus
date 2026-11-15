@@ -15,6 +15,9 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     self.sim_lambda = sim_lambda
     self._simulator_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     self._actor_updates = 0
+    # The simulator batch is injected dynamically between policy updates;
+    # capturing the update before/after that branch changes is unsafe.
+    self._captured_update = self._update_from
 
   def _beta_v(self) -> float:
     return min(1.0, 0.25 + 0.75 * self._actor_updates / 2000.0)
