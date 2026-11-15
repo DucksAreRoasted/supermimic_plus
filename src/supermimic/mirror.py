@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-_SIDE = re.compile(r"^(left|right|l|r)([_-].*)$", re.IGNORECASE)
+_SIDE = re.compile(r"^(.*[/])?(left|right|l|r)([_-].*)$", re.IGNORECASE)
 
 
 def joint_mirror_permutation(joint_names: list[str]) -> tuple[list[int], list[str]]:
@@ -18,9 +18,10 @@ def joint_mirror_permutation(joint_names: list[str]) -> tuple[list[int], list[st
       perm.append(lookup[name.lower()])
       pairs.append(name)
       continue
-    side, suffix = match.groups()
-    opposite = ("right" if side.lower() in {"left", "l"} else "left") + suffix
-    short = ("r" if side.lower() in {"left", "l"} else "l") + suffix
+    prefix, side, suffix = match.groups()
+    prefix = prefix or ""
+    opposite = prefix + ("right" if side.lower() in {"left", "l"} else "left") + suffix
+    short = prefix + ("r" if side.lower() in {"left", "l"} else "l") + suffix
     idx = lookup.get(opposite.lower(), lookup.get(short.lower()))
     if idx is None:
       raise ValueError(f"No mirror partner found for joint {name!r}")
