@@ -15,8 +15,9 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     self.sim_lambda = sim_lambda
     self._simulator_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     self._actor_updates = 0
-    action_term = self.wm_env.env.unwrapped.action_manager.get_term(
-      self.wm_env.env.unwrapped.action_manager.active_terms[0]
+    action_manager = self.wm_env._env.unwrapped.action_manager
+    action_term = action_manager.get_term(
+      action_manager.active_terms[0]
     )
     device = self.actor_params[0].device
     self._action_scale = action_term.scale.to(device).float().reshape(-1)
