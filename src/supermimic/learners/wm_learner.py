@@ -190,7 +190,7 @@ class WorldModelLearner:
     )
     loss_state = (group_mse * weights * widths).sum() / widths.sum()
     q_pred, v_pred = pred_aux_states[..., 7:36], pred_aux_states[..., 42:71]
-    q_gt, v_gt = gt_aux_states[..., 7:36], gt_aux_states[..., 42:71]
+    v_gt = gt_aux_states[..., 42:71]
     q_step = q_pred[:, 1:] - q_pred[:, :-1]
     semi_err = q_step - self.representation.dt * v_pred[:, 1:]
     accel_pred = (v_pred[:, 1:] - v_pred[:, :-1]) / self.representation.dt
