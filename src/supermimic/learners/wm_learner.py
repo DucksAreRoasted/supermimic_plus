@@ -195,6 +195,12 @@ class WorldModelLearner:
     semi_err = q_step - self.representation.dt * v_pred[:, 1:]
     accel_pred = (v_pred[:, 1:] - v_pred[:, :-1]) / self.representation.dt
     accel_gt = (v_gt[:, 1:] - v_gt[:, :-1]) / self.representation.dt
-    semi_loss = torch.nan_to_num(semi_err, nan=0.0, posinf=0.0, neginf=0.0).square().mean()
-    accel_loss = torch.nan_to_num(accel_pred - accel_gt, nan=0.0, posinf=0.0, neginf=0.0).square().mean()
+    semi_loss = torch.nan_to_num(
+      torch.nan_to_num(semi_err, nan=0.0, posinf=0.0, neginf=0.0).square().mean(),
+      nan=0.0, posinf=0.0, neginf=0.0
+    )
+    accel_loss = torch.nan_to_num(
+      torch.nan_to_num(accel_pred - accel_gt, nan=0.0, posinf=0.0, neginf=0.0).square().mean(),
+      nan=0.0, posinf=0.0, neginf=0.0
+    )
     return loss_state, group_mse, semi_loss, accel_loss
