@@ -125,7 +125,7 @@ class WorldModelLearner:
       )
 
       # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
-      loss_state, group_mse, semi_loss, accel_loss = self._compiled_compute_losses(
+      loss_state, group_mse = self._compiled_compute_losses(
         pred_rep_states,
         pred_aux_states,
         all_rep_states[:, 1:],
@@ -133,13 +133,12 @@ class WorldModelLearner:
       )
 
       # 3. Backprop
-      total_loss = loss_state + 0.1 * semi_loss + 0.05 * accel_loss
-      _optimize_step(self.optimizers, total_loss, self._all_params, max_norm=1.0)
+      _optimize_step(self.optimizers, loss_state, self._all_params, max_norm=1.0)
 
       # 4. Logging
-      stats.append(torch.cat([loss_state.unsqueeze(0), group_mse, semi_loss.unsqueeze(0), accel_loss.unsqueeze(0)]).detach())
+      stats.append(torch.cat([loss_state.unsqueeze(0), group_mse]).detach())
 
-    names = ["state", *self.loss_group_weights, "semi_implicit", "acceleration_compensation"]
+    names = ["state", *self.loss_group_weights]
     means = torch.stack(stats).mean(0)
     return {f"Loss/{name}": m for name, m in zip(names, means, strict=True)}
 
@@ -149,7 +148,7 @@ class WorldModelLearner:
     actions: torch.Tensor,
     init_aux: torch.Tensor,
     sim_ctx: torch.Tensor,
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  ) -> tuple[torch.Tensor, torch.Tensor]:
     """Autoregressive rollout over the window's actions.
 
     The prediction from the last action is never scored, so the rollout stops
@@ -189,22 +188,4 @@ class WorldModelLearner:
       [group_mse.new_full((), self.loss_group_weights[name]) for name in sq_errs]
     )
     loss_state = (group_mse * weights * widths).sum() / widths.sum()
-    pred_joint = self.representation.joint_state(pred_rep_states)
-    gt_joint = self.representation.joint_state(gt_rep_states)
-    half = pred_joint.shape[-1] // 2
-    q_pred, v_pred = pred_joint[..., :half], pred_joint[..., half:]
-    v_gt = gt_joint[..., half:]
-    q_step = q_pred[:, 1:] - q_pred[:, :-1]
-    semi_err = q_step - self.representation.dt * v_pred[:, 1:]
-    accel_pred = (v_pred[:, 1:] - v_pred[:, :-1]) / self.representation.dt
-    accel_gt = (v_gt[:, 1:] - v_gt[:, :-1]) / self.representation.dt
-    accel_scale = accel_gt.detach().std(dim=(0, 1), keepdim=True).clamp_min(1e-3)
-    semi_loss = torch.nan_to_num(
-      torch.nan_to_num(semi_err, nan=0.0, posinf=0.0, neginf=0.0).square().mean(),
-      nan=0.0, posinf=0.0, neginf=0.0
-    )
-    accel_loss = torch.nan_to_num(
-      torch.nan_to_num((accel_pred - accel_gt) / accel_scale, nan=0.0, posinf=0.0, neginf=0.0).square().mean(),
-      nan=0.0, posinf=0.0, neginf=0.0
-    )
-    return loss_state, group_mse, semi_loss, accel_loss
+    return loss_state, group_mse

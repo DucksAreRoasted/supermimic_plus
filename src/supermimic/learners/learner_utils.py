@@ -112,6 +112,9 @@ class CapturedUpdate:
     if not state[0].is_cuda:
       return self._fn(inputs)
     with torch.cuda.device(state[0].device):
+      # CUDA Graph capture requires every input buffer to live on the capture
+      # device. Replay samples may be CPU-backed TensorDicts.
+      inputs = inputs.to(state[0].device)
       stream, pool = _capture_stream_and_pool(state[0].device)
       if self._inputs is None:
         self._inputs = inputs.clone()
