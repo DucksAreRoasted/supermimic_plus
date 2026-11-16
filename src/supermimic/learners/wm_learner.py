@@ -199,7 +199,12 @@ class WorldModelLearner:
       joint_pos = pred_aux_states[..., 7:36]
       joint_vel = pred_aux_states[..., 42:71]
       kin_err = (joint_pos[:, 1:] - joint_pos[:, :-1]) / dt - joint_vel[:, 1:]
-      kin_loss = torch.nan_to_num(kin_err, nan=0.0, posinf=0.0, neginf=0.0).square().mean()
+      kin_loss = torch.nan_to_num(
+        torch.nan_to_num(kin_err, nan=0.0, posinf=0.0, neginf=0.0).square().mean(),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+      )
     else:
       kin_loss = loss_state.new_zeros(())
     return loss_state, group_mse, kin_loss
