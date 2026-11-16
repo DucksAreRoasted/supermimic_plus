@@ -4,14 +4,7 @@ from __future__ import annotations
 
 import os
 import glob
-import torch
 from dataclasses import dataclass
-
-if os.getenv("SUPERMIMIC_DISABLE_COMPILE") == "1":
-  try:
-    torch._functorch.config.donated_buffer = False
-  except AttributeError:
-    pass
 
 import mjlab.tasks  # noqa: F401
 import tyro
