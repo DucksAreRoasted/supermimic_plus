@@ -198,7 +198,8 @@ class WorldModelLearner:
     if pred_aux_states.shape[1] > 1:
       joint_pos = pred_aux_states[..., 7:36]
       joint_vel = pred_aux_states[..., 42:71]
-      kin_loss = (((joint_pos[:, 1:] - joint_pos[:, :-1]) / dt - joint_vel[:, 1:]) ** 2).mean()
+      kin_err = (joint_pos[:, 1:] - joint_pos[:, :-1]) / dt - joint_vel[:, 1:]
+      kin_loss = torch.where(torch.isfinite(kin_err), kin_err, torch.zeros_like(kin_err)).square().mean()
     else:
       kin_loss = loss_state.new_zeros(())
     return loss_state, group_mse, kin_loss
