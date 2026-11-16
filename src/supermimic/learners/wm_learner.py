@@ -57,6 +57,9 @@ class WorldModelLearner:
     self.representation = representation
     self.cfg = cfg
     self.device = device
+    self._wm_updates = 0
+    self.kinematic_loss_weight = 0.1
+    self.kinematic_warmup = 1000
 
     self._all_params = list(dynamics.parameters())
     self.optimizers = build_optimizers([dynamics], self.cfg.lr, device=self.device)
@@ -125,7 +128,7 @@ class WorldModelLearner:
       )
 
       # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
-      loss_state, group_mse = self._compiled_compute_losses(
+      loss_state, group_mse, kin_loss = self._compiled_compute_losses(
         pred_rep_states,
         pred_aux_states,
         all_rep_states[:, 1:],
@@ -133,12 +136,15 @@ class WorldModelLearner:
       )
 
       # 3. Backprop
-      _optimize_step(self.optimizers, loss_state, self._all_params, max_norm=1.0)
+      warmup = min(1.0, self._wm_updates / max(1, self.kinematic_warmup))
+      total_loss = loss_state + self.kinematic_loss_weight * warmup * kin_loss
+      _optimize_step(self.optimizers, total_loss, self._all_params, max_norm=1.0)
 
       # 4. Logging
-      stats.append(torch.cat([loss_state.unsqueeze(0), group_mse]).detach())
+      stats.append(torch.cat([loss_state.unsqueeze(0), group_mse, kin_loss.unsqueeze(0)]).detach())
+    self._wm_updates += 1
 
-    names = ["state", *self.loss_group_weights]
+    names = ["state", *self.loss_group_weights, "kinematic_consistency"]
     means = torch.stack(stats).mean(0)
     return {f"Loss/{name}": m for name, m in zip(names, means, strict=True)}
 
@@ -148,7 +154,7 @@ class WorldModelLearner:
     actions: torch.Tensor,
     init_aux: torch.Tensor,
     sim_ctx: torch.Tensor,
-  ) -> tuple[torch.Tensor, torch.Tensor]:
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Autoregressive rollout over the window's actions.
 
     The prediction from the last action is never scored, so the rollout stops
@@ -188,4 +194,11 @@ class WorldModelLearner:
       [group_mse.new_full((), self.loss_group_weights[name]) for name in sq_errs]
     )
     loss_state = (group_mse * weights * widths).sum() / widths.sum()
-    return loss_state, group_mse
+    dt = self.representation.dt
+    if pred_aux_states.shape[1] > 1:
+      joint_pos = pred_aux_states[..., 7:36]
+      joint_vel = pred_aux_states[..., 42:71]
+      kin_loss = (((joint_pos[:, 1:] - joint_pos[:, :-1]) / dt - joint_vel[:, 1:]) ** 2).mean()
+    else:
+      kin_loss = loss_state.new_zeros(())
+    return loss_state, group_mse, kin_loss
