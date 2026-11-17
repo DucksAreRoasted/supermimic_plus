@@ -287,6 +287,17 @@ class ReferenceResidualPolicy(nn.Module):
     self.residual_scale = float(residual_scale)
     self.register_buffer("action_scale", action_scale.clone())
     self.register_buffer("action_offset", action_offset.clone())
+    # Start exactly at the reference policy so early gradients are useful.
+    last_linear = next(
+      (module for module in reversed(list(self.actor.decoder))
+       if isinstance(module, nn.Linear)),
+      None,
+    )
+    if last_linear is None:
+      raise ValueError("ReferenceResidualPolicy requires a linear decoder output")
+    nn.init.zeros_(last_linear.weight)
+    if last_linear.bias is not None:
+      nn.init.zeros_(last_linear.bias)
 
   def forward(self, obs_td: TensorDict) -> torch.Tensor:
     residual = self.actor(obs_td)
