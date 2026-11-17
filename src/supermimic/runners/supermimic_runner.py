@@ -361,6 +361,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       device=self.device,
       mirror_perm=mirror_perm,
       mirror_sign=mirror_sign,
+      mirror_context_slices={
+        name: self._sim_context.find(name)
+        for name in ("base_com", "encoder_bias")
+      },
     )
 
     self._pending_norm_updates: list[tuple] = []

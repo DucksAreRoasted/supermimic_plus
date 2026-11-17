@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import re
 
+import torch
+from mjlab.utils.lab_api.math import matrix_from_quat
+
+from supermimic.utils.helpers import matrix_to_quat
+
 _SIDE = re.compile(r"^(.*[/])?(left|right|l|r)([_-].*)$", re.IGNORECASE)
 
 
@@ -42,3 +47,19 @@ def joint_mirror_signs(joint_names: list[str]) -> list[float]:
     token = name.lower().split("/")[-1]
     signs.append(-1.0 if ("roll" in token or "yaw" in token) else 1.0)
   return signs
+
+
+def mirror_full_state(
+  full_state: torch.Tensor, perm: torch.Tensor, sign: torch.Tensor
+) -> torch.Tensor:
+  """Reflect a GenCoord full state across the sagittal plane."""
+  out = full_state.clone()
+  M = torch.diag(torch.tensor((1.0, -1.0, 1.0), device=full_state.device, dtype=full_state.dtype))
+  out[..., 0:3] = full_state[..., 0:3] @ M
+  R = matrix_from_quat(full_state[..., 3:7])
+  out[..., 3:7] = matrix_to_quat(M @ R @ M)
+  out[..., 7:36] = full_state[..., 7:36][..., perm] * sign
+  out[..., 36:39] = full_state[..., 36:39] @ M
+  out[..., 39:42] = -(full_state[..., 39:42] @ M)
+  out[..., 42:71] = full_state[..., 42:71][..., perm] * sign
+  return out

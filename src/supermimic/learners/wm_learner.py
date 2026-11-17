@@ -15,6 +15,7 @@ from supermimic.learners.learner_utils import (
   build_optimizers,
   graph_state,
 )
+from supermimic.mirror import mirror_full_state
 
 if TYPE_CHECKING:
   from supermimic.models import Dynamics
@@ -54,6 +55,7 @@ class WorldModelLearner:
     device: str = "cpu",
     mirror_perm: torch.Tensor | None = None,
     mirror_sign: torch.Tensor | None = None,
+    mirror_context_slices: dict[str, slice | None] | None = None,
   ) -> None:
     self.dynamics = dynamics
     self.representation = representation
@@ -61,6 +63,7 @@ class WorldModelLearner:
     self.device = device
     self.mirror_perm = mirror_perm
     self.mirror_sign = mirror_sign
+    self.mirror_context_slices = mirror_context_slices or {}
 
     self._all_params = list(dynamics.parameters())
     self.optimizers = build_optimizers([dynamics], self.cfg.lr, device=self.device)
@@ -117,15 +120,21 @@ class WorldModelLearner:
         mirrored = td.clone()
         state = mirrored["state"].clone()
         action = mirrored["action"].clone()
-        state[..., 7:36] = state[..., 7:36][..., self.mirror_perm]
-        state[..., 42:71] = state[..., 42:71][..., self.mirror_perm]
+        if self.mirror_sign is None:
+          raise RuntimeError("mirror_sign must be provided with mirror_perm")
+        state = mirror_full_state(state, self.mirror_perm, self.mirror_sign)
         action = action[..., self.mirror_perm]
-        if self.mirror_sign is not None:
-          state[..., 7:36] = state[..., 7:36] * self.mirror_sign
-          state[..., 42:71] = state[..., 42:71] * self.mirror_sign
-          action = action * self.mirror_sign
+        action = action * self.mirror_sign
+        sim_ctx = mirrored["sim_ctx"].clone()
+        com = self.mirror_context_slices.get("base_com")
+        if com is not None:
+          sim_ctx[..., com.start + 1] = -sim_ctx[..., com.start + 1]
+        bias = self.mirror_context_slices.get("encoder_bias")
+        if bias is not None:
+          sim_ctx[..., bias] = sim_ctx[..., bias][..., self.mirror_perm] * self.mirror_sign
         mirrored["state"] = state
         mirrored["action"] = action
+        mirrored["sim_ctx"] = sim_ctx
         td = torch.stack([td, mirrored], 0).flatten(0, 1)
       full_states = td["state"]
       actions = td["action"]
