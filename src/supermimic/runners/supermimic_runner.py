@@ -33,6 +33,7 @@ from supermimic.learners.twin_policy_learner import TwinActorCriticPolicyLearner
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.mirror import joint_mirror_permutation, joint_mirror_signs
 from supermimic.models import Dynamics, MultiEncoderAE, ReferenceResidualPolicy, build_mlp
+from supermimic.mjlab_cuda_graph_env import CapturedDeviceStep
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
 from supermimic.runners.exporter import export_actor_as_onnx
@@ -78,7 +79,7 @@ class BaseRunnerCfg:
   mirror_augmentation: bool = False
   """Augment generalized-coordinate world-model windows with a joint mirror."""
   cuda_graph_collection: bool = False
-  """Compile the fixed-shape MuJoCo collection step with reduce-overhead mode."""
+  """Use the explicit fixed-shape device collection graph."""
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -319,17 +320,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self.action_manager = self.env.unwrapped.action_manager
     self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     self.motion = self.motion_cmd.motion
-
-    if (
-      self.cfg.cuda_graph_collection
-      and self.device.startswith("cuda")
-      and os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1"
-    ):
-      # The collection graph is intentionally opt-in: env.step mutates the
-      # simulator and must be compiled only after the final env shape is fixed.
-      self.env.step = torch.compile(self.env.step, mode="reduce-overhead")
-      self.env.reset = torch.compile(self.env.reset, mode="reduce-overhead")
-      print("[INFO] CUDA graph collection mode enabled")
+    self._captured_device_step: CapturedDeviceStep | None = None
+    if self.cfg.cuda_graph_collection and self.device.startswith("cuda"):
+      print("[INFO] Capturing explicit device collection graph")
+      self._captured_device_step = CapturedDeviceStep(self.env.unwrapped)
 
     self.replay_buffer = ReplayBuffer(
       schema=self._buffer_schema(),
@@ -516,7 +510,13 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     raw_actions = actions.detach().clone()
     prev_action = self.action_manager.action.clone()
 
-    next_obs, rewards, dones, extras = self.env.step(actions)
+    if self._captured_device_step is None:
+      next_obs, rewards, dones, extras = self.env.step(actions)
+    else:
+      rewards, terminated, truncated, _ = self._captured_device_step(actions)
+      next_obs = self.env.get_observations()
+      dones = terminated | truncated
+      extras = {"time_outs": truncated}
 
     truncated = extras.get(
       "time_outs",

@@ -77,3 +77,36 @@ class DeviceStepAdapter:
     self.env.action_manager._prev_action.masked_fill_(mask[:, None], 0.0)
     self.env.action_manager._prev_prev_action.masked_fill_(mask[:, None], 0.0)
 
+
+class CapturedDeviceStep:
+  """CUDA-graph wrapper around :class:`DeviceStepAdapter`."""
+
+  def __init__(self, env):
+    self.adapter = DeviceStepAdapter(env)
+    self.env = env
+    self.action = self.adapter.action
+    self._graph = torch.cuda.CUDAGraph()
+    self._warmup_step()
+    env.reset()
+    stream = torch.cuda.Stream(device=self.action.device)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(self._graph, stream=stream):
+      self._outputs = self._capture_body(self.action)
+    torch.cuda.current_stream().wait_stream(stream)
+
+  def _capture_body(self, action: torch.Tensor):
+    out = self.adapter.step_core_device(action)
+    self.adapter.reset_mask.copy_(self.adapter.reset_buf)
+    self.adapter.reset_masked(self.adapter.reset_mask)
+    return out
+
+  def _warmup_step(self) -> None:
+    for _ in range(2):
+      self._capture_body(self.action)
+    torch.cuda.synchronize(self.action.device)
+
+  def __call__(self, action: torch.Tensor):
+    self.action.copy_(action)
+    self._graph.replay()
+    return tuple(x.clone() for x in self._outputs)
+
