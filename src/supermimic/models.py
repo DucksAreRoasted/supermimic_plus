@@ -295,6 +295,13 @@ class ReferenceResidualPolicy(nn.Module):
     reference = (joint_pos - self.action_offset) / self.action_scale.clamp_min(1e-6)
     return (reference + self.residual_scale * residual).clamp(-1.0, 1.0)
 
+  @property
+  def task_specs(self):
+    return self.actor.task_specs
+
+  def slot_ranges(self, batch_size: int):
+    return self.actor.slot_ranges(batch_size)
+
   def auxiliary_loss(self) -> torch.Tensor:
     return self.actor.auxiliary_loss()
 
