@@ -32,12 +32,13 @@ def _capture(fn, *inputs):
 def main() -> None:
   assert torch.cuda.is_available(), "CUDA is required"
   device = torch.device("cuda:0")
+  env_device = "cuda"
   cfg = load_env_cfg("SuperMimic-GenCoord-G1")
   cfg.scene.num_envs = 16
   cfg.commands["motion"].motion_file = glob.glob(
     "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk1_subject1.npz"
   )
-  env = ManagerBasedRlEnv(cfg=cfg, device=device)
+  env = ManagerBasedRlEnv(cfg=cfg, device=env_device)
   env.reset()
 
   command = env.command_manager.get_term("motion")
