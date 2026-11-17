@@ -18,10 +18,13 @@ import supermimic.tasks  # noqa: F401
 
 
 def _capture(fn, *inputs):
-  stream = torch.cuda.current_stream()
+  stream = torch.cuda.Stream()
+  current = torch.cuda.current_stream()
+  stream.wait_stream(current)
   for _ in range(2):
-    fn(*inputs)
-  torch.cuda.synchronize()
+    with torch.cuda.stream(stream):
+      fn(*inputs)
+  current.wait_stream(stream)
   graph = torch.cuda.CUDAGraph()
   with torch.cuda.graph(graph, stream=stream):
     fn(*inputs)
