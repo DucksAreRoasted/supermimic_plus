@@ -78,7 +78,7 @@ class BaseRunnerCfg:
   mirror_augmentation: bool = False
   """Augment generalized-coordinate world-model windows with a joint mirror."""
   cuda_graph_collection: bool = False
-  """Capture the fixed-shape MuJoCo-Warp step in an explicit CUDA graph."""
+  """Compile the fixed-shape MuJoCo collection step with reduce-overhead mode."""
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -147,51 +147,6 @@ class WorldModel:
     """Load a ``world_model.pt`` bundle."""
     self.dynamics.load_state_dict(bundle["dynamics"])
     self.sim_context.load_state_dict(bundle["sim_context"])
-
-
-class _CapturedEnvStep:
-  """Explicit fixed-shape CUDA graph for the MuJoCo-Warp environment step.
-
-  The action buffer and returned device tensors stay at stable addresses. The
-  Python-side runner still handles episode logging and reset decisions outside
-  the graph; this keeps dynamic TensorDict metadata out of capture.
-  """
-
-  def __init__(self, env, num_envs: int, num_actions: int, device: str):
-    if not torch.cuda.is_available() or not str(device).startswith("cuda"):
-      raise RuntimeError("_CapturedEnvStep requires a CUDA device")
-    self.env = env
-    self.device = torch.device(device)
-    self.action = torch.zeros(
-      (num_envs, num_actions), device=self.device, dtype=torch.float32
-    )
-    self._graph = torch.cuda.CUDAGraph()
-    # The warmup uses the same fixed input and is intentionally followed by a
-    # reset by the caller, so capture never consumes training transitions.
-    for _ in range(3):
-      self.env.step(self.action)
-    torch.cuda.synchronize(self.device)
-    with torch.cuda.graph(self._graph):
-      self._outputs = self.env.step(self.action)
-
-  @staticmethod
-  def _clone(value):
-    if isinstance(value, TensorDict):
-      return value.clone()
-    if isinstance(value, torch.Tensor):
-      return value.clone()
-    if isinstance(value, tuple):
-      return tuple(_CapturedEnvStep._clone(v) for v in value)
-    if isinstance(value, list):
-      return [_CapturedEnvStep._clone(v) for v in value]
-    if isinstance(value, dict):
-      return {k: _CapturedEnvStep._clone(v) for k, v in value.items()}
-    return value
-
-  def __call__(self, actions: torch.Tensor):
-    self.action.copy_(actions)
-    self._graph.replay()
-    return self._clone(self._outputs)
 
 
 def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
@@ -365,18 +320,16 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     self.motion = self.motion_cmd.motion
 
-    self._captured_env_step: _CapturedEnvStep | None = None
     if (
       self.cfg.cuda_graph_collection
       and self.device.startswith("cuda")
       and os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1"
     ):
-      print("[INFO] Capturing explicit CUDA graph for MuJoCo-Warp collection step")
-      self._captured_env_step = _CapturedEnvStep(
-        self.env, self.env.num_envs, self.env.num_actions, self.device
-      )
-      # Discard warmup/capture transitions before the real history seed.
-      self.env.reset()
+      # The collection graph is intentionally opt-in: env.step mutates the
+      # simulator and must be compiled only after the final env shape is fixed.
+      self.env.step = torch.compile(self.env.step, mode="reduce-overhead")
+      self.env.reset = torch.compile(self.env.reset, mode="reduce-overhead")
+      print("[INFO] CUDA graph collection mode enabled")
 
     self.replay_buffer = ReplayBuffer(
       schema=self._buffer_schema(),
@@ -842,20 +795,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       if self._stores_actor_obs:
         extra_fields["actor_obs"] = sim_actor_obs
 
-      if self._captured_env_step is not None:
-        original_step = self.env.step
-        self.env.step = self._captured_env_step
-        try:
-          next_obs, rewards, dones, extras = self._step_and_store(
-            actions,
-            curr_states,
-            actor_td=actor_td,
-            extra_fields=extra_fields,
-          )
-        finally:
-          self.env.step = original_step
-      else:
-        next_obs, rewards, dones, extras = self._step_and_store(
+      next_obs, rewards, dones, extras = self._step_and_store(
         actions,
         curr_states,
         actor_td=actor_td,
