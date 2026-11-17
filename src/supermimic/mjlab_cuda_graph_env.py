@@ -28,6 +28,9 @@ class DeviceStepAdapter:
     self.reset_buf = torch.zeros_like(self.reset_mask)
     self.reset_terminated = torch.zeros_like(self.reset_mask)
     self.reset_time_outs = torch.zeros_like(self.reset_mask)
+    self.reward_buf = torch.zeros(
+      (self.num_envs,), device=self.device, dtype=torch.float32
+    )
 
   def step_core_device(self, action: torch.Tensor):
     """Run one fixed-shape action/physics/reward step.
@@ -46,11 +49,11 @@ class DeviceStepAdapter:
     self.reset_buf.copy_(self.env.termination_manager.compute())
     self.reset_terminated.copy_(self.env.termination_manager.terminated)
     self.reset_time_outs.copy_(self.env.termination_manager.time_outs)
-    self.env.reward_buf.copy_(
+    self.reward_buf.copy_(
       self.env.reward_manager.compute(dt=self.env.step_dt)
     )
     return (
-      self.env.reward_buf,
+      self.reward_buf,
       self.reset_terminated,
       self.reset_time_outs,
       self.env.episode_length_buf,
