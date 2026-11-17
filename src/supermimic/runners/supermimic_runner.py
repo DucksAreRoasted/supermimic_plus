@@ -31,7 +31,7 @@ from supermimic.learners.sim_calibrated_learner import (
 )
 from supermimic.learners.twin_policy_learner import TwinActorCriticPolicyLearner
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
-from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
+from supermimic.models import Dynamics, MultiEncoderAE, ReferenceResidualPolicy, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
 from supermimic.runners.exporter import export_actor_as_onnx
@@ -70,6 +70,10 @@ class BaseRunnerCfg:
   """Add a learned residual correction head to the physics-integrated WM."""
   residual_scale: float = 0.1
   """Initial residual contribution scale; kept small for stable warm-up."""
+  reference_residual_policy: bool = False
+  """Center raw Actor actions on the current reference joint pose."""
+  reference_residual_scale: float = 0.25
+  """Raw-action residual amplitude around the reference pose."""
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -204,7 +208,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
 
 def build_actor(
   cfg: SuperMimicRunnerCfg, wm: WorldModel, device: str
-) -> MultiEncoderAE:
+) -> nn.Module:
   """Actor sized by ``cfg``; the resolved task specs live on ``actor.task_specs``."""
   representation = wm.representation
   obs_dim = (
@@ -212,7 +216,7 @@ def build_actor(
     if cfg.actor_obs == "rep_state"
     else representation.proprio_obs_dim(wm.num_actions)
   )
-  return MultiEncoderAE(
+  actor = MultiEncoderAE(
     obs_dim=obs_dim,
     action_dim=wm.num_actions,
     task_specs=resolve_task_specs(cfg.tasks, representation, wm.num_goals, device),
@@ -222,6 +226,14 @@ def build_actor(
     latent_bc_weight=cfg.latent_bc_weight,
     history_length=cfg.history_length,
   ).to(device)
+  if cfg.reference_residual_policy:
+    return ReferenceResidualPolicy(
+      actor,
+      wm.dynamics.action_scale,
+      wm.dynamics.action_offset,
+      cfg.reference_residual_scale,
+    ).to(device)
+  return actor
 
 
 def load_wandb_checkpoint(wandb_run_path: str, wm: WorldModel, device: str) -> None:
