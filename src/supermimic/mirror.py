@@ -50,11 +50,16 @@ def joint_mirror_signs(joint_names: list[str]) -> list[float]:
 
 
 def mirror_full_state(
-  full_state: torch.Tensor, perm: torch.Tensor, sign: torch.Tensor
+  full_state: torch.Tensor,
+  perm: torch.Tensor,
+  sign: torch.Tensor,
+  reflection: torch.Tensor | None = None,
 ) -> torch.Tensor:
   """Reflect a GenCoord full state across the sagittal plane."""
   out = full_state.clone()
-  M = torch.diag(torch.tensor((1.0, -1.0, 1.0), device=full_state.device, dtype=full_state.dtype))
+  M = reflection
+  if M is None:
+    M = torch.diag(full_state.new_tensor((1.0, -1.0, 1.0)))
   out[..., 0:3] = full_state[..., 0:3] @ M
   R = matrix_from_quat(full_state[..., 3:7])
   out[..., 3:7] = matrix_to_quat(M @ R @ M)

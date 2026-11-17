@@ -64,6 +64,10 @@ class WorldModelLearner:
     self.mirror_perm = mirror_perm
     self.mirror_sign = mirror_sign
     self.mirror_context_slices = mirror_context_slices or {}
+    self.mirror_reflection = (
+      torch.diag(torch.tensor((1.0, -1.0, 1.0), device=device))
+      if mirror_perm is not None else None
+    )
 
     self._all_params = list(dynamics.parameters())
     self.optimizers = build_optimizers([dynamics], self.cfg.lr, device=self.device)
@@ -122,7 +126,9 @@ class WorldModelLearner:
         action = mirrored["action"].clone()
         if self.mirror_sign is None:
           raise RuntimeError("mirror_sign must be provided with mirror_perm")
-        state = mirror_full_state(state, self.mirror_perm, self.mirror_sign)
+        state = mirror_full_state(
+          state, self.mirror_perm, self.mirror_sign, self.mirror_reflection
+        )
         action = action[..., self.mirror_perm]
         action = action * self.mirror_sign
         sim_ctx = mirrored["sim_ctx"].clone()
