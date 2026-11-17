@@ -17,6 +17,9 @@ run_g1_residual_correction_10k.sh. Both use 40 clips, seed 42, 4096 environments
 Validation: scripts/probe_residual_correction.py checks CUDA outputs,
 zero-scale equivalence, gradients in both networks and a residual optimizer
 update. Full-size training smoke uses the treatment script with max-iterations
-5 and log-interval 1 before a separate fresh 10K launch.
+64 and log-interval 1 before a separate fresh 10K launch. Five iterations
+only exercise collection: WM needs 8 transitions and calibration needs a
+32-step window. scripts/verify_residual_smoke.py requires finite, nonzero
+calibration losses after step 32 and residual weights in the checkpoint.
 
 The CLI requires --runner.residual-correction True (a bare flag is invalid).
