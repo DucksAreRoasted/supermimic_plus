@@ -372,25 +372,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       and os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1"
     ):
       print("[INFO] Capturing explicit CUDA graph for MuJoCo-Warp collection step")
-      try:
-        self._captured_env_step = _CapturedEnvStep(
-          self.env, self.env.num_envs, self.env.num_actions, self.device
-        )
-      except (RuntimeError, torch.AcceleratorError) as exc:
-        # mjlab versions whose actuator control path uses indexed writes are
-        # not capture-safe. Do not leave a poisoned CUDA stream or start a run
-        # that silently collects no transitions; fall back to eager collection.
-        try:
-          torch.cuda.synchronize(self.device)
-        except Exception:
-          # A failed capture may invalidate the current stream; env.reset()
-          # below reinitializes the simulator state before eager collection.
-          pass
-        self._captured_env_step = None
-        print(
-          "[WARN] Collection CUDA Graph unavailable; falling back to eager env.step: "
-          f"{type(exc).__name__}: {exc}"
-        )
+      self._captured_env_step = _CapturedEnvStep(
+        self.env, self.env.num_envs, self.env.num_actions, self.device
+      )
       # Discard warmup/capture transitions before the real history seed.
       self.env.reset()
 
