@@ -77,6 +77,8 @@ class BaseRunnerCfg:
   """Raw-action residual amplitude around the reference pose."""
   mirror_augmentation: bool = False
   """Augment generalized-coordinate world-model windows with a joint mirror."""
+  cuda_graph_collection: bool = False
+  """Compile the fixed-shape MuJoCo collection step with reduce-overhead mode."""
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -317,6 +319,17 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self.action_manager = self.env.unwrapped.action_manager
     self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     self.motion = self.motion_cmd.motion
+
+    if (
+      self.cfg.cuda_graph_collection
+      and self.device.startswith("cuda")
+      and os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1"
+    ):
+      # The collection graph is intentionally opt-in: env.step mutates the
+      # simulator and must be compiled only after the final env shape is fixed.
+      self.env.step = torch.compile(self.env.step, mode="reduce-overhead")
+      self.env.reset = torch.compile(self.env.reset, mode="reduce-overhead")
+      print("[INFO] CUDA graph collection mode enabled")
 
     self.replay_buffer = ReplayBuffer(
       schema=self._buffer_schema(),
