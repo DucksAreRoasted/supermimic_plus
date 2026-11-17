@@ -25,6 +25,9 @@ class DeviceStepAdapter:
     self.reset_mask = torch.zeros(
       (self.num_envs,), dtype=torch.bool, device=self.device
     )
+    self.reset_buf = torch.zeros_like(self.reset_mask)
+    self.reset_terminated = torch.zeros_like(self.reset_mask)
+    self.reset_time_outs = torch.zeros_like(self.reset_mask)
 
   def step_core_device(self, action: torch.Tensor):
     """Run one fixed-shape action/physics/reward step.
@@ -40,14 +43,16 @@ class DeviceStepAdapter:
       self.env.scene.update(dt=self.env.physics_dt)
     self.env.episode_length_buf.add_(1)
     self.env.common_step_counter += 1
-    self.env.reset_buf.copy_(self.env.termination_manager.compute())
+    self.reset_buf.copy_(self.env.termination_manager.compute())
+    self.reset_terminated.copy_(self.env.termination_manager.terminated)
+    self.reset_time_outs.copy_(self.env.termination_manager.time_outs)
     self.env.reward_buf.copy_(
       self.env.reward_manager.compute(dt=self.env.step_dt)
     )
     return (
       self.env.reward_buf,
-      self.env.termination_manager.terminated,
-      self.env.termination_manager.time_outs,
+      self.reset_terminated,
+      self.reset_time_outs,
       self.env.episode_length_buf,
     )
 
@@ -62,9 +67,9 @@ class DeviceStepAdapter:
       else:
         mjwarp.reset_data(sim.wp_model, sim.wp_data, reset=sim._reset_mask_wp)
     self.env.episode_length_buf.masked_fill_(mask, 0)
-    self.env.reset_buf.masked_fill_(mask, False)
-    self.env.reset_terminated.masked_fill_(mask, False)
-    self.env.reset_time_outs.masked_fill_(mask, False)
+    self.reset_buf.masked_fill_(mask, False)
+    self.reset_terminated.masked_fill_(mask, False)
+    self.reset_time_outs.masked_fill_(mask, False)
     self.env.action_manager._action.masked_fill_(mask[:, None], 0.0)
     self.env.action_manager._prev_action.masked_fill_(mask[:, None], 0.0)
     self.env.action_manager._prev_prev_action.masked_fill_(mask[:, None], 0.0)
