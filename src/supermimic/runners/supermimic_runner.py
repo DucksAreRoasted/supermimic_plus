@@ -66,6 +66,10 @@ class BaseRunnerCfg:
   history_length: int = 1
   termination_softness: float = 0.05
   dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
+  residual_correction: bool = False
+  """Add a learned residual correction head to the physics-integrated WM."""
+  residual_scale: float = 0.1
+  """Initial residual contribution scale; kept small for stable warm-up."""
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -185,6 +189,8 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     action_scale,
     action_offset,
     hidden_dims=cfg.dynamics_hidden_dims,
+    residual_correction=cfg.residual_correction,
+    residual_scale=cfg.residual_scale,
   ).to(device)
 
   return WorldModel(

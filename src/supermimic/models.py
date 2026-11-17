@@ -59,6 +59,8 @@ class Dynamics(nn.Module):
     action_scale: torch.Tensor,
     action_offset: torch.Tensor,
     hidden_dims: tuple[int, ...],
+    residual_correction: bool = False,
+    residual_scale: float = 0.1,
   ):
     super().__init__()
 
@@ -66,6 +68,8 @@ class Dynamics(nn.Module):
     self.num_actions = num_actions
     self.dt = representation.dt
     self._apply_prediction = representation.apply_prediction
+    self.residual_correction = residual_correction
+    self.residual_scale = float(residual_scale)
 
     self.register_buffer("action_scale", action_scale.clone())
     self.register_buffer("action_offset", action_offset.clone())
@@ -77,6 +81,15 @@ class Dynamics(nn.Module):
       self.num_rep_state + num_actions + sim_ctx_dim,
       hidden_dims,
       output_dim=representation.prediction_dim,
+    )
+    self.residual_mlp = (
+      build_mlp(
+        self.num_rep_state + num_actions + sim_ctx_dim,
+        hidden_dims,
+        output_dim=representation.prediction_dim,
+      )
+      if residual_correction
+      else None
     )
 
   def proc(self, action: torch.Tensor) -> torch.Tensor:
@@ -92,7 +105,10 @@ class Dynamics(nn.Module):
   ) -> tuple[torch.Tensor, torch.Tensor]:
     state_norm = self.state_normalizer(rep_state)
     action_norm = self.action_normalizer(self.proc(action))
-    prediction = self.mlp(torch.cat([state_norm, action_norm, sim_ctx], dim=-1))
+    features = torch.cat([state_norm, action_norm, sim_ctx], dim=-1)
+    prediction = self.mlp(features)
+    if self.residual_mlp is not None:
+      prediction = prediction + self.residual_scale * self.residual_mlp(features)
     return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
