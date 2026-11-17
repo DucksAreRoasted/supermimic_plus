@@ -31,7 +31,7 @@ from supermimic.learners.sim_calibrated_learner import (
 )
 from supermimic.learners.twin_policy_learner import TwinActorCriticPolicyLearner
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
-from supermimic.mirror import joint_mirror_permutation
+from supermimic.mirror import joint_mirror_permutation, joint_mirror_signs
 from supermimic.models import Dynamics, MultiEncoderAE, ReferenceResidualPolicy, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
@@ -325,6 +325,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       device=self.device,
     )
     mirror_perm = None
+    mirror_sign = None
     if self.cfg.mirror_augmentation and self.cfg.representation == "gencoord":
       mj_model = self.env.unwrapped.sim.mj_model
       joint_names = [
@@ -338,6 +339,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
           f"Mirror joint count {len(perm)} does not match action count {self._num_actions}"
         )
       mirror_perm = torch.tensor(perm, device=self.device)
+      mirror_sign = torch.tensor(joint_mirror_signs(joint_names), device=self.device)
       print(f"[INFO] Mirror augmentation enabled: {len(pairs)} joints")
     self.world_model_learner = WorldModelLearner(
       self._dynamics,
@@ -345,6 +347,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       self.cfg.wm,
       device=self.device,
       mirror_perm=mirror_perm,
+      mirror_sign=mirror_sign,
     )
 
     self._pending_norm_updates: list[tuple] = []

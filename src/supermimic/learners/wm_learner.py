@@ -53,12 +53,14 @@ class WorldModelLearner:
     cfg: WorldModelLearnerCfg,
     device: str = "cpu",
     mirror_perm: torch.Tensor | None = None,
+    mirror_sign: torch.Tensor | None = None,
   ) -> None:
     self.dynamics = dynamics
     self.representation = representation
     self.cfg = cfg
     self.device = device
     self.mirror_perm = mirror_perm
+    self.mirror_sign = mirror_sign
 
     self._all_params = list(dynamics.parameters())
     self.optimizers = build_optimizers([dynamics], self.cfg.lr, device=self.device)
@@ -118,6 +120,10 @@ class WorldModelLearner:
         state[..., 7:36] = state[..., 7:36][..., self.mirror_perm]
         state[..., 42:71] = state[..., 42:71][..., self.mirror_perm]
         action = action[..., self.mirror_perm]
+        if self.mirror_sign is not None:
+          state[..., 7:36] = state[..., 7:36] * self.mirror_sign
+          state[..., 42:71] = state[..., 42:71] * self.mirror_sign
+          action = action * self.mirror_sign
         mirrored["state"] = state
         mirrored["action"] = action
         td = torch.stack([td, mirrored], 0).flatten(0, 1)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-_SIDE = re.compile(r"^(left|right|l|r)([_-].*)$", re.IGNORECASE)
+_SIDE = re.compile(r"^(.*[/])?(left|right|l|r)([_-].*)$", re.IGNORECASE)
 
 
 def joint_mirror_permutation(joint_names: list[str]) -> tuple[list[int], list[str]]:
@@ -18,12 +18,27 @@ def joint_mirror_permutation(joint_names: list[str]) -> tuple[list[int], list[st
       perm.append(lookup[name.lower()])
       pairs.append(name)
       continue
-    side, suffix = match.groups()
-    opposite = ("right" if side.lower() in {"left", "l"} else "left") + suffix
-    short = ("r" if side.lower() in {"left", "l"} else "l") + suffix
+    prefix, side, suffix = match.groups()
+    prefix = prefix or ""
+    opposite = prefix + ("right" if side.lower() in {"left", "l"} else "left") + suffix
+    short = prefix + ("r" if side.lower() in {"left", "l"} else "l") + suffix
     idx = lookup.get(opposite.lower(), lookup.get(short.lower()))
     if idx is None:
       raise ValueError(f"No mirror partner found for joint {name!r}")
     perm.append(idx)
     pairs.append(f"{name}<->{joint_names[idx]}")
   return perm, pairs
+
+
+def joint_mirror_signs(joint_names: list[str]) -> list[float]:
+  """Return the reflection sign for each joint's scalar coordinate.
+
+  Reflection across the sagittal plane flips axial x/z rotations (roll/yaw)
+  and preserves the y-axis pitch coordinate.  The returned signs are ordered
+  like ``joint_names`` and are applied after the left/right permutation.
+  """
+  signs: list[float] = []
+  for name in joint_names:
+    token = name.lower().split("/")[-1]
+    signs.append(-1.0 if ("roll" in token or "yaw" in token) else 1.0)
+  return signs
