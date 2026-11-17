@@ -84,6 +84,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   sim_calibration_horizon: int = 32
   sim_calibration_lambda: float = 1.0
   sim_calibration_interval: int = 1
+  sim_calibration_epochs: int = 2
+  """Number of Critic regression passes over each fixed simulator target."""
   init_model_dir: str | None = None
   """Optional local actor/world-model/critic checkpoint to warm-start from."""
   """Official single critic is unchanged; twin is an isolated experiment."""
@@ -619,6 +621,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         learner_kwargs = {}
         if self.cfg.critic_variant == "sim-calibrated":
           learner_kwargs["sim_lambda"] = self.cfg.sim_calibration_lambda
+          learner_kwargs["sim_calibration_epochs"] = self.cfg.sim_calibration_epochs
         self.policy_learner = learner_cls(
           actor, critic1, self.wm_env, policy_cfg, device=self.device, **learner_kwargs
         )

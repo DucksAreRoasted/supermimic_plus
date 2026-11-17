@@ -11,6 +11,9 @@ from supermimic.learners.policy_learner import ActorCriticPolicyLearner, gae_ret
 
 class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
   def __init__(self, *args, sim_lambda: float = 1.0, **kwargs):
+    self.sim_calibration_epochs = int(kwargs.pop("sim_calibration_epochs", 1))
+    if self.sim_calibration_epochs < 1:
+      raise ValueError("sim_calibration_epochs must be at least 1")
     super().__init__(*args, **kwargs)
     self.sim_lambda = sim_lambda
     self._simulator_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
@@ -118,13 +121,27 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
       sim_loss = torch.nn.functional.mse_loss(sim_prediction, sim_targets)
       sim_return = sim_targets.mean()
 
-    total_loss = imagined_loss + sim_weight * sim_loss
-    grad_norm = _optimize_step(
-      self.critic_optimizers,
-      total_loss,
-      self.critic.parameters(),
-      max_norm=1.0,
-    )
+    # Keep both return targets fixed while reusing this real simulator window.
+    # Additional epochs improve value regression without collecting more data.
+    grad_norm = torch.zeros((), device=imagined_loss.device)
+    for _ in range(self.sim_calibration_epochs):
+      imagined_prediction = self.critic(imagined_obs)
+      sim_prediction = self.critic(sim_obs[:-1].flatten(0, 1)) if sim_weight > 0 and self._simulator_batch is not None else None
+      imagined_epoch_loss = torch.nn.functional.mse_loss(
+        imagined_prediction, imagined_targets
+      )
+      sim_epoch_loss = (
+        torch.nn.functional.mse_loss(sim_prediction, sim_targets)
+        if sim_prediction is not None
+        else torch.zeros((), device=imagined_loss.device)
+      )
+      total_loss = imagined_epoch_loss + sim_weight * sim_epoch_loss
+      grad_norm = _optimize_step(
+        self.critic_optimizers,
+        total_loss,
+        self.critic.parameters(),
+        max_norm=1.0,
+      )
     self._simulator_batch = None
     return {
       "value_function": imagined_loss.detach(),
@@ -133,4 +150,7 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
       "critic_total_loss": total_loss.detach(),
       "sim_calibration_return": sim_return.detach(),
       "critic_grad_norm": grad_norm,
+      "sim_calibration_epochs": torch.tensor(
+        self.sim_calibration_epochs, device=imagined_loss.device
+      ),
     }
