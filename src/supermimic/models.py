@@ -82,15 +82,25 @@ class Dynamics(nn.Module):
       hidden_dims,
       output_dim=representation.prediction_dim,
     )
-    self.residual_mlp = (
-      build_mlp(
+    self.residual_mlp = None
+    if residual_correction:
+      self.residual_mlp = build_mlp(
         self.num_rep_state + num_actions + sim_ctx_dim,
         hidden_dims,
         output_dim=representation.prediction_dim,
       )
-      if residual_correction
-      else None
-    )
+      # Preserve the baseline predictor at step zero. The residual branch
+      # should learn a correction rather than inject a random offset.
+      last_linear = next(
+        (module for module in reversed(list(self.residual_mlp))
+         if isinstance(module, nn.Linear)),
+        None,
+      )
+      if last_linear is None:
+        raise ValueError("Residual correction requires a linear output layer")
+      nn.init.zeros_(last_linear.weight)
+      if last_linear.bias is not None:
+        nn.init.zeros_(last_linear.bias)
 
   def proc(self, action: torch.Tensor) -> torch.Tensor:
     """Map raw policy output to proc joint commands: ``action * scale + offset``."""
