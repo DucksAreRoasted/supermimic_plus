@@ -115,6 +115,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Prioritize replay windows from environments that recently failed."""
   failure_priority_decay: float = 0.95
   failure_priority_boost: float = 1.0
+  ema_decay: float = 0.0
+  """Exponential moving average decay for an optional deployment actor."""
   latent_dim: int = 32
   actor_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256)
   critic_hidden_dims: tuple[int, ...] = (256, 128)
@@ -716,6 +718,22 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self.policy_learner = BpttPolicyLearner(
         actor, self.wm_env, policy_cfg, device=self.device
       )
+    if self.cfg.ema_decay:
+      if not 0.0 < self.cfg.ema_decay < 1.0:
+        raise ValueError("ema_decay must be in (0, 1) when enabled")
+      self._ema_actor_state = {
+        name: value.detach().clone()
+        for name, value in self.policy_learner.actor.state_dict().items()
+      }
+    else:
+      self._ema_actor_state = None
+
+  def _update_ema_actor(self) -> None:
+    if self._ema_actor_state is None:
+      return
+    decay = self.cfg.ema_decay
+    for name, value in self.policy_learner.actor.state_dict().items():
+      self._ema_actor_state[name].mul_(decay).add_(value.detach(), alpha=1.0 - decay)
 
   def _build_sim_obs_td(
     self,
@@ -921,6 +939,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
               torch.stack(self._sim_calibration_dones),
             )
         policy_logs = self.policy_learner.update()
+        self._update_ema_actor()
         policy_learn_time += time.time() - start_policy_time
 
         loss_dict.update(wm_logs)
@@ -956,6 +975,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         torch.save(self._wm.bundle(), world_model_path)
         torch.save(self.policy_learner.actor.state_dict(), actor_path)
         checkpoint_files = [world_model_path, actor_path]
+        if self._ema_actor_state is not None:
+          ema_actor_path = str(log_dir / "ema_actor.pt")
+          torch.save(self._ema_actor_state, ema_actor_path)
+          checkpoint_files.append(ema_actor_path)
         critics = getattr(self.policy_learner, "critics", None)
         if critics is None:
           critics = getattr(self.policy_learner, "critic", None)
