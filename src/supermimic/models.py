@@ -61,6 +61,7 @@ class Dynamics(nn.Module):
     hidden_dims: tuple[int, ...],
     residual_correction: bool = False,
     residual_scale: float = 0.1,
+    residual_hidden_dims: tuple[int, ...] | None = None,
   ):
     super().__init__()
 
@@ -86,7 +87,7 @@ class Dynamics(nn.Module):
     if residual_correction:
       self.residual_mlp = build_mlp(
         self.num_rep_state + num_actions + sim_ctx_dim,
-        hidden_dims,
+        hidden_dims if residual_hidden_dims is None else residual_hidden_dims,
         output_dim=representation.prediction_dim,
       )
       # Preserve the baseline predictor at step zero. The residual branch

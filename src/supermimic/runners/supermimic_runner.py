@@ -72,6 +72,8 @@ class BaseRunnerCfg:
   """Add a learned residual correction head to the physics-integrated WM."""
   residual_scale: float = 0.1
   """Initial residual contribution scale; kept small for stable warm-up."""
+  residual_hidden_dims: tuple[int, ...] | None = None
+  """Optional narrower residual head for lower-cost correction experiments."""
   reference_residual_policy: bool = False
   """Center raw Actor actions on the current reference joint pose."""
   reference_residual_scale: float = 0.25
@@ -201,6 +203,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     hidden_dims=cfg.dynamics_hidden_dims,
     residual_correction=cfg.residual_correction,
     residual_scale=cfg.residual_scale,
+    residual_hidden_dims=cfg.residual_hidden_dims,
   ).to(device)
 
   return WorldModel(
