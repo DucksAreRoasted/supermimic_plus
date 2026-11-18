@@ -221,3 +221,7 @@ __marimo__/
 data/modelscope/
 third_party/
 /outputs/
+
+data/raw/lafan1/
+data/self_retarget_lafan1/
+data/self_retarget_lafan1_supermimic/
