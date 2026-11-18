@@ -219,3 +219,29 @@ class TestLossBlocks:
     )
     torch.cat(list(last.values()), dim=-1).pow(2).mean().backward()
     assert init_aux.grad is not None and float(init_aux.grad.abs().sum()) > 0.0
+
+
+def test_residual_correction_starts_as_base_dynamics():
+  """A zero-initialized residual head must preserve the base prediction."""
+  rep = _make_representation("gencoord")
+  kwargs = dict(
+    representation=rep,
+    num_actions=NUM_ACTIONS,
+    sim_ctx_dim=1,
+    action_scale=torch.ones(NUM_ACTIONS),
+    action_offset=torch.zeros(NUM_ACTIONS),
+    hidden_dims=(16, 16),
+  )
+  base = Dynamics(**kwargs)
+  corrected = Dynamics(**kwargs, residual_correction=True)
+  corrected.mlp.load_state_dict(base.mlp.state_dict())
+  corrected.state_normalizer.load_state_dict(base.state_normalizer.state_dict())
+  corrected.action_normalizer.load_state_dict(base.action_normalizer.state_dict())
+  rep_state = torch.randn(5, rep.rep_state_dim)
+  action = torch.randn(5, NUM_ACTIONS)
+  aux = torch.randn(5, 7)
+  sim_ctx = torch.randn(5, 1)
+  base_out = base(rep_state, action, aux, sim_ctx)
+  corrected_out = corrected(rep_state, action, aux, sim_ctx)
+  for actual, expected in zip(corrected_out, base_out):
+    torch.testing.assert_close(actual, expected)
