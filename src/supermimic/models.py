@@ -262,3 +262,63 @@ class MultiEncoderAE(nn.Module):
       if lo == hi:
         continue
       self.goal_normalizers[name].update(obs_td[f"goal_{name}"][lo:hi])
+
+
+class ReferenceResidualPolicy(nn.Module):
+  """Policy that predicts a bounded correction around the first reference pose.
+
+  The motion goal starts with ``NUM_GOAL_FRAMES`` blocks of
+  ``[joint_pos, joint_vel]``.  Only the first joint-position block is used as
+  the reference action; the wrapped actor learns the residual.  Action scale
+  and offset are the same values used by :class:`Dynamics`, so the reference
+  pose is converted into the raw action space before addition.
+  """
+
+  def __init__(
+    self,
+    actor: MultiEncoderAE,
+    action_scale: torch.Tensor,
+    action_offset: torch.Tensor,
+    residual_scale: float = 0.25,
+  ):
+    super().__init__()
+    self.actor = actor
+    self.num_actions = action_scale.numel()
+    self.residual_scale = float(residual_scale)
+    self.register_buffer("action_scale", action_scale.clone())
+    self.register_buffer("action_offset", action_offset.clone())
+    # Start exactly at the reference policy so early gradients are useful.
+    last_linear = next(
+      (module for module in reversed(list(self.actor.decoder))
+       if isinstance(module, nn.Linear)),
+      None,
+    )
+    if last_linear is None:
+      raise ValueError("ReferenceResidualPolicy requires a linear decoder output")
+    nn.init.zeros_(last_linear.weight)
+    if last_linear.bias is not None:
+      nn.init.zeros_(last_linear.bias)
+
+  def forward(self, obs_td: TensorDict) -> torch.Tensor:
+    residual = self.actor(obs_td)
+    goal = obs_td["goal_motion"]
+    joint_pos = goal[..., : self.num_actions]
+    reference = (joint_pos - self.action_offset) / self.action_scale.clamp_min(1e-6)
+    return (reference + self.residual_scale * residual).clamp(-1.0, 1.0)
+
+  @property
+  def task_specs(self):
+    return self.actor.task_specs
+
+  def slot_ranges(self, batch_size: int):
+    return self.actor.slot_ranges(batch_size)
+
+  def auxiliary_loss(self) -> torch.Tensor:
+    return self.actor.auxiliary_loss()
+
+  def auxiliary_stats(self) -> dict[str, torch.Tensor]:
+    return self.actor.auxiliary_stats()
+
+  @torch.jit.unused
+  def update_normalization(self, obs_td: TensorDict) -> None:
+    self.actor.update_normalization(obs_td)

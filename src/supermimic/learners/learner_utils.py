@@ -10,15 +10,58 @@ import torch.nn as nn
 from tensordict import TensorDict
 
 
+class CapturableMuonAdam:
+  """Muon + fused Adam with device-resident learning rates for CUDA Graphs."""
+
+  def __init__(self, muon_params, adam_params, lr: float, betas, device: str):
+    self.muon = torch.optim.Muon(
+      list(muon_params), lr=torch.tensor(lr, device=device),
+      adjust_lr_fn="match_rms_adamw"
+    )
+    self.adam = torch.optim.Adam(
+      list(adam_params), lr=torch.tensor(lr, device=device), betas=betas,
+      fused=True, capturable=True
+    )
+
+  @property
+  def param_groups(self):
+    return self.muon.param_groups + self.adam.param_groups
+
+  @property
+  def state(self):
+    return {**self.muon.state, **self.adam.state}
+
+  def zero_grad(self, set_to_none=True):
+    self.muon.zero_grad(set_to_none=set_to_none)
+    self.adam.zero_grad(set_to_none=set_to_none)
+
+  @torch.no_grad()
+  def step(self):
+    from torch.optim._muon import _adjust_lr, _zeropower_via_newtonschulz
+    for group in self.muon.param_groups:
+      for param in group["params"]:
+        if param.grad is None:
+          continue
+        state = self.muon.state[param]
+        if "momentum_buffer" not in state:
+          state["momentum_buffer"] = torch.zeros_like(param.grad)
+        buf = state["momentum_buffer"]
+        buf.lerp_(param.grad, 1 - group["momentum"])
+        update = _zeropower_via_newtonschulz(
+          buf, group["ns_coefficients"], group["ns_steps"], group["eps"]
+        )
+        ratio = _adjust_lr(1.0, group["adjust_lr_fn"], param.shape)
+        param.add_(update.to(param.dtype) * (group["lr"] * -ratio))
+    self.adam.step()
+
+
 def build_optimizers(
   modules: Sequence[nn.Module],
   lr: float,
   betas: tuple[float, float] = (0.9, 0.999),
   device: str = "cpu",
 ) -> list[torch.optim.Optimizer]:
-  """Muon on the Linear weights between the first and the last Linear of each
-  ``nn.Sequential`` in ``modules``, fused capturable Adam on the rest, both at
-  ``lr``. Muon's ``lr`` is a float, fixed once an update is captured."""
+  """Capturable Muon on hidden Linear weights and fused Adam elsewhere."""
   hidden = [
     linear.weight
     for module in modules
@@ -28,12 +71,20 @@ def build_optimizers(
   ]
   hidden_ids = {id(p) for p in hidden}
   rest = [p for m in modules for p in m.parameters() if id(p) not in hidden_ids]
-  adam = torch.optim.Adam(
-    rest, lr=torch.tensor(lr, device=device), betas=betas, fused=True, capturable=True
-  )
   if not hidden:
-    return [adam]
-  return [adam, torch.optim.Muon(hidden, lr=lr, adjust_lr_fn="match_rms_adamw")]
+    return [torch.optim.Adam(
+      rest, lr=torch.tensor(lr, device=device), betas=betas,
+      fused=True, capturable=True
+    )]
+  if torch.device(device).type != "cuda":
+    # Keep the simple two-optimizer interface for CPU tests and tooling.
+    return [
+      torch.optim.Adam(
+        rest, lr=lr, betas=betas
+      ),
+      torch.optim.Muon(hidden, lr=lr, adjust_lr_fn="match_rms_adamw"),
+    ]
+  return [CapturableMuonAdam(hidden, rest, lr, betas, device)]
 
 
 def _optimize_step(

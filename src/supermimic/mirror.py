@@ -1,0 +1,70 @@
+"""Joint-name driven mirror permutations for humanoid augmentation."""
+
+from __future__ import annotations
+
+import re
+
+import torch
+from mjlab.utils.lab_api.math import matrix_from_quat
+
+from supermimic.utils.helpers import matrix_to_quat
+
+_SIDE = re.compile(r"^(.*[/])?(left|right|l|r)([_-].*)$", re.IGNORECASE)
+
+
+def joint_mirror_permutation(joint_names: list[str]) -> tuple[list[int], list[str]]:
+  """Return a permutation and signed swap labels using joint names only."""
+  lookup = {name.lower(): i for i, name in enumerate(joint_names)}
+  perm: list[int] = []
+  pairs: list[str] = []
+  for name in joint_names:
+    match = _SIDE.match(name)
+    if match is None:
+      perm.append(lookup[name.lower()])
+      pairs.append(name)
+      continue
+    prefix, side, suffix = match.groups()
+    prefix = prefix or ""
+    opposite = prefix + ("right" if side.lower() in {"left", "l"} else "left") + suffix
+    short = prefix + ("r" if side.lower() in {"left", "l"} else "l") + suffix
+    idx = lookup.get(opposite.lower(), lookup.get(short.lower()))
+    if idx is None:
+      raise ValueError(f"No mirror partner found for joint {name!r}")
+    perm.append(idx)
+    pairs.append(f"{name}<->{joint_names[idx]}")
+  return perm, pairs
+
+
+def joint_mirror_signs(joint_names: list[str]) -> list[float]:
+  """Return the reflection sign for each joint's scalar coordinate.
+
+  Reflection across the sagittal plane flips axial x/z rotations (roll/yaw)
+  and preserves the y-axis pitch coordinate.  The returned signs are ordered
+  like ``joint_names`` and are applied after the left/right permutation.
+  """
+  signs: list[float] = []
+  for name in joint_names:
+    token = name.lower().split("/")[-1]
+    signs.append(-1.0 if ("roll" in token or "yaw" in token) else 1.0)
+  return signs
+
+
+def mirror_full_state(
+  full_state: torch.Tensor,
+  perm: torch.Tensor,
+  sign: torch.Tensor,
+  reflection: torch.Tensor | None = None,
+) -> torch.Tensor:
+  """Reflect a GenCoord full state across the sagittal plane."""
+  out = full_state.clone()
+  M = reflection
+  if M is None:
+    M = torch.diag(full_state.new_tensor((1.0, -1.0, 1.0)))
+  out[..., 0:3] = full_state[..., 0:3] @ M
+  R = matrix_from_quat(full_state[..., 3:7])
+  out[..., 3:7] = matrix_to_quat(M @ R @ M)
+  out[..., 7:36] = full_state[..., 7:36][..., perm] * sign
+  out[..., 36:39] = full_state[..., 36:39] @ M
+  out[..., 39:42] = -(full_state[..., 39:42] @ M)
+  out[..., 42:71] = full_state[..., 42:71][..., perm] * sign
+  return out

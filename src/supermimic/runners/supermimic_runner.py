@@ -31,7 +31,9 @@ from supermimic.learners.sim_calibrated_learner import (
 )
 from supermimic.learners.twin_policy_learner import TwinActorCriticPolicyLearner
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
-from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
+from supermimic.mirror import joint_mirror_permutation, joint_mirror_signs
+from supermimic.models import Dynamics, MultiEncoderAE, ReferenceResidualPolicy, build_mlp
+from supermimic.mjlab_cuda_graph_env import CapturedDeviceStep
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
 from supermimic.runners.exporter import export_actor_as_onnx
@@ -70,6 +72,14 @@ class BaseRunnerCfg:
   """Add a learned residual correction head to the physics-integrated WM."""
   residual_scale: float = 0.1
   """Initial residual contribution scale; kept small for stable warm-up."""
+  reference_residual_policy: bool = False
+  """Center raw Actor actions on the current reference joint pose."""
+  reference_residual_scale: float = 0.25
+  """Raw-action residual amplitude around the reference pose."""
+  mirror_augmentation: bool = False
+  """Augment generalized-coordinate world-model windows with a joint mirror."""
+  cuda_graph_collection: bool = False
+  """Use the explicit fixed-shape device collection graph."""
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -204,7 +214,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
 
 def build_actor(
   cfg: SuperMimicRunnerCfg, wm: WorldModel, device: str
-) -> MultiEncoderAE:
+) -> nn.Module:
   """Actor sized by ``cfg``; the resolved task specs live on ``actor.task_specs``."""
   representation = wm.representation
   obs_dim = (
@@ -212,7 +222,7 @@ def build_actor(
     if cfg.actor_obs == "rep_state"
     else representation.proprio_obs_dim(wm.num_actions)
   )
-  return MultiEncoderAE(
+  actor = MultiEncoderAE(
     obs_dim=obs_dim,
     action_dim=wm.num_actions,
     task_specs=resolve_task_specs(cfg.tasks, representation, wm.num_goals, device),
@@ -222,6 +232,14 @@ def build_actor(
     latent_bc_weight=cfg.latent_bc_weight,
     history_length=cfg.history_length,
   ).to(device)
+  if cfg.reference_residual_policy:
+    return ReferenceResidualPolicy(
+      actor,
+      wm.dynamics.action_scale,
+      wm.dynamics.action_offset,
+      cfg.reference_residual_scale,
+    ).to(device)
+  return actor
 
 
 def load_wandb_checkpoint(wandb_run_path: str, wm: WorldModel, device: str) -> None:
@@ -302,6 +320,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self.action_manager = self.env.unwrapped.action_manager
     self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     self.motion = self.motion_cmd.motion
+    self._captured_device_step: CapturedDeviceStep | None = None
+    if self.cfg.cuda_graph_collection and self.device.startswith("cuda"):
+      print("[INFO] Capturing explicit device collection graph")
+      self._captured_device_step = CapturedDeviceStep(self.env.unwrapped)
 
     self.replay_buffer = ReplayBuffer(
       schema=self._buffer_schema(),
@@ -309,8 +331,34 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       num_envs=self.env.num_envs,
       device=self.device,
     )
+    mirror_perm = None
+    mirror_sign = None
+    if self.cfg.mirror_augmentation and self.cfg.representation == "gencoord":
+      mj_model = self.env.unwrapped.sim.mj_model
+      joint_names = [
+        mj_model.joint(i).name
+        for i in range(mj_model.njnt)
+        if mj_model.joint(i).type != 0
+      ]
+      perm, pairs = joint_mirror_permutation(joint_names)
+      if len(perm) != self._num_actions:
+        raise ValueError(
+          f"Mirror joint count {len(perm)} does not match action count {self._num_actions}"
+        )
+      mirror_perm = torch.tensor(perm, device=self.device)
+      mirror_sign = torch.tensor(joint_mirror_signs(joint_names), device=self.device)
+      print(f"[INFO] Mirror augmentation enabled: {len(pairs)} joints")
     self.world_model_learner = WorldModelLearner(
-      self._dynamics, self._representation, self.cfg.wm, device=self.device
+      self._dynamics,
+      self._representation,
+      self.cfg.wm,
+      device=self.device,
+      mirror_perm=mirror_perm,
+      mirror_sign=mirror_sign,
+      mirror_context_slices={
+        name: self._sim_context.find(name)
+        for name in ("base_com", "encoder_bias")
+      },
     )
 
     self._pending_norm_updates: list[tuple] = []
@@ -462,7 +510,13 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     raw_actions = actions.detach().clone()
     prev_action = self.action_manager.action.clone()
 
-    next_obs, rewards, dones, extras = self.env.step(actions)
+    if self._captured_device_step is None:
+      next_obs, rewards, dones, extras = self.env.step(actions)
+    else:
+      rewards, terminated, truncated, _ = self._captured_device_step(actions)
+      next_obs = self.env.get_observations()
+      dones = terminated | truncated
+      extras = {"time_outs": truncated}
 
     truncated = extras.get(
       "time_outs",
