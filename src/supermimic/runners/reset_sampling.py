@@ -32,6 +32,13 @@ class ReturnSamplerCfg:
   keep: float = 0.1
   """Share of resets on bins in proportion to the summed square of the focus each
   received: concentrated focus earns keep, focus spread thin earns almost none."""
+  focus_share: float | None = None
+  """Optional explicit share of resets assigned to low-return bins.
+
+  When unset, ``explore`` retains the historical distribution. Setting this to a
+  value such as 0.10 or 0.15 makes the failure-focused portion explicit while
+  preserving ``keep`` and assigning the remainder to uniform exploration.
+  """
 
 
 class ReturnSampler:
@@ -46,6 +53,10 @@ class ReturnSampler:
   ) -> None:
     assert 0.0 < cfg.gamma < 1.0, f"gamma must be in (0, 1), got {cfg.gamma}"
     assert cfg.explore + cfg.keep < 1.0, "explore + keep must leave room for focus"
+    if cfg.focus_share is not None:
+      assert 0.0 <= cfg.focus_share <= 1.0 - cfg.keep, (
+        "focus_share must be between 0 and 1 - keep"
+      )
     self.cfg = cfg
     self.bin_count = bin_count
     self.frame_count = frame_count
@@ -149,5 +160,11 @@ class ReturnSampler:
     focus = torch.softmax(-cfg.steepness * self.value / self.v_max, dim=0)
     self.effort += focus.double().square()
     keep = (self.effort / self.effort.sum()).float()
-    explore = cfg.explore / self.bin_count
-    return explore + (1.0 - cfg.explore - cfg.keep) * focus + cfg.keep * keep
+    focus_share = (
+      1.0 - cfg.explore - cfg.keep
+      if cfg.focus_share is None
+      else cfg.focus_share
+    )
+    explore_share = 1.0 - cfg.keep - focus_share
+    explore = explore_share / self.bin_count
+    return explore + focus_share * focus + cfg.keep * keep
