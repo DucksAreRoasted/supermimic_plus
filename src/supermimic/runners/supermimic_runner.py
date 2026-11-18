@@ -697,6 +697,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         if self.cfg.critic_variant == "sim-calibrated":
           learner_kwargs["sim_lambda"] = self.cfg.sim_calibration_lambda
           learner_kwargs["sim_calibration_epochs"] = self.cfg.sim_calibration_epochs
+          learner_kwargs["sim_calibration_horizon"] = self.cfg.sim_calibration_horizon
+          learner_kwargs["sim_calibration_batch_size"] = policy_cfg.batch_size
+          learner_kwargs["sim_critic_input_dim"] = critic_input_dim
         self.policy_learner = learner_cls(
           actor, critic1, self.wm_env, policy_cfg, device=self.device, **learner_kwargs
         )
@@ -927,6 +930,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         start_policy_time = time.time()
         if self.cfg.critic_variant == "sim-calibrated":
           horizon = self.cfg.sim_calibration_horizon
+          self.policy_learner.clear_simulator_batch()
           if (
             step % self.cfg.sim_calibration_interval == 0
             and

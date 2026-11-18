@@ -10,17 +10,32 @@ from supermimic.learners.policy_learner import ActorCriticPolicyLearner, gae_ret
 
 
 class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
-  def __init__(self, *args, sim_lambda: float = 1.0, **kwargs):
+  def __init__(
+    self,
+    *args,
+    sim_lambda: float = 1.0,
+    sim_calibration_horizon: int = 32,
+    sim_calibration_batch_size: int | None = None,
+    sim_critic_input_dim: int | None = None,
+    **kwargs,
+  ):
     self.sim_calibration_epochs = int(kwargs.pop("sim_calibration_epochs", 1))
     if self.sim_calibration_epochs < 1:
       raise ValueError("sim_calibration_epochs must be at least 1")
     super().__init__(*args, **kwargs)
     self.sim_lambda = sim_lambda
-    self._simulator_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    self.sim_calibration_horizon = int(sim_calibration_horizon)
+    self._simulator_obs: torch.Tensor | None = None
+    self._simulator_rewards: torch.Tensor | None = None
+    self._simulator_terminated: torch.Tensor | None = None
+    self._simulator_enabled = torch.zeros((), device=self.actor_params[0].device)
+    self._actor_beta_v = torch.ones_like(self._simulator_enabled)
+    self._sim_calibration_epochs_tensor = torch.full_like(
+      self._simulator_enabled, self.sim_calibration_epochs
+    )
+    if sim_calibration_batch_size is not None and sim_critic_input_dim is not None:
+      self.initialize_simulator_batch(sim_calibration_batch_size, sim_critic_input_dim)
     self._actor_updates = 0
-    # The simulator batch is injected dynamically between policy updates;
-    # capturing the update before/after that branch changes is unsafe.
-    self._captured_update = self._update_from
 
   def _beta_v(self) -> float:
     # Keep the original Actor objective intact: the calibrated Critic should
@@ -61,7 +76,7 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     return {
       "return": total_return.mean().detach(),
       "grad_norm": grad_norm,
-      "actor_beta_v": torch.tensor(self._beta_v(), device=total_return.device),
+      "actor_beta_v": self._actor_beta_v,
       **critic_logs,
       **getattr(self.actor, "auxiliary_stats", lambda: {})(),
     }
@@ -85,13 +100,48 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     rewards: torch.Tensor,
     terminated: torch.Tensor,
   ) -> None:
-    """Set one fixed H+1-state simulator window for the next critic update."""
+    """Copy one fixed simulator window into the graph-owned device buffers."""
     device = self.actor_params[0].device
-    self._simulator_batch = (
-      critic_obs.detach().to(device),
-      rewards.detach().to(device),
-      terminated.detach().to(device),
+    if self._simulator_obs is None:
+      self.initialize_simulator_batch(critic_obs.shape[1], critic_obs.shape[2])
+    assert self._simulator_obs is not None
+    assert self._simulator_rewards is not None
+    assert self._simulator_terminated is not None
+    self._simulator_obs.copy_(critic_obs.detach().to(device))
+    self._simulator_rewards.copy_(rewards.detach().to(device))
+    self._simulator_terminated.copy_(terminated.detach().to(device))
+    self._simulator_enabled.fill_(1.0)
+
+  def initialize_simulator_batch(self, batch_size: int, critic_input_dim: int) -> None:
+    """Allocate fixed-shape simulator targets before CUDA Graph capture."""
+    device = self.actor_params[0].device
+    horizon = self.sim_calibration_horizon
+    self._simulator_obs = torch.zeros(
+      horizon + 1, batch_size, critic_input_dim, device=device
     )
+    self._simulator_rewards = torch.zeros(horizon, batch_size, device=device)
+    self._simulator_terminated = torch.zeros(horizon, batch_size, device=device)
+    self._simulator_enabled.zero_()
+
+  def clear_simulator_batch(self) -> None:
+    """Disable the previous simulator window without changing its storage."""
+    self._simulator_enabled.zero_()
+
+  def _graph_state(self) -> list[torch.Tensor]:
+    """Include fixed calibration buffers in CUDA Graph identity checks."""
+    simulator_state = [
+      buffer
+      for buffer in (
+        self._simulator_obs,
+        self._simulator_rewards,
+        self._simulator_terminated,
+        self._simulator_enabled,
+        self._actor_beta_v,
+        self._sim_calibration_epochs_tensor,
+      )
+      if buffer is not None
+    ]
+    return super()._graph_state() + simulator_state
 
   def _fit_critic(self, rollout, last_obs) -> dict[str, torch.Tensor]:
     sim_weight = getattr(self, "sim_calibration_weight", 0.0)
@@ -116,8 +166,13 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
 
     sim_loss = torch.zeros((), device=imagined_loss.device)
     sim_return = torch.zeros((), device=imagined_loss.device)
-    if sim_weight > 0 and self._simulator_batch is not None:
-      sim_obs, sim_rewards, sim_terminated = self._simulator_batch
+    if sim_weight > 0:
+      assert self._simulator_obs is not None
+      assert self._simulator_rewards is not None
+      assert self._simulator_terminated is not None
+      sim_obs = self._simulator_obs
+      sim_rewards = self._simulator_rewards
+      sim_terminated = self._simulator_terminated
       with torch.no_grad():
         sim_values = self.critic(sim_obs[:-1])
         sim_last_value = self.critic(sim_obs[-1])
@@ -139,7 +194,11 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     grad_norm = torch.zeros((), device=imagined_loss.device)
     for _ in range(self.sim_calibration_epochs):
       imagined_prediction = self.critic(imagined_obs)
-      sim_prediction = self.critic(sim_obs[:-1].flatten(0, 1)) if sim_weight > 0 and self._simulator_batch is not None else None
+      sim_prediction = (
+        self.critic(self._simulator_obs[:-1].flatten(0, 1))
+        if sim_weight > 0
+        else None
+      )
       imagined_epoch_loss = torch.nn.functional.mse_loss(
         imagined_prediction, imagined_targets
       )
@@ -148,22 +207,23 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
         if sim_prediction is not None
         else torch.zeros((), device=imagined_loss.device)
       )
-      total_loss = imagined_epoch_loss + sim_weight * sim_epoch_loss
+      total_loss = imagined_epoch_loss + (
+        self._simulator_enabled * sim_weight * sim_epoch_loss
+      )
       grad_norm = _optimize_step(
         self.critic_optimizers,
         total_loss,
         self.critic.parameters(),
         max_norm=1.0,
       )
-    self._simulator_batch = None
     return {
       "value_function": imagined_loss.detach(),
       "imagined_value_loss": imagined_loss.detach(),
-      "sim_calibration_loss": sim_loss.detach(),
+      "sim_calibration_loss": self._simulator_enabled * sim_loss.detach(),
       "critic_total_loss": total_loss.detach(),
-      "sim_calibration_return": sim_return.detach(),
-      "critic_grad_norm": grad_norm,
-      "sim_calibration_epochs": torch.tensor(
-        self.sim_calibration_epochs, device=imagined_loss.device
+      "sim_calibration_return": (
+        self._simulator_enabled * sim_return.detach()
       ),
+      "critic_grad_norm": grad_norm,
+      "sim_calibration_epochs": self._sim_calibration_epochs_tensor,
     }
