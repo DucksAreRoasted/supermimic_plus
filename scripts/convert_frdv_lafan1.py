@@ -15,9 +15,17 @@ def main():
         root_pos=q[:, :3]; root_quat=q[:, 3:7]; joint_pos=q[:, 7:]
         joint_vel=np.gradient(joint_pos, dt, axis=0).astype(np.float32)
         root_lin_vel=np.gradient(root_pos, dt, axis=0).astype(np.float32)
-        # FRDV outputs quaternion poses. Angular velocity is unused by the motion
-        # loader for targets, so keep a deterministic zero field for compatibility.
-        root_ang_vel=np.zeros_like(root_lin_vel)
+        # Derive world-frame angular velocity from consecutive wxyz quaternions.
+        q = root_quat / np.linalg.norm(root_quat, axis=1, keepdims=True).clip(1e-8)
+        rel = np.empty_like(q)
+        rel[0] = np.array([1, 0, 0, 0], dtype=np.float32)
+        a, b = q[:-1], q[1:]
+        rel[1:, 0] = b[:, 0] * a[:, 0] + np.sum(b[:, 1:] * a[:, 1:], axis=1)
+        rel[1:, 1:] = (b[:, 0, None] * a[:, 1:] - a[:, 0, None] * b[:, 1:]
+                       - np.cross(b[:, 1:], a[:, 1:]))
+        rel /= np.linalg.norm(rel, axis=1, keepdims=True).clip(1e-8)
+        sign = np.where(rel[:, :1, 0] < 0, -1.0, 1.0)
+        root_ang_vel = (2.0 * rel[:, 1:] * sign / dt).astype(np.float32)
         out=args.dst/src.name
         np.savez_compressed(out, fps=np.float32(fps),
             joint_names=d['joint_names'][1:], joint_pos=joint_pos,
