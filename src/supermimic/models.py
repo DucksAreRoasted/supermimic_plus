@@ -28,6 +28,29 @@ class _CudaGraphNormalization(EmpiricalNormalization):
     self._std = std_buf
 
 
+def build_low_rank_mlp(
+  input_dim: int,
+  hidden_dims: tuple[int, ...],
+  output_dim: int,
+  rank: int,
+) -> nn.Sequential:
+  """Build an MLP whose wide linear maps use a shared low-rank bottleneck."""
+  if rank < 1:
+    raise ValueError("low-rank bottleneck must be positive")
+  layers: list[nn.Module] = []
+  curr = input_dim
+  for h in hidden_dims:
+    layers += [
+      nn.Linear(curr, rank, bias=False),
+      nn.Linear(rank, h),
+      nn.LayerNorm(h),
+      nn.GELU(),
+    ]
+    curr = h
+  layers.append(nn.Linear(curr, output_dim))
+  return nn.Sequential(*layers)
+
+
 def build_mlp(
   input_dim: int,
   hidden_dims: tuple[int, ...],
@@ -63,6 +86,7 @@ class Dynamics(nn.Module):
     residual_scale: float = 0.1,
     residual_hidden_dims: tuple[int, ...] | None = None,
     residual_shared_trunk: bool = False,
+    residual_low_rank: int | None = None,
   ):
     super().__init__()
 
@@ -95,10 +119,20 @@ class Dynamics(nn.Module):
         nn.init.zeros_(self.residual_head.weight)
         nn.init.zeros_(self.residual_head.bias)
       else:
-        self.residual_mlp = build_mlp(
-          self.num_rep_state + num_actions + sim_ctx_dim,
-          hidden_dims if residual_hidden_dims is None else residual_hidden_dims,
-          output_dim=representation.prediction_dim,
+        residual_dims = hidden_dims if residual_hidden_dims is None else residual_hidden_dims
+        self.residual_mlp = (
+          build_low_rank_mlp(
+            self.num_rep_state + num_actions + sim_ctx_dim,
+            residual_dims,
+            representation.prediction_dim,
+            residual_low_rank,
+          )
+          if residual_low_rank is not None
+          else build_mlp(
+            self.num_rep_state + num_actions + sim_ctx_dim,
+            residual_dims,
+            output_dim=representation.prediction_dim,
+          )
         )
         # Preserve the baseline predictor at step zero. The residual branch
         # should learn a correction rather than inject a random offset.
