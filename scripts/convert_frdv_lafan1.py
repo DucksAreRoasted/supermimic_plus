@@ -24,7 +24,7 @@ def main():
         rel[1:, 1:] = (b[:, 0, None] * a[:, 1:] - a[:, 0, None] * b[:, 1:]
                        - np.cross(b[:, 1:], a[:, 1:]))
         rel /= np.linalg.norm(rel, axis=1, keepdims=True).clip(1e-8)
-        sign = np.where(rel[:, :1, 0] < 0, -1.0, 1.0)
+        sign = np.where(rel[:, 0:1] < 0, -1.0, 1.0)
         root_ang_vel = (2.0 * rel[:, 1:] * sign / dt).astype(np.float32)
         out=args.dst/src.name
         np.savez_compressed(out, fps=np.float32(fps),
