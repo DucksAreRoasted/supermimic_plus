@@ -111,6 +111,10 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Official single critic is unchanged; twin is an isolated experiment."""
   max_iterations: int = 1000000
   replay_ratio: int = 16
+  failure_priority: bool = False
+  """Prioritize replay windows from environments that recently failed."""
+  failure_priority_decay: float = 0.95
+  failure_priority_boost: float = 1.0
   latent_dim: int = 32
   actor_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256)
   critic_hidden_dims: tuple[int, ...] = (256, 128)
@@ -811,6 +815,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         extra_fields=extra_fields,
       )
       terminated = self.env.unwrapped.termination_manager.terminated
+      manager = self.env.unwrapped.termination_manager
+      truncated = manager.time_outs.to(self.device, torch.bool)
       if self.cfg.critic_variant == "sim-calibrated":
         next_full_state = next_obs["full_state"].to(self.device)
         next_rep_state = self._representation.represent(next_full_state)
@@ -833,11 +839,15 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         del self._sim_calibration_dones[:-max_window]
       self._advance_sim_history(next_obs["actor"].to(self.device), dones)
       self.logger.process_env_step(rewards, terminated, extras)
+      if self.cfg.failure_priority:
+        self.replay_buffer.update_failure_priority(
+          terminated.to(self.device, torch.bool) & ~truncated,
+          decay=self.cfg.failure_priority_decay,
+          boost=self.cfg.failure_priority_boost,
+        )
 
       if self._sampler is not None:
         # A failure on a step that also times out counts as the time-out.
-        manager = self.env.unwrapped.termination_manager
-        truncated = manager.time_outs.to(self.device, torch.bool)
         clip_end = manager.get_term("motion_end").to(self.device, torch.bool)
         weights = self._sampler.record(
           motion_times,

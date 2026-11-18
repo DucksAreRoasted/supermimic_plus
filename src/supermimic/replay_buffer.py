@@ -30,6 +30,7 @@ class ReplayBuffer:
     self.num_envs = num_envs
     self.device = device
     self._step = 0
+    self._env_priority = torch.ones(num_envs, dtype=torch.float32, device=device)
     self._storage = TensorDict(
       {
         name: torch.zeros(
@@ -50,6 +51,17 @@ class ReplayBuffer:
     self._storage[:, self._step] = td
     self._step = (self._step + 1) % self.buffer_size
     self.num_transitions = min(self.buffer_size, self.num_transitions + 1)
+
+  def update_failure_priority(
+    self, failed: torch.Tensor, decay: float = 0.95, boost: float = 1.0
+  ) -> None:
+    """Increase sampling mass for environments that just reached failure."""
+    if failed.shape != (self.num_envs,):
+      raise ValueError("failed must have shape [num_envs]")
+    failed = failed.to(self._env_priority.device, dtype=torch.bool)
+    self._env_priority.mul_(decay)
+    self._env_priority.add_(failed.to(torch.float32) * boost)
+    self._env_priority.clamp_(min=1e-3)
 
   def sample_causal(
     self, sequence_length: int, batch_size: int
@@ -114,7 +126,8 @@ class ReplayBuffer:
     total = csum[:, -1]
     if not (total > 0).any():
       raise RuntimeError(f"no valid sequences L={L} n={n}")
-    env_idx = torch.multinomial((total > 0).float(), B, replacement=True)
+    env_mass = (total > 0).float() * self._env_priority
+    env_idx = torch.multinomial(env_mass, B, replacement=True)
     u = (torch.rand(B, device=dev) * total[env_idx].float()).long()
     age_start = torch.searchsorted(csum[env_idx], u[:, None], right=True).squeeze(-1)
     storage_idx = (base + age_start[:, None] + torch.arange(L, device=dev)) % T
