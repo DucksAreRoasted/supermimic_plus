@@ -66,6 +66,19 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
       **getattr(self.actor, "auxiliary_stats", lambda: {})(),
     }
 
+  def simulator_returns(
+    self, rewards: torch.Tensor, dones: torch.Tensor
+  ) -> torch.Tensor:
+    """Compute discounted returns that stop at each simulator termination."""
+    if rewards.shape != dones.shape:
+      raise ValueError("rewards and dones must have the same shape")
+    returns = torch.empty_like(rewards)
+    running = torch.zeros_like(rewards[-1])
+    for index in range(rewards.shape[0] - 1, -1, -1):
+      running = rewards[index] + self.cfg.gamma * (1 - dones[index]) * running
+      returns[index] = running
+    return returns
+
   def set_simulator_batch(
     self,
     critic_obs: torch.Tensor,
