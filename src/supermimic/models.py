@@ -62,6 +62,7 @@ class Dynamics(nn.Module):
     residual_correction: bool = False,
     residual_scale: float = 0.1,
     residual_hidden_dims: tuple[int, ...] | None = None,
+    residual_shared_trunk: bool = False,
   ):
     super().__init__()
 
@@ -71,6 +72,7 @@ class Dynamics(nn.Module):
     self._apply_prediction = representation.apply_prediction
     self.residual_correction = residual_correction
     self.residual_scale = float(residual_scale)
+    self.residual_shared_trunk = bool(residual_shared_trunk)
 
     self.register_buffer("action_scale", action_scale.clone())
     self.register_buffer("action_offset", action_offset.clone())
@@ -84,24 +86,32 @@ class Dynamics(nn.Module):
       output_dim=representation.prediction_dim,
     )
     self.residual_mlp = None
+    self.residual_head = None
     if residual_correction:
-      self.residual_mlp = build_mlp(
-        self.num_rep_state + num_actions + sim_ctx_dim,
-        hidden_dims if residual_hidden_dims is None else residual_hidden_dims,
-        output_dim=representation.prediction_dim,
-      )
-      # Preserve the baseline predictor at step zero. The residual branch
-      # should learn a correction rather than inject a random offset.
-      last_linear = next(
-        (module for module in reversed(list(self.residual_mlp))
-         if isinstance(module, nn.Linear)),
-        None,
-      )
-      if last_linear is None:
-        raise ValueError("Residual correction requires a linear output layer")
-      nn.init.zeros_(last_linear.weight)
-      if last_linear.bias is not None:
-        nn.init.zeros_(last_linear.bias)
+      if self.residual_shared_trunk:
+        if not hidden_dims:
+          raise ValueError("Shared residual trunk requires at least one hidden layer")
+        self.residual_head = nn.Linear(hidden_dims[-1], representation.prediction_dim)
+        nn.init.zeros_(self.residual_head.weight)
+        nn.init.zeros_(self.residual_head.bias)
+      else:
+        self.residual_mlp = build_mlp(
+          self.num_rep_state + num_actions + sim_ctx_dim,
+          hidden_dims if residual_hidden_dims is None else residual_hidden_dims,
+          output_dim=representation.prediction_dim,
+        )
+        # Preserve the baseline predictor at step zero. The residual branch
+        # should learn a correction rather than inject a random offset.
+        last_linear = next(
+          (module for module in reversed(list(self.residual_mlp))
+           if isinstance(module, nn.Linear)),
+          None,
+        )
+        if last_linear is None:
+          raise ValueError("Residual correction requires a linear output layer")
+        nn.init.zeros_(last_linear.weight)
+        if last_linear.bias is not None:
+          nn.init.zeros_(last_linear.bias)
 
   def proc(self, action: torch.Tensor) -> torch.Tensor:
     """Map raw policy output to proc joint commands: ``action * scale + offset``."""
@@ -117,9 +127,14 @@ class Dynamics(nn.Module):
     state_norm = self.state_normalizer(rep_state)
     action_norm = self.action_normalizer(self.proc(action))
     features = torch.cat([state_norm, action_norm, sim_ctx], dim=-1)
-    prediction = self.mlp(features)
-    if self.residual_mlp is not None:
-      prediction = prediction + self.residual_scale * self.residual_mlp(features)
+    if self.residual_head is not None:
+      trunk = self.mlp[:-1](features)
+      prediction = self.mlp[-1](trunk)
+      prediction = prediction + self.residual_scale * self.residual_head(trunk)
+    else:
+      prediction = self.mlp(features)
+      if self.residual_mlp is not None:
+        prediction = prediction + self.residual_scale * self.residual_mlp(features)
     return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
 
   def normalizers(self) -> list[_CudaGraphNormalization]:

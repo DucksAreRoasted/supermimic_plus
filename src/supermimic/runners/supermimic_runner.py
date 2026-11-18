@@ -74,6 +74,8 @@ class BaseRunnerCfg:
   """Initial residual contribution scale; kept small for stable warm-up."""
   residual_hidden_dims: tuple[int, ...] | None = None
   """Optional narrower residual head for lower-cost correction experiments."""
+  residual_shared_trunk: bool = False
+  """Share the World Model trunk and use a zero-initialized residual output head."""
   reference_residual_policy: bool = False
   """Center raw Actor actions on the current reference joint pose."""
   reference_residual_scale: float = 0.25
@@ -204,6 +206,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     residual_correction=cfg.residual_correction,
     residual_scale=cfg.residual_scale,
     residual_hidden_dims=cfg.residual_hidden_dims,
+    residual_shared_trunk=cfg.residual_shared_trunk,
   ).to(device)
 
   return WorldModel(

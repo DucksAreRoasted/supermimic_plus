@@ -245,3 +245,11 @@ def test_residual_correction_starts_as_base_dynamics():
   corrected_out = corrected(rep_state, action, aux, sim_ctx)
   for actual, expected in zip(corrected_out, base_out):
     torch.testing.assert_close(actual, expected)
+
+  shared = Dynamics(**kwargs, residual_correction=True, residual_shared_trunk=True)
+  shared.mlp.load_state_dict(base.mlp.state_dict())
+  shared.state_normalizer.load_state_dict(base.state_normalizer.state_dict())
+  shared.action_normalizer.load_state_dict(base.action_normalizer.state_dict())
+  shared_out = shared(rep_state, action, aux, sim_ctx)
+  for actual, expected in zip(shared_out, base_out):
+    torch.testing.assert_close(actual, expected)
