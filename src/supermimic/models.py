@@ -206,6 +206,7 @@ class MultiEncoderAE(nn.Module):
     history_length: int,
     latent_prior_weight: float = 0.0,
     latent_prior_mode: str = "mse",
+    latent_prior_blend: float = 0.0,
     prior_hidden_dims: tuple[int, ...] | None = None,
   ):
     super().__init__()
@@ -216,6 +217,11 @@ class MultiEncoderAE(nn.Module):
     self.latent_dim = latent_dim
     self.latent_bc_weight = latent_bc_weight
     self.latent_prior_weight = latent_prior_weight
+    if not 0.0 <= latent_prior_blend <= 1.0:
+      raise ValueError(
+        f"latent_prior_blend must be in [0, 1], got {latent_prior_blend}"
+      )
+    self.latent_prior_blend = latent_prior_blend
     if latent_prior_mode not in {"mse", "kl"}:
       raise ValueError(
         f"latent_prior_mode must be 'mse' or 'kl', got {latent_prior_mode!r}"
@@ -252,10 +258,10 @@ class MultiEncoderAE(nn.Module):
     prior_output_dim = latent_dim * 2 if latent_prior_mode == "kl" else latent_dim
     self.prior = (
       build_mlp(obs_dim, prior_dims, output_dim=prior_output_dim)
-      if latent_prior_weight != 0.0
+      if latent_prior_weight != 0.0 or latent_prior_blend != 0.0
       else None
     )
-    if latent_prior_weight != 0.0 and latent_prior_mode == "kl":
+    if (latent_prior_weight != 0.0 or latent_prior_blend != 0.0) and latent_prior_mode == "kl":
       assert self.prior is not None
       # Start the prior variance at unit variance. This keeps the first KL
       # updates finite while the prior mean learns from posterior targets.
@@ -299,13 +305,29 @@ class MultiEncoderAE(nn.Module):
       enc_outs.append(self.encoders[name](goal_n))
 
     z = torch.cat([torch.tanh(eo) for eo in enc_outs], dim=0)
+    posterior_z = z
     posterior_mu = (
       torch.cat(enc_outs, dim=0)
       if self.latent_prior_mode == "kl" and self.latent_prior_weight != 0.0
       else None
     )
+    prior_out = None
+    if self.latent_prior_blend != 0.0 or (
+      self.training and self.latent_prior_weight != 0.0
+    ):
+      assert self.prior is not None
+      history_n = self.obs_normalizer(obs_td["history"][:, -1])
+      prior_out = self.prior(history_n)
+      if self.latent_prior_blend != 0.0:
+        prior_mu = (
+          prior_out.chunk(2, dim=-1)[0]
+          if self.latent_prior_mode == "kl"
+          else prior_out
+        )
+        z_prior = torch.tanh(prior_mu)
+        z = (1.0 - self.latent_prior_blend) * z + self.latent_prior_blend * z_prior
     self._aux_loss = self._compute_aux_loss(
-      obs_td, slots, z, posterior_mu
+      obs_td, slots, posterior_z, posterior_mu, prior_out
     )
 
     history_n = self.obs_normalizer(obs_td["history"])
@@ -317,6 +339,7 @@ class MultiEncoderAE(nn.Module):
     slots: list[tuple[int, int]],
     z_post: torch.Tensor,
     posterior_mu: torch.Tensor | None,
+    prior_out: torch.Tensor | None,
   ) -> torch.Tensor:
     """Return per-environment auxiliary losses for the latent heads.
 
@@ -335,9 +358,10 @@ class MultiEncoderAE(nn.Module):
     prior_kl = torch.zeros(obs_td.shape[0], device=obs_td.device)
     bc_loss = torch.zeros(obs_td.shape[0], device=obs_td.device)
     if self.training and self.latent_prior_weight != 0.0:
-      history_n = self.obs_normalizer(obs_td["history"][:, -1])
       assert self.prior is not None
-      prior_out = self.prior(history_n)
+      if prior_out is None:
+        history_n = self.obs_normalizer(obs_td["history"][:, -1])
+        prior_out = self.prior(history_n)
       if self.latent_prior_mode == "kl":
         assert posterior_mu is not None
         prior_mu, prior_logvar = prior_out.chunk(2, dim=-1)

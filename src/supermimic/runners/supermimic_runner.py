@@ -127,6 +127,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Weight on conditional-prior matching for the motion latent."""
   latent_prior_mode: Literal["mse", "kl"] = "mse"
   """Conditional-prior objective used when ``latent_prior_weight`` is nonzero."""
+  latent_prior_blend: float = 0.0
+  """Fraction of the prior mean blended into the decoder latent."""
   latent_prior_hidden_dims: tuple[int, ...] = (512, 256)
   """Hidden layer widths for the conditional-prior head."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
@@ -253,6 +255,7 @@ def build_actor(
     latent_bc_weight=cfg.latent_bc_weight,
     latent_prior_weight=cfg.latent_prior_weight,
     latent_prior_mode=cfg.latent_prior_mode,
+    latent_prior_blend=cfg.latent_prior_blend,
     prior_hidden_dims=cfg.latent_prior_hidden_dims,
     history_length=cfg.history_length,
   ).to(device)

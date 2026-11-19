@@ -24,6 +24,7 @@ def _make_actor(
   history_length: int = 1,
   latent_prior_weight: float = 0.0,
   latent_prior_mode: str = "mse",
+  latent_prior_blend: float = 0.0,
   prior_hidden_dims: tuple[int, ...] | None = None,
 ) -> MultiEncoderAE:
   return MultiEncoderAE(
@@ -37,6 +38,7 @@ def _make_actor(
     history_length=history_length,
     latent_prior_weight=latent_prior_weight,
     latent_prior_mode=latent_prior_mode,
+    latent_prior_blend=latent_prior_blend,
     prior_hidden_dims=prior_hidden_dims,
   )
 
@@ -203,6 +205,21 @@ class TestLatentPrior:
     actor.auxiliary_loss().mean().backward()
     assert any(p.grad is not None for p in actor.prior.parameters())
     assert any(p.grad is not None for p in actor.encoders["motion"].parameters())
+
+  def test_prior_blend_changes_decoder_latent(self):
+    base = _make_actor(slot_mix={"motion": 1.0}, latent_prior_weight=0.1,
+      latent_prior_mode="kl", latent_prior_blend=0.0).eval()
+    blend = _make_actor(slot_mix={"motion": 1.0}, latent_prior_weight=0.1,
+      latent_prior_mode="kl", latent_prior_blend=0.2).eval()
+    blend.load_state_dict(base.state_dict(), strict=False)
+    obs = make_actor_obs(BATCH)
+    base_in = []
+    blend_in = []
+    base.decoder[0].register_forward_pre_hook(lambda _m, a: base_in.append(a[0].detach()))
+    blend.decoder[0].register_forward_pre_hook(lambda _m, a: blend_in.append(a[0].detach()))
+    base(obs)
+    blend(obs)
+    assert not torch.allclose(base_in[0], blend_in[0])
 
 
 class TestSlotRanges:
