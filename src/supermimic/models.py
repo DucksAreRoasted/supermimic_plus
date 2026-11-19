@@ -236,7 +236,13 @@ class MultiEncoderAE(nn.Module):
       hidden_dims,
       output_dim=action_dim,
     )
-    self.prior = build_mlp(obs_dim, hidden_dims, output_dim=latent_dim)
+    # Do not allocate or initialize the prior when disabled. This preserves the
+    # baseline parameter set and RNG initialization exactly for weight=0 runs.
+    self.prior = (
+      build_mlp(obs_dim, hidden_dims, output_dim=latent_dim)
+      if latent_prior_weight != 0.0
+      else None
+    )
 
     self.set_slot_mix(slot_mix)
 
@@ -295,6 +301,7 @@ class MultiEncoderAE(nn.Module):
     out = torch.zeros(obs_td.shape[0], device=obs_td.device)
     if self.training and self.latent_prior_weight != 0.0:
       history_n = self.obs_normalizer(obs_td["history"][:, -1])
+      assert self.prior is not None
       z_prior = torch.tanh(self.prior(history_n))
       z_post = torch.zeros_like(z_prior)
       for name, (lo, hi) in zip(self._task_names, slots, strict=True):
