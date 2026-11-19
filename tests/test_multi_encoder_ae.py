@@ -199,9 +199,10 @@ class TestLatentPrior:
     assert actor.prior[-1].out_features == 2 * LATENT_DIM
     assert torch.isfinite(stats["prior_kl"])
     assert (stats["prior_kl"] > 0).all()
-    (actions.sum() + actor.auxiliary_loss().mean()).backward()
+    actor.zero_grad(set_to_none=True)
+    actor.auxiliary_loss().mean().backward()
     assert any(p.grad is not None for p in actor.prior.parameters())
-    assert any(p.grad is not None for p in actor.posterior_logvars["motion"].parameters())
+    assert any(p.grad is not None for p in actor.encoders["motion"].parameters())
 
 
 class TestSlotRanges:
