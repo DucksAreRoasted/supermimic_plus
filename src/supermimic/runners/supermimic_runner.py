@@ -125,6 +125,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   anchor encoder's latent on the same state. 0 disables."""
   latent_prior_weight: float = 0.0
   """Weight on conditional-prior matching for the motion latent."""
+  latent_prior_mode: Literal["mse", "kl"] = "mse"
+  """Conditional-prior objective used when ``latent_prior_weight`` is nonzero."""
   latent_prior_hidden_dims: tuple[int, ...] = (512, 256)
   """Hidden layer widths for the conditional-prior head."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
@@ -250,6 +252,7 @@ def build_actor(
     hidden_dims=cfg.actor_hidden_dims,
     latent_bc_weight=cfg.latent_bc_weight,
     latent_prior_weight=cfg.latent_prior_weight,
+    latent_prior_mode=cfg.latent_prior_mode,
     prior_hidden_dims=cfg.latent_prior_hidden_dims,
     history_length=cfg.history_length,
   ).to(device)

@@ -205,6 +205,7 @@ class MultiEncoderAE(nn.Module):
     latent_bc_weight: float,
     history_length: int,
     latent_prior_weight: float = 0.0,
+    latent_prior_mode: str = "mse",
     prior_hidden_dims: tuple[int, ...] | None = None,
   ):
     super().__init__()
@@ -215,6 +216,11 @@ class MultiEncoderAE(nn.Module):
     self.latent_dim = latent_dim
     self.latent_bc_weight = latent_bc_weight
     self.latent_prior_weight = latent_prior_weight
+    if latent_prior_mode not in {"mse", "kl"}:
+      raise ValueError(
+        f"latent_prior_mode must be 'mse' or 'kl', got {latent_prior_mode!r}"
+      )
+    self.latent_prior_mode = latent_prior_mode
     self.task_specs = task_specs
     self._task_names = [ts.name for ts in task_specs]
     # Anchor: the first task. The aux-loss hook regularizes each non-anchor
@@ -222,6 +228,7 @@ class MultiEncoderAE(nn.Module):
     self._anchor = self._task_names[0]
     self._aux_loss = torch.zeros(0)
     self._prior_loss = torch.zeros(0)
+    self._prior_kl = torch.zeros(0)
     self._bc_loss = torch.zeros(0)
 
     self.obs_normalizer = _CudaGraphNormalization(obs_dim)
@@ -242,11 +249,32 @@ class MultiEncoderAE(nn.Module):
     # Do not allocate or initialize the prior when disabled. This preserves the
     # baseline parameter set and RNG initialization exactly for weight=0 runs.
     prior_dims = hidden_dims if prior_hidden_dims is None else prior_hidden_dims
+    prior_output_dim = latent_dim * 2 if latent_prior_mode == "kl" else latent_dim
     self.prior = (
-      build_mlp(obs_dim, prior_dims, output_dim=latent_dim)
+      build_mlp(obs_dim, prior_dims, output_dim=prior_output_dim)
       if latent_prior_weight != 0.0
       else None
     )
+    # KL mode adds a posterior log-variance head without changing the
+    # deterministic posterior mean used by the decoder.
+    self.posterior_logvars = nn.ModuleDict(
+      {
+        ts.name: build_mlp(ts.goal_dim, hidden_dims, output_dim=latent_dim)
+        for ts in task_specs
+      }
+      if latent_prior_weight != 0.0 and latent_prior_mode == "kl"
+      else {}
+    )
+    if latent_prior_weight != 0.0 and latent_prior_mode == "kl":
+      assert self.prior is not None
+      # Start both variance heads at unit variance. This keeps the first KL
+      # updates finite while the mean heads learn from the posterior targets.
+      with torch.no_grad():
+        self.prior[-1].weight[self.latent_dim :].zero_()
+        self.prior[-1].bias[self.latent_dim :].zero_()
+        for head in self.posterior_logvars.values():
+          head[-1].weight.zero_()
+          head[-1].bias.zero_()
 
     self.set_slot_mix(slot_mix)
 
@@ -277,14 +305,25 @@ class MultiEncoderAE(nn.Module):
   def forward(self, obs_td: TensorDict) -> torch.Tensor:
     slots = self.slot_ranges(obs_td.shape[0])
     enc_outs: list[torch.Tensor] = []
+    posterior_logvar_outs: list[torch.Tensor] = []
     for name, (lo, hi) in zip(self._task_names, slots, strict=True):
       if lo == hi:
         continue
       goal_n = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi])
       enc_outs.append(self.encoders[name](goal_n))
+      if self.latent_prior_mode == "kl" and self.latent_prior_weight != 0.0:
+        posterior_logvar_outs.append(self.posterior_logvars[name](goal_n))
 
     z = torch.cat([torch.tanh(eo) for eo in enc_outs], dim=0)
-    self._aux_loss = self._compute_aux_loss(obs_td, slots, z)
+    posterior_logvar = (
+      torch.cat(posterior_logvar_outs, dim=0)
+      if posterior_logvar_outs
+      else None
+    )
+    posterior_mu = torch.cat(enc_outs, dim=0) if posterior_logvar is not None else None
+    self._aux_loss = self._compute_aux_loss(
+      obs_td, slots, z, posterior_mu, posterior_logvar
+    )
 
     history_n = self.obs_normalizer(obs_td["history"])
     return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
@@ -294,6 +333,8 @@ class MultiEncoderAE(nn.Module):
     obs_td: TensorDict,
     slots: list[tuple[int, int]],
     z_post: torch.Tensor,
+    posterior_mu: torch.Tensor | None,
+    posterior_logvar: torch.Tensor | None,
   ) -> torch.Tensor:
     """Return per-environment auxiliary losses for the latent heads.
 
@@ -309,16 +350,34 @@ class MultiEncoderAE(nn.Module):
     Returns ``(num_envs,)``; anchor / empty slots contribute zero.
     """
     prior_loss = torch.zeros(obs_td.shape[0], device=obs_td.device)
+    prior_kl = torch.zeros(obs_td.shape[0], device=obs_td.device)
     bc_loss = torch.zeros(obs_td.shape[0], device=obs_td.device)
     if self.training and self.latent_prior_weight != 0.0:
       history_n = self.obs_normalizer(obs_td["history"][:, -1])
       assert self.prior is not None
-      z_prior = torch.tanh(self.prior(history_n))
-      prior_loss = self.latent_prior_weight * (
-        (z_prior - z_post.detach()) ** 2
-      ).mean(dim=-1)
+      prior_out = self.prior(history_n)
+      if self.latent_prior_mode == "kl":
+        assert posterior_mu is not None and posterior_logvar is not None
+        prior_mu, prior_logvar = prior_out.chunk(2, dim=-1)
+        posterior_logvar = posterior_logvar.clamp(-8.0, 4.0)
+        prior_logvar = prior_logvar.clamp(-8.0, 4.0)
+        posterior_var = posterior_logvar.exp()
+        prior_var = prior_logvar.exp()
+        prior_kl = 0.5 * (
+          prior_logvar
+          - posterior_logvar
+          + (posterior_var + (posterior_mu - prior_mu).square()) / prior_var
+          - 1.0
+        ).mean(dim=-1)
+        prior_loss = self.latent_prior_weight * prior_kl
+      else:
+        z_prior = torch.tanh(prior_out)
+        prior_loss = self.latent_prior_weight * (
+          (z_prior - z_post.detach()) ** 2
+        ).mean(dim=-1)
     if not self.training or self.latent_bc_weight == 0.0:
       self._prior_loss = prior_loss
+      self._prior_kl = prior_kl
       self._bc_loss = bc_loss
       return prior_loss
     anchor = self._anchor
@@ -332,6 +391,7 @@ class MultiEncoderAE(nn.Module):
         z_anchor = torch.tanh(self.encoders[anchor](anchor_goal_d[lo:hi]))
       bc_loss[lo:hi] = self.latent_bc_weight * ((z - z_anchor) ** 2).mean(dim=-1)
     self._prior_loss = prior_loss
+    self._prior_kl = prior_kl
     self._bc_loss = bc_loss
     return prior_loss + bc_loss
 
@@ -343,6 +403,7 @@ class MultiEncoderAE(nn.Module):
       return {}
     return {
       "prior_loss": self._prior_loss.mean().detach(),
+      "prior_kl": self._prior_kl.mean().detach(),
       "bc_loss": self._bc_loss.mean().detach(),
     }
 

@@ -23,6 +23,7 @@ def _make_actor(
   slot_mix=None,
   history_length: int = 1,
   latent_prior_weight: float = 0.0,
+  latent_prior_mode: str = "mse",
   prior_hidden_dims: tuple[int, ...] | None = None,
 ) -> MultiEncoderAE:
   return MultiEncoderAE(
@@ -35,6 +36,7 @@ def _make_actor(
     latent_bc_weight=1.0,
     history_length=history_length,
     latent_prior_weight=latent_prior_weight,
+    latent_prior_mode=latent_prior_mode,
     prior_hidden_dims=prior_hidden_dims,
   )
 
@@ -174,13 +176,32 @@ class TestLatentPrior:
     assert actor.prior is not None
     assert actor.prior[0].out_features == 8
     stats = actor.auxiliary_stats()
-    assert set(stats) == {"prior_loss", "bc_loss"}
+    assert set(stats) == {"prior_loss", "prior_kl", "bc_loss"}
     assert torch.isfinite(stats["prior_loss"])
+    assert torch.equal(stats["prior_kl"], torch.zeros_like(stats["prior_kl"]))
     assert torch.equal(stats["bc_loss"], torch.zeros_like(stats["bc_loss"]))
 
   def test_prior_disabled_preserves_baseline_head(self):
     actor = _make_actor(slot_mix={"motion": 1.0})
     assert actor.prior is None
+
+  def test_kl_prior_has_finite_loss_and_gradients(self):
+    actor = _make_actor(
+      slot_mix={"motion": 1.0},
+      latent_prior_weight=0.1,
+      latent_prior_mode="kl",
+      prior_hidden_dims=(8, 4),
+    ).train()
+    obs = make_actor_obs(BATCH)
+    actions = actor(obs)
+    stats = actor.auxiliary_stats()
+    assert actor.prior is not None
+    assert actor.prior[-1].out_features == 2 * LATENT_DIM
+    assert torch.isfinite(stats["prior_kl"])
+    assert (stats["prior_kl"] > 0).all()
+    (actions.sum() + actor.auxiliary_loss().mean()).backward()
+    assert any(p.grad is not None for p in actor.prior.parameters())
+    assert any(p.grad is not None for p in actor.posterior_logvars["motion"].parameters())
 
 
 class TestSlotRanges:
