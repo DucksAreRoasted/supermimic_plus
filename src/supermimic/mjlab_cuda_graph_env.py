@@ -54,10 +54,6 @@ class DeviceStepAdapter:
     self.reward_buf.copy_(
       self.env.reward_manager.compute(dt=self.env.step_dt)
     )
-    self.env.reset_buf.copy_(self.reset_buf)
-    self.env.reset_terminated.copy_(self.reset_terminated)
-    self.env.reset_time_outs.copy_(self.reset_time_outs)
-    self.env.reward_buf.copy_(self.reward_buf)
     return (
       self.reward_buf,
       self.reset_terminated,
@@ -75,6 +71,13 @@ class DeviceStepAdapter:
     """
     env = self.env
     reset_mask = terminated | time_outs
+    # These attributes are created lazily by ManagerBasedRlEnv.step. Assign the
+    # stable graph-owned tensors here after capture, rather than reading them
+    # during graph construction.
+    env.reset_buf = reset_mask
+    env.reset_terminated = terminated
+    env.reset_time_outs = time_outs
+    env.reward_buf = self.reward_buf
     reset_ids = reset_mask.nonzero(as_tuple=False).squeeze(-1)
     if "step" in env.event_manager.available_modes:
       env.event_manager.apply(mode="step", dt=env.step_dt)
