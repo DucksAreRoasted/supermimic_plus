@@ -205,6 +205,7 @@ class MultiEncoderAE(nn.Module):
     latent_bc_weight: float,
     history_length: int,
     latent_prior_weight: float = 0.0,
+    prior_hidden_dims: tuple[int, ...] | None = None,
   ):
     super().__init__()
     if not task_specs:
@@ -220,6 +221,8 @@ class MultiEncoderAE(nn.Module):
     # encoder against the anchor encoder on the same state.
     self._anchor = self._task_names[0]
     self._aux_loss = torch.zeros(0)
+    self._prior_loss = torch.zeros(0)
+    self._bc_loss = torch.zeros(0)
 
     self.obs_normalizer = _CudaGraphNormalization(obs_dim)
     self.goal_normalizers = nn.ModuleDict(
@@ -238,8 +241,9 @@ class MultiEncoderAE(nn.Module):
     )
     # Do not allocate or initialize the prior when disabled. This preserves the
     # baseline parameter set and RNG initialization exactly for weight=0 runs.
+    prior_dims = hidden_dims if prior_hidden_dims is None else prior_hidden_dims
     self.prior = (
-      build_mlp(obs_dim, hidden_dims, output_dim=latent_dim)
+      build_mlp(obs_dim, prior_dims, output_dim=latent_dim)
       if latent_prior_weight != 0.0
       else None
     )
@@ -279,17 +283,23 @@ class MultiEncoderAE(nn.Module):
       goal_n = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi])
       enc_outs.append(self.encoders[name](goal_n))
 
-    self._aux_loss = self._compute_aux_loss(obs_td, slots)
-
     z = torch.cat([torch.tanh(eo) for eo in enc_outs], dim=0)
+    self._aux_loss = self._compute_aux_loss(obs_td, slots, z)
+
     history_n = self.obs_normalizer(obs_td["history"])
     return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
 
   def _compute_aux_loss(
-    self, obs_td: TensorDict, slots: list[tuple[int, int]]
+    self,
+    obs_td: TensorDict,
+    slots: list[tuple[int, int]],
+    z_post: torch.Tensor,
   ) -> torch.Tensor:
-    """Per-env BC loss pulling each non-anchor encoder's latent toward the
-    anchor encoder's latent on the same state.
+    """Return per-environment auxiliary losses for the latent heads.
+
+    The prior term pulls the state-conditioned prior toward the already computed
+    goal-conditioned latent. The latent BC term pulls each non-anchor encoder
+    toward the anchor encoder on the same state.
 
     Goals are detached before the BC encoder forwards so BC's gradient only
     updates the non-anchor encoder's parameters — never the decoder or the
@@ -298,20 +308,19 @@ class MultiEncoderAE(nn.Module):
     Anchor query is also under ``no_grad``. Skipped in eval mode.
     Returns ``(num_envs,)``; anchor / empty slots contribute zero.
     """
-    out = torch.zeros(obs_td.shape[0], device=obs_td.device)
+    prior_loss = torch.zeros(obs_td.shape[0], device=obs_td.device)
+    bc_loss = torch.zeros(obs_td.shape[0], device=obs_td.device)
     if self.training and self.latent_prior_weight != 0.0:
       history_n = self.obs_normalizer(obs_td["history"][:, -1])
       assert self.prior is not None
       z_prior = torch.tanh(self.prior(history_n))
-      z_post = torch.zeros_like(z_prior)
-      for name, (lo, hi) in zip(self._task_names, slots, strict=True):
-        if lo == hi:
-          continue
-        goal_n = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi])
-        z_post[lo:hi] = torch.tanh(self.encoders[name](goal_n)).detach()
-      out += self.latent_prior_weight * ((z_prior - z_post) ** 2).mean(dim=-1)
+      prior_loss = self.latent_prior_weight * (
+        (z_prior - z_post.detach()) ** 2
+      ).mean(dim=-1)
     if not self.training or self.latent_bc_weight == 0.0:
-      return out
+      self._prior_loss = prior_loss
+      self._bc_loss = bc_loss
+      return prior_loss
     anchor = self._anchor
     anchor_goal_d = self.goal_normalizers[anchor](obs_td[f"goal_{anchor}"]).detach()
     for name, (lo, hi) in zip(self._task_names, slots, strict=True):
@@ -321,8 +330,10 @@ class MultiEncoderAE(nn.Module):
       z = torch.tanh(self.encoders[name](goal_n_d))
       with torch.no_grad():
         z_anchor = torch.tanh(self.encoders[anchor](anchor_goal_d[lo:hi]))
-      out[lo:hi] = self.latent_bc_weight * ((z - z_anchor) ** 2).mean(dim=-1)
-    return out
+      bc_loss[lo:hi] = self.latent_bc_weight * ((z - z_anchor) ** 2).mean(dim=-1)
+    self._prior_loss = prior_loss
+    self._bc_loss = bc_loss
+    return prior_loss + bc_loss
 
   def auxiliary_loss(self) -> torch.Tensor:
     return self._aux_loss
@@ -330,7 +341,10 @@ class MultiEncoderAE(nn.Module):
   def auxiliary_stats(self) -> dict[str, torch.Tensor]:
     if self._aux_loss.numel() == 0:
       return {}
-    return {"bc_loss": self._aux_loss.mean().detach()}
+    return {
+      "prior_loss": self._prior_loss.mean().detach(),
+      "bc_loss": self._bc_loss.mean().detach(),
+    }
 
   @torch.jit.unused
   def update_normalization(self, obs_td: TensorDict) -> None:

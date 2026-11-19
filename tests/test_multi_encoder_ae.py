@@ -19,7 +19,12 @@ from tests.conftest import (
 BATCH = 16
 
 
-def _make_actor(slot_mix=None, history_length: int = 1) -> MultiEncoderAE:
+def _make_actor(
+  slot_mix=None,
+  history_length: int = 1,
+  latent_prior_weight: float = 0.0,
+  prior_hidden_dims: tuple[int, ...] | None = None,
+) -> MultiEncoderAE:
   return MultiEncoderAE(
     obs_dim=OBS_DIM,
     action_dim=ACTION_DIM,
@@ -29,6 +34,8 @@ def _make_actor(slot_mix=None, history_length: int = 1) -> MultiEncoderAE:
     hidden_dims=(32, 32),
     latent_bc_weight=1.0,
     history_length=history_length,
+    latent_prior_weight=latent_prior_weight,
+    prior_hidden_dims=prior_hidden_dims,
   )
 
 
@@ -152,6 +159,28 @@ class TestGradientFlow:
       assert not p.grad.isnan().any()
     for name, p in actor.decoder.named_parameters():
       assert p.grad is not None, f"decoder.{name} got no grad"
+
+
+class TestLatentPrior:
+  def test_prior_hidden_dims_and_stats(self):
+    actor = _make_actor(
+      slot_mix={"motion": 1.0},
+      latent_prior_weight=1.0,
+      prior_hidden_dims=(8, 4),
+    ).train()
+    obs = make_actor_obs(BATCH)
+    actor(obs)
+
+    assert actor.prior is not None
+    assert actor.prior[0].out_features == 8
+    stats = actor.auxiliary_stats()
+    assert set(stats) == {"prior_loss", "bc_loss"}
+    assert torch.isfinite(stats["prior_loss"])
+    assert torch.equal(stats["bc_loss"], torch.zeros_like(stats["bc_loss"]))
+
+  def test_prior_disabled_preserves_baseline_head(self):
+    actor = _make_actor(slot_mix={"motion": 1.0})
+    assert actor.prior is None
 
 
 class TestSlotRanges:
