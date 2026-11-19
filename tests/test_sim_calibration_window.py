@@ -66,7 +66,7 @@ def test_reset_isolation_for_fall_clip_end_and_timeout(device, lam):
   torch.testing.assert_close(base[:2, :3], changed[:2, :3])
   assert not torch.equal(base[2], changed[2])
   torch.testing.assert_close(base[1, :3, 0], torch.tensor([2.0, 2.0, 7.0]))
-  assert base[0, 2, 0] == pytest.approx(1.0 + 0.9 * 7.0)
+  assert base[0, 2, 0].item() == pytest.approx(1.0 + 0.9 * 7.0)
   assert censored.nonzero().tolist() == [[1, 2]]
   if lam > 0:
     assert base[0, 3, 0] != changed[0, 3, 0]
