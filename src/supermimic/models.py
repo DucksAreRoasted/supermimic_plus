@@ -204,6 +204,7 @@ class MultiEncoderAE(nn.Module):
     hidden_dims: tuple[int, ...],
     latent_bc_weight: float,
     history_length: int,
+    latent_prior_weight: float = 0.0,
   ):
     super().__init__()
     if not task_specs:
@@ -212,6 +213,7 @@ class MultiEncoderAE(nn.Module):
     self.history_length = history_length
     self.latent_dim = latent_dim
     self.latent_bc_weight = latent_bc_weight
+    self.latent_prior_weight = latent_prior_weight
     self.task_specs = task_specs
     self._task_names = [ts.name for ts in task_specs]
     # Anchor: the first task. The aux-loss hook regularizes each non-anchor
@@ -234,6 +236,7 @@ class MultiEncoderAE(nn.Module):
       hidden_dims,
       output_dim=action_dim,
     )
+    self.prior = build_mlp(obs_dim, hidden_dims, output_dim=latent_dim)
 
     self.set_slot_mix(slot_mix)
 
@@ -290,6 +293,16 @@ class MultiEncoderAE(nn.Module):
     Returns ``(num_envs,)``; anchor / empty slots contribute zero.
     """
     out = torch.zeros(obs_td.shape[0], device=obs_td.device)
+    if self.training and self.latent_prior_weight != 0.0:
+      history_n = self.obs_normalizer(obs_td["history"][:, -1])
+      z_prior = torch.tanh(self.prior(history_n))
+      z_post = torch.zeros_like(z_prior)
+      for name, (lo, hi) in zip(self._task_names, slots, strict=True):
+        if lo == hi:
+          continue
+        goal_n = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi])
+        z_post[lo:hi] = torch.tanh(self.encoders[name](goal_n)).detach()
+      out += self.latent_prior_weight * ((z_prior - z_post) ** 2).mean(dim=-1)
     if not self.training or self.latent_bc_weight == 0.0:
       return out
     anchor = self._anchor

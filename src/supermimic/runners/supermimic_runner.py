@@ -123,6 +123,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   latent_bc_weight: float = 1e-1
   """Weight on the latent BC loss pulling non-anchor encoders toward the
   anchor encoder's latent on the same state. 0 disables."""
+  latent_prior_weight: float = 0.0
+  """Weight on conditional-prior matching for the motion latent."""
   tasks: TasksCfg = field(default_factory=TasksCfg)
   """Per-task hyperparameters."""
   slot_mix: dict[str, float] = field(
@@ -245,6 +247,7 @@ def build_actor(
     latent_dim=cfg.latent_dim,
     hidden_dims=cfg.actor_hidden_dims,
     latent_bc_weight=cfg.latent_bc_weight,
+    latent_prior_weight=cfg.latent_prior_weight,
     history_length=cfg.history_length,
   ).to(device)
   if cfg.reference_residual_policy:
