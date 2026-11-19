@@ -9,6 +9,20 @@ from supermimic.learners.learner_utils import _optimize_step
 from supermimic.learners.policy_learner import ActorCriticPolicyLearner, gae_returns
 
 
+def calibration_targets(values, last_value, rewards, resets, censored, gamma, lam):
+  # Cut every reset. A censored time-limit transition has no observed successor
+  # before auto-reset: its target is V(s_t), yielding zero advantage there.
+  # Earlier transitions thus bootstrap at their own last valid observation.
+  labels = torch.where(censored, values.squeeze(-1), rewards)
+  return gae_returns(
+    values, last_value, labels.unsqueeze(-1), resets.to(values.dtype).unsqueeze(-1), gamma, lam
+  )
+
+
+def masked_sim_mean(x, valid, count):
+  return torch.where(valid, x, 0.0).sum() / count
+
+
 class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
   def __init__(
     self,
@@ -27,7 +41,8 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     self.sim_calibration_horizon = int(sim_calibration_horizon)
     self._simulator_obs: torch.Tensor | None = None
     self._simulator_rewards: torch.Tensor | None = None
-    self._simulator_terminated: torch.Tensor | None = None
+    self._simulator_resets: torch.Tensor | None = None
+    self._simulator_censored: torch.Tensor | None = None
     self._simulator_enabled = torch.zeros((), device=self.actor_params[0].device)
     self._actor_beta_v = torch.ones_like(self._simulator_enabled)
     self._sim_calibration_epochs_tensor = torch.full_like(
@@ -98,7 +113,8 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     self,
     critic_obs: torch.Tensor,
     rewards: torch.Tensor,
-    terminated: torch.Tensor,
+    resets: torch.Tensor,
+    censored: torch.Tensor,
   ) -> None:
     """Copy one fixed simulator window into the graph-owned device buffers."""
     device = self.actor_params[0].device
@@ -106,10 +122,12 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
       self.initialize_simulator_batch(critic_obs.shape[1], critic_obs.shape[2])
     assert self._simulator_obs is not None
     assert self._simulator_rewards is not None
-    assert self._simulator_terminated is not None
+    assert self._simulator_resets is not None
     self._simulator_obs.copy_(critic_obs.detach().to(device))
     self._simulator_rewards.copy_(rewards.detach().to(device))
-    self._simulator_terminated.copy_(terminated.detach().to(device))
+    assert self._simulator_censored is not None
+    self._simulator_resets.copy_(resets.detach())
+    self._simulator_censored.copy_(censored.detach())
     self._simulator_enabled.fill_(1.0)
 
   def initialize_simulator_batch(self, batch_size: int, critic_input_dim: int) -> None:
@@ -120,7 +138,8 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
       horizon + 1, batch_size, critic_input_dim, device=device
     )
     self._simulator_rewards = torch.zeros(horizon, batch_size, device=device)
-    self._simulator_terminated = torch.zeros(horizon, batch_size, device=device)
+    self._simulator_resets = torch.zeros(horizon, batch_size, dtype=torch.bool, device=device)
+    self._simulator_censored = torch.zeros_like(self._simulator_resets)
     self._simulator_enabled.zero_()
 
   def clear_simulator_batch(self) -> None:
@@ -134,7 +153,8 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
       for buffer in (
         self._simulator_obs,
         self._simulator_rewards,
-        self._simulator_terminated,
+        self._simulator_resets,
+        self._simulator_censored,
         self._simulator_enabled,
         self._actor_beta_v,
         self._sim_calibration_epochs_tensor,
@@ -169,25 +189,29 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     if sim_weight > 0:
       assert self._simulator_obs is not None
       assert self._simulator_rewards is not None
-      assert self._simulator_terminated is not None
+      assert self._simulator_resets is not None
       sim_obs = self._simulator_obs
       sim_rewards = self._simulator_rewards
-      sim_terminated = self._simulator_terminated
+      assert self._simulator_censored is not None
+      censored = self._simulator_censored
+      valid = ~censored.flatten().unsqueeze(-1)
+      valid_count = valid.sum().clamp_min(1)
       with torch.no_grad():
         sim_values = self.critic(sim_obs[:-1])
         sim_last_value = self.critic(sim_obs[-1])
-        sim_returns = gae_returns(
+        sim_returns = calibration_targets(
           sim_values,
           sim_last_value,
-          sim_rewards.unsqueeze(-1),
-          sim_terminated.unsqueeze(-1),
+          sim_rewards,
+          self._simulator_resets,
+          censored,
           self.cfg.gamma,
           self.sim_lambda,
         ).clamp(max=self._v_max)
       sim_prediction = self.critic(sim_obs[:-1].flatten(0, 1))
       sim_targets = sim_returns.flatten(0, 1).detach()
-      sim_loss = torch.nn.functional.mse_loss(sim_prediction, sim_targets)
-      sim_return = sim_targets.mean()
+      sim_loss = masked_sim_mean((sim_prediction - sim_targets).square(), valid, valid_count)
+      sim_return = masked_sim_mean(sim_targets, valid, valid_count)
 
     # Keep both return targets fixed while reusing this real simulator window.
     # Additional epochs improve value regression without collecting more data.
@@ -203,7 +227,7 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
         imagined_prediction, imagined_targets
       )
       sim_epoch_loss = (
-        torch.nn.functional.mse_loss(sim_prediction, sim_targets)
+        masked_sim_mean((sim_prediction - sim_targets).square(), valid, valid_count)
         if sim_prediction is not None
         else torch.zeros((), device=imagined_loss.device)
       )
@@ -216,7 +240,16 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
         self.critic.parameters(),
         max_norm=1.0,
       )
+    window_stats = {}
+    if sim_weight > 0:
+      window_stats = {
+        "sim_reward_time_delta": (sim_rewards[1:] - sim_rewards[:-1]).abs().sum()
+        / max(1, sim_rewards[1:].numel()) * self._simulator_enabled,
+        "sim_reset_fraction": self._simulator_resets.float().mean() * self._simulator_enabled,
+        "sim_censored_fraction": censored.float().mean() * self._simulator_enabled,
+      }
     return {
+      **window_stats,
       "value_function": imagined_loss.detach(),
       "imagined_value_loss": imagined_loss.detach(),
       "sim_calibration_loss": self._simulator_enabled * sim_loss.detach(),

@@ -38,6 +38,7 @@ from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
 from supermimic.runners.exporter import export_actor_as_onnx
 from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
+from supermimic.runners.sim_calibration_window import SimulatorWindow
 from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import (
   TasksCfg,
@@ -392,9 +393,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self._sim_history: torch.Tensor | None = None
     # Keep only one finite simulator-return window. Storing every 4096-env
     # critic observation on GPU would grow without bound over a long run.
-    self._sim_calibration_obs: list[torch.Tensor] = []
-    self._sim_calibration_rewards: list[torch.Tensor] = []
-    self._sim_calibration_dones: list[torch.Tensor] = []
+    self._sim_calibration_window = (
+      SimulatorWindow(self.cfg.sim_calibration_horizon)
+      if self.cfg.critic_variant == "sim-calibrated" else None
+    )
 
   def _seed_sim_history(self) -> None:
     """Seed the real-sim obs-history ring with the noised current sensor."""
@@ -861,17 +863,14 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           self.motion_cmd.time_steps.to(self.device),
           next_sim_ctx,
         ).detach()
-        if not self._sim_calibration_obs:
-          self._sim_calibration_obs.append(critic_obs)
-        self._sim_calibration_obs.append(next_critic_obs)
-        self._sim_calibration_rewards.append(rewards.detach())
-        self._sim_calibration_dones.append(terminated.detach().float())
-        max_window = max(1, self.cfg.sim_calibration_horizon)
-        del self._sim_calibration_obs[: -(max_window + 1)]
-        del self._sim_calibration_rewards[:-max_window]
-        del self._sim_calibration_dones[:-max_window]
+        assert self._sim_calibration_window is not None
+        self._sim_calibration_window.append(
+          critic_obs, next_critic_obs, rewards, dones, terminated, manager.get_term("motion_end")
+        )
       self._advance_sim_history(next_obs["actor"].to(self.device), dones)
-      self.logger.process_env_step(rewards, terminated, extras)
+      self.logger.process_env_step(
+        rewards, dones.bool() if self._sim_calibration_window is not None else terminated, extras
+      )
       if self.cfg.failure_priority:
         self.replay_buffer.update_failure_priority(
           terminated.to(self.device, torch.bool) & ~truncated,
@@ -941,19 +940,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
         start_policy_time = time.time()
         if self.cfg.critic_variant == "sim-calibrated":
-          horizon = self.cfg.sim_calibration_horizon
+          window = self._sim_calibration_window
+          assert window is not None
           self.policy_learner.clear_simulator_batch()
-          if (
-            step % self.cfg.sim_calibration_interval == 0
-            and
-            len(self._sim_calibration_obs) == horizon + 1
-            and len(self._sim_calibration_rewards) == horizon
-          ):
-            self.policy_learner.set_simulator_batch(
-              torch.stack(self._sim_calibration_obs),
-              torch.stack(self._sim_calibration_rewards),
-              torch.stack(self._sim_calibration_dones),
-            )
+          if step % self.cfg.sim_calibration_interval == 0 and window.full:
+            self.policy_learner.set_simulator_batch(*window.batch())
         policy_logs = self.policy_learner.update()
         self._update_ema_actor()
         policy_learn_time += time.time() - start_policy_time
