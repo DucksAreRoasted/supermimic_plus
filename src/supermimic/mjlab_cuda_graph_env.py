@@ -40,10 +40,12 @@ class DeviceStepAdapter:
     """
     self.env.action_manager.process_action(action)
     for _ in range(self.env.cfg.decimation):
+      self.env._sim_step_counter += 1
       self.env.action_manager.apply_action()
       self.env.scene.write_data_to_sim()
       self.env.sim.step()
       self.env.scene.update(dt=self.env.physics_dt)
+      self.env.metrics_manager.compute_substep()
     self.env.episode_length_buf.add_(1)
     self.env.common_step_counter += 1
     self.reset_buf.copy_(self.env.termination_manager.compute())
@@ -59,23 +61,44 @@ class DeviceStepAdapter:
       self.env.episode_length_buf,
     )
 
-  def reset_masked(self, mask: torch.Tensor) -> None:
-    """Reset simulator bookkeeping using a fixed device-side mask."""
-    self.reset_mask.copy_(mask)
-    sim = self.env.sim
-    sim._reset_mask.copy_(self.reset_mask)
-    with wp.ScopedDevice(sim.wp_device):
-      if sim.use_cuda_graph and sim.reset_graph is not None:
-        wp.capture_launch(sim.reset_graph)
-      else:
-        mjwarp.reset_data(sim.wp_model, sim.wp_data, reset=sim._reset_mask_wp)
-    self.env.episode_length_buf.masked_fill_(mask, 0)
-    self.reset_buf.masked_fill_(mask, False)
-    self.reset_terminated.masked_fill_(mask, False)
-    self.reset_time_outs.masked_fill_(mask, False)
-    self.env.action_manager._action.masked_fill_(mask[:, None], 0.0)
-    self.env.action_manager._prev_action.masked_fill_(mask[:, None], 0.0)
-    self.env.action_manager._prev_prev_action.masked_fill_(mask[:, None], 0.0)
+  def post_step(self, terminated: torch.Tensor, time_outs: torch.Tensor) -> None:
+    """Run the Python-side reset and observation hooks omitted from the graph.
+
+    ManagerBasedRlEnv.step performs these operations after reward computation.
+    Keeping them outside the graph preserves command sampling, motion timelines,
+    observation history, and event callbacks while the expensive physics step
+    remains captured.
+    """
+    env = self.env
+    reset_mask = terminated | time_outs
+    # These attributes are created lazily by ManagerBasedRlEnv.step. Assign the
+    # stable graph-owned tensors here after capture, rather than reading them
+    # during graph construction.
+    env.reset_buf = reset_mask
+    env.reset_terminated = terminated
+    env.reset_time_outs = time_outs
+    env.reward_buf = self.reward_buf
+    reset_ids = reset_mask.nonzero(as_tuple=False).squeeze(-1)
+    if "step" in env.event_manager.available_modes:
+      env.event_manager.apply(mode="step", dt=env.step_dt)
+    if "interval" in env.event_manager.available_modes:
+      env.event_manager.apply(mode="interval", dt=env.step_dt)
+    if len(reset_ids) > 0:
+      env.recorder_manager.record_pre_reset(reset_ids)
+      env._reset_idx(reset_ids)
+      env.scene.write_data_to_sim(env_ids=reset_ids)
+    env.sim.forward()
+    command_dt = env._command_dt
+    command_dt.fill_(env.step_dt)
+    if len(reset_ids) > 0:
+      command_dt[reset_ids] = 0.0
+    env.command_manager.compute(dt=command_dt)
+    env.sim.sense()
+    env.obs_buf = env.observation_manager.compute(update_history=True)
+    env.metrics_manager.compute()
+    if len(reset_ids) > 0:
+      env.recorder_manager.record_post_reset(reset_ids)
+    env.recorder_manager.record_post_step()
 
 
 class CapturedDeviceStep:
@@ -95,10 +118,7 @@ class CapturedDeviceStep:
     torch.cuda.current_stream().wait_stream(stream)
 
   def _capture_body(self, action: torch.Tensor):
-    out = self.adapter.step_core_device(action)
-    self.adapter.reset_mask.copy_(self.adapter.reset_buf)
-    self.adapter.reset_masked(self.adapter.reset_mask)
-    return out
+    return self.adapter.step_core_device(action)
 
   def _warmup_step(self) -> None:
     for _ in range(2):
@@ -108,5 +128,7 @@ class CapturedDeviceStep:
   def __call__(self, action: torch.Tensor):
     self.action.copy_(action)
     self._graph.replay()
-    return tuple(x.clone() for x in self._outputs)
+    outputs = tuple(x.clone() for x in self._outputs)
+    self.adapter.post_step(outputs[1], outputs[2])
+    return outputs
 
