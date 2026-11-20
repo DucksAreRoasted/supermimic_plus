@@ -9,6 +9,7 @@ import numpy as np
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import get_spec
 from scipy.ndimage import gaussian_filter1d, maximum_filter1d
 
+from supermimic.tasks.push_box import PushCourse
 from supermimic.tasks.walk_terrain import WalkTerrain
 
 
@@ -42,11 +43,17 @@ def retarget(clip: dict, course: WalkTerrain) -> tuple[dict, dict]:
     legs.append(np.array(limb))
   profile = course.profile()
   grid = (np.arange(len(profile)) - course.half_cells) * course.cell_size
+  cross = course.cross_profile()
+  y_grid = np.linspace(-course.half_width, course.half_width, len(cross))
 
   def height(xy):
+    if getattr(course, "grade", 0.0):
+      return course.grade * xy[..., 0]
     return np.where(
-      abs(xy[..., 1]) <= course.half_width,
-      np.maximum(0.0, np.interp(xy[..., 0], grid, profile, left=0.0, right=0.0)),
+      (abs(xy[..., 1]) <= course.half_width) & (abs(xy[..., 0]) <= grid[-1]),
+      np.maximum(
+        0.0, np.interp(xy[..., 0], grid, profile) + np.interp(xy[..., 1], y_grid, cross)
+      ),
       0.0,
     )
 
@@ -117,6 +124,8 @@ def retarget(clip: dict, course: WalkTerrain) -> tuple[dict, dict]:
   return out, dict(
     frames=len(root),
     terrain_height_m=course.height,
+    lateral_height_m=course.lateral_height,
+    grade=getattr(course, "grade", 0.0),
     phase_cells=course.phase_cells,
     ankle_target_p95_m=float(np.quantile(errors, 0.95)),
     ankle_target_max_m=float(np.max(errors)),
@@ -130,6 +139,13 @@ def main():
   parser.add_argument("output", type=Path)
   parser.add_argument("--height", type=float, default=0.05)
   parser.add_argument("--phase", type=int, default=0)
+  parser.add_argument(
+    "--push-course", action="store_true", help="Use the solid box-pushing course"
+  )
+  parser.add_argument(
+    "--grade", type=float, default=0.0, help="Tilt the plane for uphill pushing"
+  )
+  parser.add_argument("--lateral-height", type=float, default=0.0)
   parser.add_argument("--start", type=int, default=0)
   parser.add_argument("--frames", type=int)
   args = parser.parse_args()
@@ -145,7 +161,14 @@ def main():
       )
       for k, v in archive.items()
     }
-  out, metrics = retarget(clip, WalkTerrain(args.height, args.phase))
+  course = WalkTerrain(args.height, args.phase, lateral_height=args.lateral_height)
+  if args.push_course:
+    if args.lateral_height or (args.grade and args.height):
+      parser.error("For pushing, choose a ledge height or a planar grade")
+    course = PushCourse(height=args.height, phase_cells=args.phase, grade=args.grade)
+  elif args.grade:
+    parser.error("--grade requires --push-course")
+  out, metrics = retarget(clip, course)
   args.output.parent.mkdir(exist_ok=True, parents=True)
   np.savez_compressed(args.output, **out)
   print(json.dumps(metrics, indent=2, allow_nan=False))

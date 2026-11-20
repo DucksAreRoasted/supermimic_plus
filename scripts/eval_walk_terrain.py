@@ -55,7 +55,7 @@ def select_windows(root, heights, length, count, seed):
 @torch.inference_mode()
 def evaluate(args):
   device = args.device
-  course = WalkTerrain(args.height, args.phase)
+  course = WalkTerrain(args.height, args.phase, lateral_height=args.lateral_height)
   query = TerrainObservation(course).to(device)
   with np.load(args.motion) as clip:
     root = clip["root_pos_w"]
@@ -230,6 +230,7 @@ def evaluate(args):
       driver=str(args.driver or args.checkpoint),
       clip_sha256=hashlib.sha256(args.motion.read_bytes()).hexdigest(),
       height=args.height,
+      lateral_height=args.lateral_height,
       phase_cells=args.phase,
       flat=args.flat,
       solver_iterations=cfg.sim.mujoco.iterations,
@@ -283,12 +284,15 @@ def main():
   )
   parser.add_argument("--height", type=float, default=0.065)
   parser.add_argument("--phase", type=int, default=17)
+  parser.add_argument("--lateral-height", type=float, default=0.0)
   parser.add_argument("--steps", type=int, default=100)
   parser.add_argument("--num-envs", type=int, default=16)
   parser.add_argument("--seed", type=int, default=71)
   parser.add_argument("--device", default="cuda:0")
   parser.add_argument("--flat", action="store_true")
-  parser.add_argument("--solver-iterations", type=int, help="Set both solver iteration limits")
+  parser.add_argument(
+    "--solver-iterations", type=int, help="Set both solver iteration limits"
+  )
   parser.add_argument(
     "--starts-file", type=Path, help="Record or verify the common initial conditions"
   )

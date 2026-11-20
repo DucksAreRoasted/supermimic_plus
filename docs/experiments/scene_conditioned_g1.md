@@ -42,10 +42,61 @@
 
 本地逐起点结果在 `outputs/scene_walk/{eval,strict,solver60,solver60-8cm}`，服务器实验工作树为 `/root/gpufree-data/supermimic_scene_g1`。训练模型和清单位于该工作树的 `logs/SuperMimic-GenCoord-G1/terrain-5cm-*`。
 
-## 双手推箱
+## 二维不平路面
 
-`PushBox` 是原生 MuJoCo 六自由度刚体。`scripts/probe_g1_push_contact.py` 使用两侧 G1 实际手掌几何和给定的机器人轨迹，只对箱体做自由动力学积分。在 2 kg 和 5 kg 条件下均观测到左右手接触、箱体前进约 10.3 cm，横向错开 0.95 m 后箱体水平位移为零。这个探针验证了接触几何与传力，策略自主接近、发力和平衡仍需训练和评估。
+在前向坡坎上叠加横向起伏。MuJoCo 碰撞和网络的高度查询共享采样表。用 `walk1_subject1` 的 2,600 帧适配参考，从阶段母版训练 384 轮，每轮 256 个仿真转移。纵向高度 5 cm，横向振幅 2.5 cm。训练 seed 42，Actor 和世界模型都读取高度图。评估使用 60 次求解和线搜索上限，训练沿用原训练器的较低上限，训练日志出现过迭代上限提醒。
 
-下一步将箱体位姿、速度、双手到目标接触面的相对位置接入回放和可微世界模型，在想象中滚动预测箱体状态。第一项任务是平地双手定向推箱。验收区分到达目标区、双手参与、机器人存活、箱体侧翻，质量和摩擦的留出组合单列。地形与推箱独立通过后，再评估低坡推箱。
+| 地形与评估动作 | 配对窗口 | 母版 → 地形版成功数 | 母版 → 地形版存活数 | 母版 → 地形版身体误差 |
+|---|---:|---:|---:|---:|
+| 8 cm 纵向、4 cm 横向，walk1_subject5 | 32 | 17 → 19 | 26 → 25 | 7.38 → 6.44 cm |
+| 7.5 cm 纵向、3 cm 横向，walk2_subject4 | 48 | 22 → 24 | 43 → 46 | 6.88 → 6.57 cm |
 
-地形相关参考见 [Perceptive BFM](https://arxiv.org/abs/2606.08059)。交互几何与接触保持参考 [InterMimic](https://openaccess.thecvf.com/content/CVPR2025/papers/Xu_InterMimic_Towards_Universal_Whole-Body_Control_for_Physics-Based_Human-Object_Interactions_CVPR_2025_paper.pdf) 和 [OmniRetarget](https://omniretarget.github.io/)。
+每个窗口 200 个控制步。第二个动作、地形相位和评估种子均在训练后选作复核。表中的窗口可能重叠，两种测试的样本量和一个训练种子限制了对通过率差异的解释。平地沿用归档协议对 40 个完整动作复测，同一起始 qpos、qvel、参考帧。地形版完成 39/40，`fallAndGetUp1_subject5` 提前结束，每帧回报 0.086377，平均身体位置误差 2.662 cm。归档母版完成 40/40，每帧 0.086819，身体位置误差 2.597 cm。发布入口在普通平地模仿任务上调用母版，在不平地行走任务上调用二维地形权重。
+
+## 双手推箱与步行结合
+
+G1 自由基座和自由箱体在 MuJoCo Warp 中同时积分。控制器只发出 29 个关节位置动作。重置时随机箱体前后、左右位置，每步记录箱子位姿和速度、左右掌接触、其余身体部位接触与机器人提前终止。动作输入使用仿真的机器人和物体状态、手部受力。参考轨迹来自 LAFAN 步行窗口。先筛选朝向、行程、脚尖前伸量，再以带关节限位和相邻帧速度约束的逆运动学生成推箱的双手目标。
+
+训练接触模型时，以 92,800 条首次 reset 前的有效转移监督箱体刚体运动及其对机器人的反作用。共享主干给出名义 G1 速度变化，接触模块根据手掌到箱体表面的距离、相对速度和物体参数校正。后续使用 8 步联合损失，让下一步同时依赖之前预测的机器人与箱体。模型训练可见材质参数；执行时控制器根据物体运动和掌力调节补偿。两批留出接触窗口中，沿同一组真实动作展开 32 步，箱心位置误差分别为 9.38、8.07 cm，匀速外推误差为 14.01、11.78 cm。换用经过约束的参考后，另两批接触窗口误差为 3.73、5.06 cm。
+
+小型动作残差从零初始化，通过 12 步耦合想象展开训练 100 次更新，梯度通过机器人、手和箱体回传。母版 Actor 与单 Critic 固定，末端步态价值权重为 0.08，Critic 仿真校准权重保持 0。参考控制每步从真实箱子到目标的剩余距离和当前速度估算减速时机，重算 Actor 接下来的十帧关节位置、速度和相位。手臂及前脚补偿在开发动作上按仿真任务表现调过六个参数，叠加幅度由既往平均掌力决定。发布的推箱配置使用归档 Actor、上述参考调速和有界补偿。平地、坡地和双段坡坎使用同一个接触控制配置。
+
+### 配对验收
+
+固定参考模板为训练阶段选定的 `walk1_subject1`，行走目标 1.09 m，145 帧步行加 70 帧结束姿势。逐回合测试 165 步。比较的两组均使用相同的推箱参考、母版权重、箱子、目标和随机化。对照以固定速率追踪参考。推箱版根据物体反馈修改未来参考并叠加动作补偿。每个地形的三组质量、摩擦、前进目标分别为 2.4 kg / 0.29 / 0.60 m、3.6 kg / 0.34 / 0.68 m、4.8 kg / 0.425 / 0.72 m，各 32 个随机摆放。左右摆放全宽 22 cm，前后全宽 12 cm，初始机器人、箱体和上下文张量两组最大差异小于 2e-8。
+
+成功要求机器人存活、两只手均接触过箱子、其他身体部位整段没有撞箱、箱子直立、最后连续 10 步箱心在目标纵横各 ±15 cm 内。初始穿透超过 1 mm 的回合计为失败。“停稳”另外要求末端水平速度小于 0.10 m/s。联合地形由两段各爬升 2 cm 的实体缓坡构成，记录机器人和箱心分别经过的高差。平坡与实体坡坎上将箱子横向移开 1.2 m，32 个负对照均无接触，箱子最大水平漂移分别为 0.37 mm 和 0。早期高度场对自由箱体产生过无接触弹飞，其数据已排除。
+
+| 场景 | 回合 | 固定速率对照成功 | 仅参考调速成功 | 推箱版成功 | 推箱版成功且停稳 |
+|---|---:|---:|---:|---:|---:|
+| 平地 | 96 | 31 | 86 | 88 | 64 |
+| 4% 上坡 | 96 | 27 | 56 | 77 | 70 |
+| 两段实体坡坎 | 96 | 24 | 47 | 66 | 54 |
+| 平地，换两条留出步行参考 | 96 | 1 | 53 | 87 | 70 |
+
+前三组推箱版全部存活，全部出现过双手同时接触，均无非手部撞箱。最后一组换用 `walk1_subject2`、`walk3_subject2` 生成的推箱参考。该组在交互训练中未使用，基础 LAFAN 模仿预训练覆盖这些原始动作。这里测试的是给定目标的直线推箱，使用仿真真值，尚未评估相机估计误差、抓取或搬运。
+
+把二维行走 Actor 直接换到实体坡坎推箱组合中，三种材质共成功 63/96，归档 Actor 加相同控制为 66/96。中等材质平地的配对消融中，固定参考、仅按箱子进度调整参考、仅动作补偿、两者合用分别为 9、31、3、27 次成功，每组 32 回合。在对应的实体坡坎上分别为 18、23、10、20。三个材质合计，单独调速在平地、4% 坡、双段坡坎分别成功 86/96、56/96、47/96。特别是在 4.8 kg、摩擦 0.425 组，仅调速在上坡和双段坡坎都只成功 6/32，加补偿后两种地形均成功 29/32。补偿中同时含学习残差和手脚几何控制，这组消融只能识别整个补偿模块的贡献。
+
+## 复现与文件
+
+从项目根目录运行下列入口。默认参数与中等材质的验收一致，命令可追加种子、目标距离、视频路径。服务器使用 `/root/gpufree-data/supermimic_scene_g1`，权重和逐回合数据保存在本地及服务器。参考及评估采用 50 Hz。
+
+```bash
+bash scripts/run_g1_scene.sh flat
+bash scripts/run_g1_scene.sh terrain
+bash scripts/run_g1_scene.sh push
+bash scripts/run_g1_scene.sh uphill
+G1_PUSH_CONTROLLER=paced bash scripts/run_g1_scene.sh uphill
+bash scripts/run_g1_scene.sh ledges --video outputs/scene-demo/ledges/push.mp4
+.venv/bin/python scripts/summarize_scene_push.py outputs/push outputs/scene-demo/release-summary.json
+```
+
+- 地形训练入口 `scripts/run_walk_terrain_pilot.sh`，二维试验最后三个参数为 `384 False 0.025`。地形训练清单和三份权重在 `logs/SuperMimic-GenCoord-G1/terrain-5cm-actor-world-cross0.025-adapted-384it-seed42/2026-11-20_16-41-43`，逐窗口、逐动作及起点在 `outputs/cross_slope/eval`。
+- 推箱参考由 `scripts/prepare_push_walk.py --length 145 --distance 1.09 --clearance --steady --push-feasible` 生成。上坡用 `scripts/prepare_terrain_walk.py --push-course --height 0 --grade .04` 适配，两段缓坡用 `--push-course --height .04`。模板在 `outputs/push_release`。
+- `scripts/run_push_task.py --record` 采集真实转移，`scripts/fit_push_dynamics.py` 训练并对比多步模型，`scripts/fit_push_policy.py` 更新动作残差，`scripts/fit_push_guidance.py` 以训练动作和材质选择反馈参数。发布配置读 `outputs/push/gains-v2.json` 和 `outputs/push/policy-v2/actor_residual_100.pt`。接触模型位于 `outputs/push/contact-v2/contact_dynamics.pt`，部署动作时无需做在线想象展开。
+- 配对验收详情在 `outputs/scene-demo/release-summary.json`，视频为 `outputs/scene-demo/ledges/push.mp4`，展示固定编号 0 的真实回合。绿色轮廓标记目标箱心区。源代码与轻量实验设计进入 Git，权重、回放和大文件单独归档。
+
+相关研究中，Deep Whole-body Parkour 将外感知引入人形全身动作跟踪，InterMimic 用物体几何和身体接触描述交互。这里的效果数字均来自本项目的 MuJoCo 评估。[Deep Whole-body Parkour](https://arxiv.org/abs/2601.07701) · [InterMimic](https://sirui-xu.github.io/InterMimic/)
+
+恢复标签为 `stage/g1-scene-walk-push-v1`。本地 `logs/archives/g1-scene-walk-push-v1.tar.gz` 与服务器 `/root/gpufree-data/archives/g1-scene-walk-push-v1.tar.gz` 保存代码 bundle、两套跟踪权重、接触模型和 Actor 补偿、发布用参考、评估证据、视频和逐文件校验值。复跑原平地 40 动作需要阶段母版恢复包中的 LAFAN40 文件。

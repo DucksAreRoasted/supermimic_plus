@@ -1,14 +1,16 @@
 import mujoco
 import numpy as np
+import pytest
 import torch
 
 from supermimic.tasks.walk_terrain import TerrainObservation, WalkTerrain
 
 
-def test_height_queries_match_vertical_mujoco_rays():
+@pytest.mark.parametrize("cross", [0.0, 0.04])
+def test_height_queries_match_vertical_mujoco_rays(cross):
   spec = mujoco.MjSpec()
   spec.worldbody.add_geom(type=mujoco.mjtGeom.mjGEOM_PLANE, size=[0.0, 0.0, 0.1])
-  course = WalkTerrain(phase_cells=13)
+  course = WalkTerrain(phase_cells=13, lateral_height=cross)
   course(spec)
   model = spec.compile()
   data = mujoco.MjData(model)

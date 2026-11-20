@@ -91,6 +91,7 @@ class BaseRunnerCfg:
   terrain_height: float = 0.0
   """Walking course amplitude in meters. Zero selects the archived flat scene."""
   terrain_phase_cells: int = 0
+  terrain_lateral_height: float = 0.0
   terrain_inputs: Literal["blind", "actor", "actor-world"] = "blind"
   """All rough-terrain arms use the same privileged Critic."""
   use_root_waypoints: bool = False
@@ -100,13 +101,17 @@ class BaseRunnerCfg:
   def configure_terrain(self, env_cfg) -> None:
     if self.use_root_waypoints and (not self.terrain_height or self.terrain_inputs == "blind"):
       raise ValueError("Root waypoint transfer requires a terrain-conditioned actor")
+    if self.terrain_lateral_height<0 or (self.terrain_lateral_height and self.terrain_height<=0):
+      raise ValueError("Cross-slope training requires a positive course height and nonnegative lateral height")
     if self.terrain_height == 0 and self.terrain_inputs == "blind":
       return
     if self.terrain_height <= 0 or self.representation != "gencoord":
       raise ValueError("Terrain conditioning requires a positive G1 walking-course height")
     if env_cfg.scene.spec_fn is not None:
       raise ValueError("The scene already has a custom MuJoCo model")
-    env_cfg.scene.spec_fn = WalkTerrain(self.terrain_height, self.terrain_phase_cells)
+    env_cfg.scene.spec_fn = WalkTerrain(
+      self.terrain_height, self.terrain_phase_cells, lateral_height=self.terrain_lateral_height
+    )
     env_cfg.scene.env_spacing = 0.
 
 

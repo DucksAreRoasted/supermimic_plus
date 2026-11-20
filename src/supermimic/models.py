@@ -164,6 +164,14 @@ class Dynamics(nn.Module):
     aux_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor]:
+    prediction = self.predict_delta(rep_state, action, aux_state, sim_ctx)
+    return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
+
+  def predict_delta(
+    self, rep_state: torch.Tensor, action: torch.Tensor, aux_state: torch.Tensor,
+    sim_ctx: torch.Tensor,
+  ) -> torch.Tensor:
+    """Velocity increments before the representation integrates the next pose."""
     state_norm = self.state_normalizer(rep_state)
     action_norm = self.action_normalizer(self.proc(action))
     features = torch.cat([state_norm, action_norm, sim_ctx], dim=-1)
@@ -177,7 +185,7 @@ class Dynamics(nn.Module):
       prediction = self.mlp(features)
       if self.residual_mlp is not None:
         prediction = prediction + self.residual_scale * self.residual_mlp(features)
-    return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
+    return prediction
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
     return [self.state_normalizer, self.action_normalizer]
