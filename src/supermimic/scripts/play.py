@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,6 +79,11 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     if cfg.motion_file is None:
       raise ValueError("Local playback requires --motion-file")
     runner_cfg = SuperMimicRunnerCfg()
+    manifest = model_dir / "run_manifest.json"
+    if manifest.is_file():
+      run_data = json.loads(manifest.read_text())
+      if "runner_cfg" in run_data:
+        runner_cfg = load_runner_cfg(run_data)
     if "MaxCoord" in task_id:
       runner_cfg.representation = "maxcoord"
     motion_artifacts = []
@@ -92,6 +98,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
     model_dir = download_model_dir(run)
   check_representation_matches(task_id, runner_cfg.representation)
+  runner_cfg.configure_terrain(env_cfg)
 
   command_term = env_cfg.commands["motion"]
   assert isinstance(command_term, MotionCommandCfg)

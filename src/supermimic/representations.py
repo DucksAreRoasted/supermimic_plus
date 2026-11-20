@@ -146,6 +146,13 @@ def extract_actor_goal(wm_goal: torch.Tensor) -> torch.Tensor:
   return torch.cat([wm_goal[..., :-tail], wm_goal[..., -GOAL_REL_ORI_DIM:]], dim=-1)
 
 
+def root_waypoints(wm_goal: torch.Tensor) -> torch.Tensor:
+  """Current and 0.3 s reference pelvis XY in the robot frame, scaled to half a meter."""
+  rel = wm_goal[..., -(GOAL_REL_POS_DIM + GOAL_REL_ORI_DIM):-GOAL_REL_ORI_DIM]
+  rel = rel.unflatten(-1, (NUM_GOAL_FRAMES, 3))
+  return torch.cat([rel[..., 0, :2], rel[..., 3, :2]], -1).mul(2.).tanh()
+
+
 def _root_loss_blocks(aux_state: torch.Tensor) -> dict[str, torch.Tensor]:
   """World root position (3) and rotation (9) as squared-error channels.
 

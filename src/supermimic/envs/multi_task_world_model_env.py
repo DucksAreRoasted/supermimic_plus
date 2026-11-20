@@ -8,9 +8,11 @@ import torch
 from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.representations import root_waypoints
 from supermimic.tasks.task_spec import build_actor_obs_td
 
 if TYPE_CHECKING:
+  from supermimic.tasks.walk_terrain import TerrainObservation
   from supermimic.models import Dynamics
   from supermimic.replay_buffer import ReplayBuffer
   from supermimic.representations import StateRepresentation
@@ -37,8 +39,14 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     history_length: int,
     termination_softness: float,
     device: str = "cpu",
+    terrain_query: TerrainObservation | None = None,
+    actor_sees_terrain: bool = False,
+    use_root_waypoints: bool = False,
   ) -> None:
     self.task_specs = task_specs
+    self.terrain_query = terrain_query
+    self.actor_sees_terrain = actor_sees_terrain
+    self.use_root_waypoints = use_root_waypoints
     assert task_specs[0].name == "motion", "task_specs[0] must be the motion task"
     super().__init__(
       dynamics=dynamics,
@@ -61,6 +69,14 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       ).clone()
 
   def get_observations(self) -> TensorDict:
-    return build_actor_obs_td(
+    obs = build_actor_obs_td(
       self._task_goal_obs, self._sensor_history(), critic=self._critic_obs()
     )
+    if self.terrain_query is not None:
+      patch = self.terrain_query.features(self.aux_state)
+      obs["critic"] = torch.cat([obs["critic"], patch], dim=-1)
+      if self.actor_sees_terrain:
+        obs["terrain"] = patch
+    if self.use_root_waypoints:
+      obs["root_waypoints"] = root_waypoints(self._wm_goal_obs)
+    return obs

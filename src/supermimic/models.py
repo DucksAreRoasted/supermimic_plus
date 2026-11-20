@@ -8,6 +8,7 @@ from rsl_rl.modules import EmpiricalNormalization
 from tensordict import TensorDict
 
 if TYPE_CHECKING:
+  from supermimic.tasks.walk_terrain import TerrainObservation
   from supermimic.representations import StateRepresentation
   from supermimic.tasks.task_spec import TaskSpec
 
@@ -87,6 +88,7 @@ class Dynamics(nn.Module):
     residual_hidden_dims: tuple[int, ...] | None = None,
     residual_shared_trunk: bool = False,
     residual_low_rank: int | None = None,
+    terrain_query: TerrainObservation | None = None,
   ):
     super().__init__()
 
@@ -97,6 +99,10 @@ class Dynamics(nn.Module):
     self.residual_correction = residual_correction
     self.residual_scale = float(residual_scale)
     self.residual_shared_trunk = bool(residual_shared_trunk)
+    self.terrain_query = terrain_query
+    input_dim = self.num_rep_state + num_actions + sim_ctx_dim
+    if terrain_query is not None:
+      input_dim += terrain_query.num_features
 
     self.register_buffer("action_scale", action_scale.clone())
     self.register_buffer("action_offset", action_offset.clone())
@@ -105,7 +111,7 @@ class Dynamics(nn.Module):
     self.action_normalizer = _CudaGraphNormalization(num_actions)
 
     self.mlp = build_mlp(
-      self.num_rep_state + num_actions + sim_ctx_dim,
+      input_dim,
       hidden_dims,
       output_dim=representation.prediction_dim,
     )
@@ -122,14 +128,14 @@ class Dynamics(nn.Module):
         residual_dims = hidden_dims if residual_hidden_dims is None else residual_hidden_dims
         self.residual_mlp = (
           build_low_rank_mlp(
-            self.num_rep_state + num_actions + sim_ctx_dim,
+            input_dim,
             residual_dims,
             representation.prediction_dim,
             residual_low_rank,
           )
           if residual_low_rank is not None
           else build_mlp(
-            self.num_rep_state + num_actions + sim_ctx_dim,
+            input_dim,
             residual_dims,
             output_dim=representation.prediction_dim,
           )
@@ -161,6 +167,8 @@ class Dynamics(nn.Module):
     state_norm = self.state_normalizer(rep_state)
     action_norm = self.action_normalizer(self.proc(action))
     features = torch.cat([state_norm, action_norm, sim_ctx], dim=-1)
+    if self.terrain_query is not None:
+      features = torch.cat([features, self.terrain_query.features(aux_state)], dim=-1)
     if self.residual_head is not None:
       trunk = self.mlp[:-1](features)
       prediction = self.mlp[-1](trunk)
@@ -208,6 +216,8 @@ class MultiEncoderAE(nn.Module):
     latent_prior_mode: str = "mse",
     latent_prior_blend: float = 0.0,
     prior_hidden_dims: tuple[int, ...] | None = None,
+    terrain_obs_dim: int = 0,
+    use_root_waypoints: bool = False,
   ):
     super().__init__()
     if not task_specs:
@@ -216,6 +226,8 @@ class MultiEncoderAE(nn.Module):
     self.history_length = history_length
     self.latent_dim = latent_dim
     self.latent_bc_weight = latent_bc_weight
+    self.terrain_obs_dim = terrain_obs_dim
+    self.use_root_waypoints = use_root_waypoints
     self.latent_prior_weight = latent_prior_weight
     if not 0.0 <= latent_prior_blend <= 1.0:
       raise ValueError(
@@ -248,7 +260,7 @@ class MultiEncoderAE(nn.Module):
       }
     )
     self.decoder = build_mlp(
-      latent_dim + history_length * obs_dim,
+      latent_dim + history_length * obs_dim + terrain_obs_dim + (4 if use_root_waypoints else 0),
       hidden_dims,
       output_dim=action_dim,
     )
@@ -331,7 +343,12 @@ class MultiEncoderAE(nn.Module):
     )
 
     history_n = self.obs_normalizer(obs_td["history"])
-    return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
+    decoder_inputs = [z, history_n.flatten(start_dim=1)]
+    if self.terrain_obs_dim:
+      decoder_inputs.append(obs_td["terrain"])
+    if self.use_root_waypoints:
+      decoder_inputs.append(obs_td["root_waypoints"])
+    return self.decoder(torch.cat(decoder_inputs, dim=-1))
 
   def _compute_aux_loss(
     self,

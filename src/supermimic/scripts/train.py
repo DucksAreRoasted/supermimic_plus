@@ -100,6 +100,7 @@ def main() -> None:
     "external" if args.runner.sampling_mode == "return" else args.runner.sampling_mode
   )
 
+  args.runner.configure_terrain(args.env)
   env = create_env(args.env, args.num_envs, device)
 
   # Init Runner

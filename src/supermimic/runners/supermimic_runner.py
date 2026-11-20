@@ -6,7 +6,7 @@ import re
 import shlex
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -35,11 +35,12 @@ from supermimic.mirror import joint_mirror_permutation, joint_mirror_signs
 from supermimic.models import Dynamics, MultiEncoderAE, ReferenceResidualPolicy, build_mlp
 from supermimic.mjlab_cuda_graph_env import CapturedDeviceStep
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
-from supermimic.representations import StateRepresentation, create_representation
+from supermimic.representations import StateRepresentation, create_representation, root_waypoints
 from supermimic.runners.exporter import export_actor_as_onnx
 from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
 from supermimic.runners.sim_calibration_window import SimulatorWindow
 from supermimic.sim_context import SimContext
+from supermimic.tasks.walk_terrain import TerrainObservation, WalkTerrain
 from supermimic.tasks.task_spec import (
   TasksCfg,
   build_actor_obs_td,
@@ -87,7 +88,26 @@ class BaseRunnerCfg:
   """Augment generalized-coordinate world-model windows with a joint mirror."""
   cuda_graph_collection: bool = False
   """Use the explicit fixed-shape device collection graph."""
+  terrain_height: float = 0.0
+  """Walking course amplitude in meters. Zero selects the archived flat scene."""
+  terrain_phase_cells: int = 0
+  terrain_inputs: Literal["blind", "actor", "actor-world"] = "blind"
+  """All rough-terrain arms use the same privileged Critic."""
+  use_root_waypoints: bool = False
+  """Add the current and near-future reference root XY to the terrain policy."""
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
+
+  def configure_terrain(self, env_cfg) -> None:
+    if self.use_root_waypoints and (not self.terrain_height or self.terrain_inputs == "blind"):
+      raise ValueError("Root waypoint transfer requires a terrain-conditioned actor")
+    if self.terrain_height == 0 and self.terrain_inputs == "blind":
+      return
+    if self.terrain_height <= 0 or self.representation != "gencoord":
+      raise ValueError("Terrain conditioning requires a positive G1 walking-course height")
+    if env_cfg.scene.spec_fn is not None:
+      raise ValueError("The scene already has a custom MuJoCo model")
+    env_cfg.scene.spec_fn = WalkTerrain(self.terrain_height, self.terrain_phase_cells)
+    env_cfg.scene.env_spacing = 0.
 
 
 BpttCfg = Annotated[BpttPolicyLearnerCfg, tyro.conf.subcommand(name="bptt")]
@@ -157,6 +177,7 @@ class WorldModel:
   sim_context: SimContext
   num_goals: int
   num_actions: int
+  terrain_query: TerrainObservation | None = None
 
   def bundle(self) -> dict:
     """The ``world_model.pt`` contents."""
@@ -169,6 +190,19 @@ class WorldModel:
     """Load a ``world_model.pt`` bundle."""
     self.dynamics.load_state_dict(bundle["dynamics"])
     self.sim_context.load_state_dict(bundle["sim_context"])
+
+
+def extend_terrain_projection(state: dict, model: nn.Module, key: str,
+                             allowed_widths: tuple[int, ...] = (TerrainObservation.num_features,)) -> None:
+  """Copy flat inputs verbatim and initialize only the added height columns to zero."""
+  weight = state[key]
+  target = model.state_dict()[key]
+  if weight.shape == target.shape:
+    return
+  extra = target.shape[1] - weight.shape[1]
+  if weight.shape[0] != target.shape[0] or extra not in allowed_widths:
+    raise ValueError(f"Unexpected checkpoint shape for {key}: {weight.shape} vs {target.shape}")
+  state[key] = torch.nn.functional.pad(weight, (0, extra))
 
 
 def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
@@ -213,6 +247,10 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
   )
 
   action_scale, action_offset = extract_action_scale_offset(env)
+  course = env.unwrapped.cfg.scene.spec_fn
+  terrain_query = TerrainObservation(course).to(device) if isinstance(course, WalkTerrain) else None
+  if cfg.terrain_height and terrain_query is None:
+    raise ValueError("Walking course missing from the simulator")
   dynamics = Dynamics(
     representation,
     num_actions,
@@ -225,6 +263,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     residual_hidden_dims=cfg.residual_hidden_dims,
     residual_shared_trunk=cfg.residual_shared_trunk,
     residual_low_rank=cfg.residual_low_rank,
+    terrain_query=terrain_query if cfg.terrain_inputs == "actor-world" else None,
   ).to(device)
 
   return WorldModel(
@@ -233,6 +272,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     sim_context=sim_context,
     num_goals=num_goals,
     num_actions=num_actions,
+    terrain_query=terrain_query,
   )
 
 
@@ -259,6 +299,8 @@ def build_actor(
     latent_prior_blend=cfg.latent_prior_blend,
     prior_hidden_dims=cfg.latent_prior_hidden_dims,
     history_length=cfg.history_length,
+    terrain_obs_dim=TerrainObservation.num_features if cfg.terrain_inputs != "blind" else 0,
+    use_root_waypoints=cfg.use_root_waypoints,
   ).to(device)
   if cfg.reference_residual_policy:
     return ReferenceResidualPolicy(
@@ -436,6 +478,8 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       + self._num_goals
       + self._sim_context.output_dim
     )
+    if self.cfg.terrain_height:
+      critic_dim += TerrainObservation.num_features
     return actor_dim, critic_dim
 
   def _build_mlp(
@@ -513,13 +557,29 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     if missing:
       raise FileNotFoundError(f"Warm-start checkpoint is missing: {missing}")
     actor = self.policy_learner.actor
-    actor.load_state_dict(torch.load(required[0], map_location=self.device, weights_only=True), strict=True)
-    self._wm.load_bundle(torch.load(required[1], map_location=self.device, weights_only=True))
+    actor_state, wm_state, critic_state = [
+      torch.load(path, map_location=self.device, weights_only=True) for path in required
+    ]
     critics = getattr(self.policy_learner, "critics", None)
     if critics is None:
       critics = getattr(self.policy_learner, "critic", None)
     assert critics is not None
-    critics.load_state_dict(torch.load(required[2], map_location=self.device, weights_only=True), strict=True)
+    if self.cfg.terrain_height:
+      # Only the three known input projections may grow when transferring a flat policy.
+      if self.cfg.terrain_inputs != "blind":
+        key = "actor.decoder.0.weight" if self.cfg.reference_residual_policy else "decoder.0.weight"
+        widths = (4, TerrainObservation.num_features + 4) if self.cfg.use_root_waypoints else (TerrainObservation.num_features,)
+        extend_terrain_projection(actor_state, actor, key, widths)
+      if self.cfg.terrain_inputs == "actor-world":
+        extend_terrain_projection(wm_state["dynamics"], self._dynamics, "mlp.0.weight")
+        if self._dynamics.residual_mlp is not None:
+          extend_terrain_projection(wm_state["dynamics"], self._dynamics, "residual_mlp.0.weight")
+      for key in critics.state_dict():
+        if key == "0.weight" or key.endswith(".0.weight"):
+          extend_terrain_projection(critic_state, critics, key)
+    actor.load_state_dict(actor_state, strict=True)
+    self._wm.load_bundle(wm_state)
+    critics.load_state_dict(critic_state, strict=True)
     print(f"[INFO] Warm-started actor, world model, and critic from {model_dir}")
 
   def _step_and_store(
@@ -616,6 +676,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "num_envs": self.env.num_envs,
       "device": self.device,
       "representation": getattr(self.cfg, "representation", None),
+      "runner_cfg": asdict(self.cfg),
       "actor_obs": getattr(self.cfg, "actor_obs", None),
       "init_model_dir": getattr(self.cfg, "init_model_dir", None),
       "created_at": datetime.now().astimezone().isoformat(),
@@ -690,6 +751,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       batch_size=policy_cfg.batch_size,
       replay_buffer=self.replay_buffer,
       task_specs=self._active_task_specs,
+      terrain_query=self._wm.terrain_query,
+      actor_sees_terrain=self.cfg.terrain_inputs != "blind",
+      use_root_waypoints=self.cfg.use_root_waypoints,
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
       device=self.device,
@@ -772,7 +836,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       ts.name: ts.extract_training_goal(self.motion, motion_times, aux_state)
       for ts in self._active_task_specs
     }
-    return build_actor_obs_td(goals, self._collection_history(sensor))
+    obs = build_actor_obs_td(goals, self._collection_history(sensor))
+    if self.cfg.terrain_inputs != "blind":
+      obs["terrain"] = self._wm.terrain_query.features(aux_state)
+    if self.cfg.use_root_waypoints:
+      full_goal, _ = self._representation.compute_wm_goal(self.motion, motion_times, aux_state)
+      obs["root_waypoints"] = root_waypoints(full_goal)
+    return obs
 
   def _build_critic_obs(
     self,
@@ -791,7 +861,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     wm_goal, _ = self._representation.compute_wm_goal(
       self.motion, motion_times, aux_state
     )
-    return torch.cat([rep_state, wm_goal, sim_ctx], dim=-1)
+    parts = [rep_state, wm_goal, sim_ctx]
+    if self.cfg.terrain_height:
+      parts.append(self._wm.terrain_query.features(aux_state))
+    return torch.cat(parts, dim=-1)
 
   def _configure_reset_sampling(self) -> None:
     self._sampler: ReturnSampler | None = None
