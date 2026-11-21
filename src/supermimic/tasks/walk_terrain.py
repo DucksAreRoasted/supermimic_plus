@@ -56,8 +56,11 @@ class WalkTerrain:
       ],
     ).astype(np.float32)
 
+  def surface(self) -> np.ndarray:
+    return self.profile()[None, :] + self.cross_profile()[:, None]
+
   def __call__(self, spec: mujoco.MjSpec) -> None:
-    surface = self.profile()[None, :] + self.cross_profile()[:, None]
+    surface = self.surface()
     if self.height == 0 and self.lateral_height == 0:
       return
     (ground,) = [g for g in spec.geoms if g.type == mujoco.mjtGeom.mjGEOM_PLANE]
@@ -82,6 +85,29 @@ class WalkTerrain:
     )
 
 
+@dataclass(frozen=True)
+class IrregularWalkTerrain(WalkTerrain):
+  """Independent two-dimensional rough ground for testing beyond periodic courses."""
+
+  landscape_seed: int = 1
+
+  def surface(self):
+    rng = np.random.default_rng(self.landscape_seed)
+    x = np.arange(-self.half_cells, self.half_cells + 1) * self.cell_size
+    y = np.linspace(-self.half_width, self.half_width, 257)
+
+    def layer(spacing):
+      gx = np.arange(x.min() - spacing, x.max() + 2 * spacing, spacing)
+      gy = np.arange(y.min() - spacing, y.max() + 2 * spacing, spacing)
+      vertices = rng.uniform(-1.0, 1.0, size=(len(gy), len(gx)))
+      along_x = np.stack([np.interp(x, gx, row) for row in vertices])
+      return np.stack([np.interp(y, gy, col) for col in along_x.T], axis=1)
+
+    return (
+      self.height * (0.35 + 0.8 * layer(0.52)) + self.lateral_height * layer(0.21)
+    ).astype(np.float32)
+
+
 class TerrainObservation(nn.Module):
   """Query the same collision height field at a real or imagined root pose (wxyz)."""
 
@@ -94,6 +120,12 @@ class TerrainObservation(nn.Module):
     self.half_cells = terrain.half_cells
     self.cross_slopes = bool(terrain.lateral_height)
     self.grade = getattr(terrain, "grade", 0.0)
+    grid = (
+      torch.from_numpy(terrain.surface())
+      if isinstance(terrain, IrregularWalkTerrain)
+      else None
+    )
+    self.register_buffer("surface_grid", grid, persistent=False)
     self.register_buffer(
       "cross_profile", torch.from_numpy(terrain.cross_profile()), persistent=False
     )
@@ -114,6 +146,20 @@ class TerrainObservation(nn.Module):
       (u >= 0) & (u <= 2 * self.half_cells) & (xy[..., 1].abs() <= self.half_width)
     )
     left = u.floor().long().clamp(0, 2 * self.half_cells - 1)
+    if self.surface_grid is not None:
+      # MuJoCo splits each rectangular heightfield cell along its (0,0)-(1,1) diagonal.
+      grid = self.surface_grid
+      v = (xy[..., 1] / self.half_width + 1.0) * ((grid.shape[0] - 1) / 2)
+      bottom = v.floor().long().clamp(0, grid.shape[0] - 2)
+      dx = (u - left).clamp(0, 1)
+      dy = (v - bottom).clamp(0, 1)
+      lower = grid[bottom, left]
+      corner = grid[bottom + 1, left + 1]
+      mid = torch.where(dx >= dy, grid[bottom, left + 1], grid[bottom + 1, left])
+      high = torch.maximum(dx, dy)
+      low = torch.minimum(dx, dy)
+      h = (1 - high) * lower + (high - low) * mid + low * corner
+      return torch.where(inside, h.clamp_min(0.0), 0.0)
     profile = self.profile.to(dtype=xy.dtype)
     h = torch.lerp(profile[left], profile[left + 1], (u - left).clamp(0.0, 1.0))
     if self.cross_slopes:

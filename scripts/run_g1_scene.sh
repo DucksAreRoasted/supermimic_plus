@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reproduce one of the pinned G1 scene evaluations; trailing options override the defaults.
 set -euo pipefail
-scene=${1:?expected flat, terrain, push, uphill, or ledges}
+scene=${1:?expected flat, terrain, perceptive, push, uphill, or ledges}
 shift
 repo_dir=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_dir"
@@ -21,6 +21,12 @@ case "$scene" in
   terrain)
     exec "$python_bin" scripts/eval_walk_terrain.py "$cross" outputs/cross_slope/walk2_subject4.npz "$out/eval.json" \
       --height .075 --lateral-height .03 --phase 67 --steps 200 --num-envs 48 --seed 147 --solver-iterations 60 "$@" ;;
+  perceptive)
+    mode=${G1_PERCEPTION:-depth-contact-stride}
+    motion=${G1_WALK_MOTION:-data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk2_subject4.npz}
+    exec "$python_bin" scripts/eval_walk_terrain.py "$cross" "$motion" "$out/$mode.json" \
+      --perception "$mode" --height .075 --lateral-height .03 --phase 67 --steps 200 --num-envs 48 \
+      --seed 147 --solver-iterations 60 --window-search-frames 3600 --starts-file "$out/starts.npz" "$@" ;;
   push|uphill|ledges)
     geometry=(); lane=flat
     if [[ $scene = uphill ]]; then geometry=(--grade .04); lane=grade; fi

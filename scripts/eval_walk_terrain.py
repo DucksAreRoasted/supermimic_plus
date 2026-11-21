@@ -19,8 +19,22 @@ from supermimic.runners.supermimic_runner import (
   build_world_model,
 )
 from supermimic.scripts.train_utils import create_env
+from supermimic.tasks.depth_mimic import (
+  DepthMemory,
+  DepthTrackingController,
+  walking_camera,
+)
+from supermimic.tasks.perceptive_walk import (
+  LocalGroundScan,
+  TerrainMotionWindow,
+  walking_scan,
+)
 from supermimic.tasks.task_spec import build_actor_obs_td
-from supermimic.tasks.walk_terrain import TerrainObservation, WalkTerrain
+from supermimic.tasks.walk_terrain import (
+  IrregularWalkTerrain,
+  TerrainObservation,
+  WalkTerrain,
+)
 
 
 def checkpoint_config(path):
@@ -35,7 +49,7 @@ def checkpoint_config(path):
   return SuperMimicRunnerCfg(residual_correction=True, residual_shared_trunk=True)
 
 
-def select_windows(root, heights, length, count, seed):
+def select_windows(root, heights, length, count, seed, *, disjoint=False):
   # Each test window commands actual travel and encounters a change of elevation.
   candidates = [
     t
@@ -43,6 +57,12 @@ def select_windows(root, heights, length, count, seed):
     if np.linalg.norm(root[t + length, :2] - root[t, :2]) > 0.75
     and np.ptp(heights[t : t + length + 1]) >= 0.02
   ]
+  if disjoint:
+    independent = []
+    for frame in candidates:
+      if not independent or frame > independent[-1] + length:
+        independent.append(frame)
+    candidates = independent
   if len(candidates) < count:
     raise ValueError(
       f"Only {len(candidates)} obstacle-crossing starts for {count} slots"
@@ -52,21 +72,83 @@ def select_windows(root, heights, length, count, seed):
   )
 
 
+def render_walk(path, model, poses, reference, dt):
+  """Render a simulated window with the unmodified reference in green."""
+  import imageio.v2 as imageio
+  import mujoco
+
+  actual, ghost = mujoco.MjData(model), mujoco.MjData(model)
+  camera = mujoco.MjvCamera()
+  travel = reference[-1, :2] - reference[0, :2]
+  camera.azimuth = np.degrees(np.arctan2(travel[1], travel[0])) + 74
+  camera.distance = 3.25
+  camera.elevation = -14
+  options, perturb = mujoco.MjvOption(), mujoco.MjvPerturb()
+  path.parent.mkdir(parents=True, exist_ok=True)
+  with (
+    mujoco.Renderer(model, height=384, width=640) as renderer,
+    imageio.get_writer(path, fps=1 / (2 * dt), codec="libx264", quality=8) as writer,
+  ):
+    for pose, ref in zip(poses, reference, strict=True):
+      actual.qpos[:], ghost.qpos[:] = pose, ref
+      mujoco.mj_forward(model, actual)
+      mujoco.mj_forward(model, ghost)
+      camera.lookat[:] = (pose[:3] + ref[:3]) / 2
+      renderer.update_scene(actual, camera, scene_option=options)
+      scene = renderer.scene
+      begin = scene.ngeom
+      mujoco.mjv_addGeoms(
+        model, ghost, options, perturb, mujoco.mjtCatBit.mjCAT_DYNAMIC, scene
+      )
+      for idx in range(begin, scene.ngeom):
+        geom = scene.geoms[idx]
+        geom.matid = -1
+        geom.rgba[:] = (0.10, 0.95, 0.32, 0.40)
+      writer.append_data(renderer.render())
+
+
 @torch.inference_mode()
 def evaluate(args):
   device = args.device
   course = WalkTerrain(args.height, args.phase, lateral_height=args.lateral_height)
+  if args.landscape_seed is not None:
+    course = IrregularWalkTerrain(
+      height=args.height,
+      lateral_height=args.lateral_height,
+      landscape_seed=args.landscape_seed,
+    )
   query = TerrainObservation(course).to(device)
   with np.load(args.motion) as clip:
-    root = clip["root_pos_w"]
+    root = clip["root_pos_w"][args.first_start_frame : args.window_search_frames]
     heights = query.height_at(torch.as_tensor(root[:, :2], device=device)).cpu().numpy()
-    starts = select_windows(root, heights, args.steps, args.num_envs, args.seed)
+    starts = [
+      args.first_start_frame + t
+      for t in select_windows(
+        root,
+        heights,
+        args.steps,
+        args.num_envs,
+        args.seed,
+        disjoint=args.disjoint_windows,
+      )
+    ]
   cfg = load_env_cfg("SuperMimic-GenCoord-G1", play=False)
   cfg.seed = args.seed
   cfg.scene.env_spacing = 0.0
   cfg.scene.spec_fn = WalkTerrain(0.0) if args.flat else course
-  cfg.sim.nconmax = max(cfg.sim.nconmax or 0, 128)
-  cfg.sim.njmax = max(cfg.sim.njmax or 0, 512)
+  sensed = args.perception != "map"
+  if sensed:
+    cfg.scene.sensors = (*cfg.scene.sensors, walking_scan())
+  depth = args.perception.startswith("depth")
+  if depth:
+    camera_cfg = walking_camera()
+    cfg.scene.sensors = (*cfg.scene.sensors, camera_cfg)
+  cfg.sim.nconmax = max(
+    cfg.sim.nconmax or 0, 256 if args.landscape_seed is not None else 128
+  )
+  cfg.sim.njmax = max(
+    cfg.sim.njmax or 0, 1024 if args.landscape_seed is not None else 512
+  )
   if args.solver_iterations:
     cfg.sim.mujoco.iterations = args.solver_iterations
     cfg.sim.mujoco.ls_iterations = args.solver_iterations
@@ -110,11 +192,39 @@ def evaluate(args):
     actor.eval()
     sim.reset(seed=args.seed)
     m = sim.command_manager.get_term("motion")
+    if depth:
+      camera = sim.scene["walk_depth"]
+      memory = DepthMemory(args.num_envs, device, sim.step_dt, camera_cfg.pattern)
+      camera_rng = torch.Generator(device=device).manual_seed(args.seed + 8731)
+      controller = DepthTrackingController(
+        m,
+        wm,
+        memory,
+        args.perception,
+        foot_gain=args.foot_gain,
+        steering_gain=args.steering_gain,
+        balance_gain=args.balance_gain,
+        prediction_steps=args.prediction_steps,
+        stride_gain=args.stride_gain,
+      )
     for i, t in enumerate(starts):
       m.reset_to_frame(torch.tensor([i], device=device), t)
     sim.scene.write_data_to_sim()
     sim.sim.forward()
     sim.sim.sense()
+    if sensed:
+      sensor = sim.scene["walk_scan"]
+      cloud = LocalGroundScan(sensor.data)
+      center = sim.sim.data.qpos.new_zeros((args.num_envs, 1, 2))
+      lift, valid = cloud.at(center)
+      if not valid.all():
+        raise ValueError("Missing terrain underneath a starting pelvis")
+      sim.sim.data.qpos[:, 2] += lift[:, 0]
+      sim.sim.forward()
+      sim.sim.sense()
+    adapter = (
+      TerrainMotionWindow(m, sim.step_dt) if args.perception == "online" else None
+    )
     m.update_relative_body_poses()
     obs = sim.observation_manager.compute(update_history=True)
     assert m.time_steps.tolist() == starts
@@ -150,32 +260,102 @@ def evaluate(args):
     returns = torch.zeros_like(active, dtype=torch.float64)
     steps = torch.zeros_like(active, dtype=torch.long)
     body_error = torch.zeros_like(returns)
+    upper_error = torch.zeros_like(returns)
+    scan_totals = {
+      name: returns.new_zeros(())
+      for name in ("error", "visible", "points", "bend", "coverage", "frames")
+    }
+    initial_scan_action_delta = None
     root_error = torch.zeros_like(returns)
     floor0 = query.height_at(obs["full_state"][:, :2])
     low, high = floor0, floor0
     wm_metrics = {name: {h: [] for h in (1, 8, 32)} for name in models}
     ankles = [m.cfg.body_names.index(s + "_ankle_roll_link") for s in ("left", "right")]
+    upper = [
+      i
+      for i, name in enumerate(m.cfg.body_names)
+      if any(part in name for part in ("torso", "shoulder", "elbow", "wrist"))
+    ]
+    offsets = query.offsets.expand(args.num_envs, -1, -1)
+    video_poses = []
     for t in range(args.steps):
+      if args.video and t % 2 == 0:
+        video_poses.append(sim.sim.data.qpos.clone())
       aux = rep.extract_aux_state(obs["full_state"])
       state = rep.represent(obs["full_state"])
       if t % 32 == 0:
         predictions = dict.fromkeys(models, (aux, state))
-      td = build_actor_obs_td(
-        {"motion": extract_actor_goal(obs["goal"])}, state.unsqueeze(1)
-      )
+      goal = extract_actor_goal(obs["goal"])
+      if sensed:
+        if depth:
+          data = camera.data
+          ranges = data.distances
+          if args.depth_noise_m:
+            noise = torch.randn(ranges.shape, device=device, generator=camera_rng)
+            ranges = torch.where(
+              ranges > 0, ranges + args.depth_noise_m * noise, ranges
+            )
+          if args.depth_dropout:
+            missing = (
+              torch.rand(ranges.shape, device=device, generator=camera_rng)
+              < args.depth_dropout
+            )
+            ranges = ranges.masked_fill(missing, -1.0)
+          terrain, heights, valid = controller.observe(
+            ranges, data.pos_w, data.quat_w, offsets
+          )
+          goal = controller.goal(goal, aux)
+        else:
+          scan = LocalGroundScan(sensor.data)
+          heights, valid = scan.at(offsets)
+          terrain = (
+            torch.zeros_like(heights) if args.perception == "blind" else 10 * heights
+          )
+        # Compare measured and known heights for scoring only.
+        visible = valid & active[:, None]
+        expected = torch.zeros_like(heights) if args.flat else query(aux)
+        scan_totals["error"] += ((heights - expected).abs() * visible).sum()
+        scan_totals["visible"] += visible.sum()
+        scan_totals["points"] += active.sum() * heights.shape[1]
+        if adapter is not None:
+          goal, bend, coverage = adapter.actor_goal(scan, m.time_steps, goal)
+          scan_totals["bend"] += (bend * active[:, None]).sum()
+          scan_totals["coverage"] += (coverage * active[:, None]).sum()
+          scan_totals["frames"] += active.sum() * bend.shape[1]
+      td = build_actor_obs_td({"motion": goal}, state.unsqueeze(1))
       if actor_cfg.terrain_inputs != "blind":
         td["terrain"] = (
-          torch.zeros_like(query.features(aux)) if args.flat else query.features(aux)
+          terrain
+          if sensed
+          else (
+            torch.zeros_like(query.features(aux)) if args.flat else query.features(aux)
+          )
         )
       if actor_cfg.use_root_waypoints:
         td["root_waypoints"] = root_waypoints(obs["goal"])
       actions = actor(td)
+      if depth:
+        actions = controller.action(actions, aux, state, terrain)
+      if (
+        t == 0
+        and args.perception in ("scan", "online")
+        and actor_cfg.terrain_inputs != "blind"
+      ):
+        td["terrain"] = torch.zeros_like(terrain)
+        initial_scan_action_delta = float((actions - actor(td)).abs().mean())
       for name, model in models.items():
         pred_aux, pred_state = predictions[name]
         predictions[name] = model.dynamics(pred_state, actions, pred_aux, ctx)
       m._update_metrics()
       body_error += torch.where(active, m.metrics["error_body_pos"], 0.0)
+      if sensed:
+        upper_distance = (
+          m.body_pos_relative_w[:, upper] - m.robot_body_pos_w[:, upper]
+        ).norm(dim=-1)
+        upper_error += torch.where(active, upper_distance.mean(-1), 0.0)
       obs, r, done, _ = env.step(actions)
+      if depth:
+        controller.reset(done.bool())
       returns += torch.where(active, r, 0.0)
       steps += active.long()
       active = active & ~done.bool()
@@ -231,8 +411,22 @@ def evaluate(args):
       clip_sha256=hashlib.sha256(args.motion.read_bytes()).hexdigest(),
       height=args.height,
       lateral_height=args.lateral_height,
+      landscape_seed=args.landscape_seed,
       phase_cells=args.phase,
       flat=args.flat,
+      perception=args.perception,
+      stride_gain=controller.stride_gain if depth else 0.0,
+      depth_noise_m=args.depth_noise_m,
+      depth_dropout=args.depth_dropout,
+      prediction_steps=args.prediction_steps
+      if args.perception.startswith("depth-predict")
+      else None,
+      balance_gain=args.balance_gain if depth else None,
+      steering_gain=args.steering_gain if depth else None,
+      foot_gain=args.foot_gain if args.perception.startswith("depth-contact") else None,
+      window_search_frames=args.window_search_frames,
+      first_start_frame=args.first_start_frame,
+      disjoint_windows=args.disjoint_windows,
       solver_iterations=cfg.sim.mujoco.iterations,
       solver_ls_iterations=cfg.sim.mujoco.ls_iterations,
       seed=args.seed,
@@ -246,6 +440,24 @@ def evaluate(args):
       mean_body_error_cm=float(np.mean([r["mean_body_error_cm"] for r in rows])),
       windows_detail=rows,
     )
+    if sensed:
+      totals = {k: float(v) for k, v in scan_totals.items()}
+      report["upper_body_links"] = [m.cfg.body_names[i] for i in upper]
+      report["mean_upper_body_error_cm"] = float(
+        (100 * upper_error / steps.clamp_min(1)).mean()
+      )
+      report["scan"] = dict(
+        valid_fraction=totals["visible"] / totals["points"],
+        height_mae_cm=100 * totals["error"] / totals["visible"]
+        if totals["visible"]
+        else None,
+        initial_action_mae_vs_masked_scan=initial_scan_action_delta,
+      )
+      if totals["frames"]:
+        report["scan"].update(
+          mean_leg_bend_rad=totals["bend"] / totals["frames"],
+          footprint_coverage=totals["coverage"] / totals["frames"],
+        )
     report["comparison_open_loop"] = {}
     for name, by_horizon in wm_metrics.items():
       results = {}
@@ -260,6 +472,35 @@ def evaluate(args):
           )
       report["comparison_open_loop"][name] = results
     report["open_loop"] = report["comparison_open_loop"][str(args.checkpoint)]
+    if args.video:
+      if args.video_first_success:
+        passed = [i for i, r in enumerate(rows) if r["success"]]
+        if not passed:
+          report["video"] = {"path": None, "reason": "no successful windows"}
+          return report
+        index = passed[0]
+      else:
+        index = 0 if args.video_start is None else starts.index(args.video_start)
+      length = (int(steps[index]) + 1) // 2
+      poses = torch.stack([batch[index] for batch in video_poses[:length]])
+      motion = m.motion
+      frames = starts[index] + 2 * torch.arange(length, device=device)
+      reference = poses.clone()
+      reference[:, :3] = motion.root_pos_w[frames]
+      reference[:, 3:7] = motion.root_quat_w[frames]
+      reference[:, m.robot.indexing.joint_q_adr] = motion.joint_pos[frames]
+      render_walk(
+        args.video,
+        sim.sim.mj_model,
+        poses.cpu().numpy(),
+        reference.cpu().numpy(),
+        sim.step_dt,
+      )
+      report["video"] = {
+        "start": starts[index],
+        "frames": length,
+        "path": str(args.video),
+      }
     return report
   finally:
     env.close()
@@ -282,21 +523,84 @@ def main():
     default=[],
     help="Score additional dynamics on exactly the same simulated transitions",
   )
+  parser.add_argument(
+    "--landscape-seed",
+    type=int,
+    help="Evaluate on an independently generated irregular 2-D surface",
+  )
   parser.add_argument("--height", type=float, default=0.065)
   parser.add_argument("--phase", type=int, default=17)
   parser.add_argument("--lateral-height", type=float, default=0.0)
   parser.add_argument("--steps", type=int, default=100)
   parser.add_argument("--num-envs", type=int, default=16)
+  parser.add_argument(
+    "--window-search-frames",
+    type=int,
+    help="Select starts within the first N original frames",
+  )
   parser.add_argument("--seed", type=int, default=71)
+  parser.add_argument("--first-start-frame", type=int, default=0)
+  parser.add_argument("--disjoint-windows", action="store_true")
   parser.add_argument("--device", default="cuda:0")
+  parser.add_argument(
+    "--video", type=Path, help="Render a paired window with its raw reference"
+  )
+  video_selection = parser.add_mutually_exclusive_group()
+  video_selection.add_argument(
+    "--video-start", type=int, help="Choose a recorded start frame"
+  )
+  video_selection.add_argument(
+    "--video-first-success",
+    action="store_true",
+    help="Illustrate the first passing window in this run",
+  )
   parser.add_argument("--flat", action="store_true")
+  parser.add_argument(
+    "--perception",
+    choices=(
+      "map",
+      "blind",
+      "scan",
+      "online",
+      "depth",
+      "depth-blind",
+      "depth-balance",
+      "depth-predict",
+      "depth-predict-no-depth",
+      "depth-steer",
+      "depth-contact",
+      "depth-contact-shuffled",
+      "depth-proprio-stride",
+      "depth-contact-stride",
+      "depth-contact-stride-shuffled",
+      "depth-contact-recover",
+      "depth-contact-recover-shuffled",
+      "depth-contact-budget",
+      "depth-contact-budget-shuffled",
+      "depth-steer-blind",
+      "depth-steer-always",
+    ),
+    default="map",
+    help="Map reproduces the analytic-map protocol. Depth-contact runs the pinhole camera, reference steering and per-foot corrections on the raw motion.",
+  )
+  parser.add_argument(
+    "--stride-gain", type=float, help="Override the phase-specific hip excursion gain"
+  )
+  parser.add_argument("--foot-gain", type=float, default=1.5)
+  parser.add_argument("--steering-gain", type=float, default=0.45)
+  parser.add_argument("--prediction-steps", type=int, choices=range(1, 9), default=4)
+  parser.add_argument("--balance-gain", type=float, default=0.5)
   parser.add_argument(
     "--solver-iterations", type=int, help="Set both solver iteration limits"
   )
   parser.add_argument(
     "--starts-file", type=Path, help="Record or verify the common initial conditions"
   )
+  parser.add_argument("--depth-noise-m", type=float, default=0.0)
+  parser.add_argument("--depth-dropout", type=float, default=0.0)
   args = parser.parse_args()
+  if args.depth_noise_m < 0 or not 0 <= args.depth_dropout <= 1:
+    parser.error("Depth noise must be nonnegative and dropout must lie in [0,1]")
   result = evaluate(args)
   args.out.parent.mkdir(parents=True, exist_ok=True)
   args.out.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")

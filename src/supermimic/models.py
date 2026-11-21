@@ -169,14 +169,19 @@ class Dynamics(nn.Module):
 
   def predict_delta(
     self, rep_state: torch.Tensor, action: torch.Tensor, aux_state: torch.Tensor,
-    sim_ctx: torch.Tensor,
+    sim_ctx: torch.Tensor, *, sensed_terrain: torch.Tensor | None = None,
   ) -> torch.Tensor:
-    """Velocity increments before the representation integrates the next pose."""
+    """Predict velocity increments using supplied depth features or the training terrain."""
     state_norm = self.state_normalizer(rep_state)
     action_norm = self.action_normalizer(self.proc(action))
     features = torch.cat([state_norm, action_norm, sim_ctx], dim=-1)
     if self.terrain_query is not None:
-      features = torch.cat([features, self.terrain_query.features(aux_state)], dim=-1)
+      terrain = (
+        self.terrain_query.features(aux_state)
+        if sensed_terrain is None
+        else sensed_terrain
+      )
+      features = torch.cat([features, terrain], dim=-1)
     if self.residual_head is not None:
       trunk = self.mlp[:-1](features)
       prediction = self.mlp[-1](trunk)
