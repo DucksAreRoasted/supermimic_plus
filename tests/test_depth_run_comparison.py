@@ -131,6 +131,20 @@ def test_depth_wm_lr_ablation_keeps_other_training_parameters(monkeypatch):
       scratch_config(**common, wm_lr=invalid)
 
 
+def test_g1_depth_actor_inputs(monkeypatch):
+  monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
+  from train_g1_dual_head_depth import scratch_config
+
+  args = (10, 2, 42, False, 4)
+  default = scratch_config(*args)
+  assert (default.actor_obs, default.history_length) == ("proprio", 10)
+  assert default.depth_fusion == "concat"
+  for name, obs in (("proprio1", "proprio"), ("state1", "rep_state")):
+    cfg = scratch_config(*args, actor_input=name)
+    assert (cfg.actor_obs, cfg.history_length) == (obs, 1)
+    assert cfg.run_name != default.run_name
+
+
 def test_learning_rate_run_rejects_different_control_manifest(tmp_path, monkeypatch):
   from copy import deepcopy
   from dataclasses import asdict

@@ -108,8 +108,10 @@ GOAL_REL_POS_DIM = 3 * NUM_GOAL_FRAMES  # rel_pos_b: in wm_goal only
 GOAL_REL_ORI_DIM = 6 * NUM_GOAL_FRAMES  # rel_ori_b: in both wm_goal and actor_goal
 
 
-def actor_goal_dim(num_goals: int) -> int:
-  """Number of goal dimensions seen by the actor (wm_goal minus rel_pos_b)."""
+def actor_goal_dim(num_goals: int, pelvis_motion_goal: bool = False) -> int:
+  """Extended targets include the complete WM goal and one vertical speed per frame."""
+  if pelvis_motion_goal:
+    return num_goals + NUM_GOAL_FRAMES
   return num_goals - GOAL_REL_POS_DIM
 
 
@@ -279,6 +281,8 @@ class StateRepresentation(nn.Module, ABC):
     "root_ori": "nominal_error_root_pose_ori",
   }
 
+  _encoder_bias: tuple[slice, SimContext] | None = None
+  pelvis_motion_goal: bool = False
   substep_coeff: float = 1.0
 
   # ------------------------------------------------------------------
@@ -318,6 +322,15 @@ class StateRepresentation(nn.Module, ABC):
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
     """Resolve env-dependent state needed by the reward and the proprio sensor."""
     self._soft_joint_pos_limits = env.scene["robot"].data.soft_joint_pos_limits[0]
+    columns = sim_context.find("encoder_bias")
+    self._encoder_bias = None if columns is None else (columns, sim_context)
+
+  def _relative_encoder_position(self, qj: torch.Tensor, sim_ctx: torch.Tensor) -> torch.Tensor:
+    position = qj - self._default_joint_pos
+    if self._encoder_bias is not None:
+      columns, context = self._encoder_bias
+      position = position + context.denormalize(sim_ctx, columns)
+    return position
 
   @abstractmethod
   def joint_state(self, rep_state: torch.Tensor) -> torch.Tensor:
@@ -362,7 +375,7 @@ class StateRepresentation(nn.Module, ABC):
       if self.actor_obs_mode == "rep_state"
       else self.proprio_obs_dim(num_actions)
     )
-    return history_length * sensor_or_state + actor_goal_dim(num_goals)
+    return history_length * sensor_or_state + actor_goal_dim(num_goals, self.pelvis_motion_goal)
 
   def add_proprio_noise(self, obs: torch.Tensor) -> torch.Tensor:
     """Add per-dim uniform proprio jitter — the single noise site shared by the
@@ -429,9 +442,17 @@ class StateRepresentation(nn.Module, ABC):
     content = _joint_targets_at(motion, idx)
     target_pos, target_quat = motion.root_pos_w[idx], motion.root_quat_w[idx]
     root_pos, root_quat = aux_state[..., :3], aux_state[..., 3:7]
-    return _compiled_assemble_goal(
+    wm_goal, actor_goal = _compiled_assemble_goal(
       content, root_pos, root_quat, target_pos, target_quat
     )
+    if self.pelvis_motion_goal:
+      # Keep the legacy encoder input as a prefix. Add displacement in the
+      # current robot frame and reference vertical speed in the world frame.
+      rel_pos = wm_goal[:, -(GOAL_REL_POS_DIM + GOAL_REL_ORI_DIM):-GOAL_REL_ORI_DIM]
+      extra = torch.cat([rel_pos.reshape(len(idx), NUM_GOAL_FRAMES, 3),
+                         motion.root_lin_vel_w[idx, 2:3]], dim=-1)
+      actor_goal = torch.cat([actor_goal, extra.flatten(1)], dim=-1)
+    return wm_goal, actor_goal
 
   @abstractmethod
   def world_frame_bodies(
@@ -620,10 +641,10 @@ class GenCoordRepresentation(StateRepresentation):
     joint_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
-    del aux_state, sim_ctx
+    del aux_state
     _, g_b, _, w_b, _, _ = decompose_rep_state(rep_state)
     qj, vj = joint_state.chunk(2, dim=-1)
-    return torch.cat([g_b, w_b, qj - self._default_joint_pos, vj], dim=-1)
+    return torch.cat([g_b, w_b, self._relative_encoder_position(qj, sim_ctx), vj], dim=-1)
 
 
 class MaxCoordRepresentation(StateRepresentation):
@@ -654,7 +675,6 @@ class MaxCoordRepresentation(StateRepresentation):
     self.register_buffer("_default_joint_pos", default_joint_pos, persistent=False)
     self.register_buffer("_gravity_w", torch.tensor([0.0, 0.0, -1.0]), persistent=False)
     self.analytic_ik: AnalyticIK  # set by bind
-    self._encoder_bias: tuple[slice, SimContext] | None = None
 
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
     super().bind(env, sim_context)
@@ -668,8 +688,6 @@ class MaxCoordRepresentation(StateRepresentation):
       self._default_joint_pos.device,
       self._default_joint_pos.dtype,
     )
-    columns = sim_context.find("encoder_bias")
-    self._encoder_bias = None if columns is None else (columns, sim_context)
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
     flat = full_state.reshape(-1, self.full_state_dim)
@@ -810,8 +828,5 @@ class MaxCoordRepresentation(StateRepresentation):
     projected_gravity = quat_apply_inverse(root_quat, g_w)
     _, _, _, avel, _, _ = decompose_maxcoord_rep_state(rep_state, self.num_bodies)
     joint_pos, joint_vel = joint_state.chunk(2, dim=-1)
-    joint_pos_rel = joint_pos - self._default_joint_pos
-    if self._encoder_bias is not None:
-      columns, sim_context = self._encoder_bias
-      joint_pos_rel = joint_pos_rel + sim_context.denormalize(sim_ctx, columns)
+    joint_pos_rel = self._relative_encoder_position(joint_pos, sim_ctx)
     return torch.cat([projected_gravity, avel[..., 0, :], joint_pos_rel, joint_vel], -1)

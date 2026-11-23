@@ -70,6 +70,7 @@ class BaseRunnerCfg:
   log_interval: int = 10
   save_interval: int = 1000
   keep_iteration_checkpoints: bool = False
+  pelvis_motion_goal: bool = False
   history_length: int = 1
   termination_softness: float = 0.05
   dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
@@ -119,9 +120,9 @@ class BaseRunnerCfg:
     if self.terrain_lateral_height<0 or (self.terrain_lateral_height and self.terrain_height<=0):
       raise ValueError("Cross-slope training requires a positive course height and nonnegative lateral height")
     if self.depth_fusion != "none":
-      if (self.terrain_inputs != "actor-world" or self.history_length != 1 or self.reference_residual_policy
+      if (self.terrain_inputs != "actor-world" or self.reference_residual_policy
           or self.mirror_augmentation or self.cuda_graph_collection):
-        raise ValueError("Depth fusion needs actor-world terrain, single-frame input and a camera-enabled collection step")
+        raise ValueError("Depth fusion needs actor-world terrain and a camera-enabled collection step")
       env_cfg.scene.sensors = (*env_cfg.scene.sensors, walking_camera())
     if self.terrain_height == 0 and self.terrain_inputs == "blind":
       return
@@ -285,6 +286,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     actor_obs_mode=cfg.actor_obs,
   ).to(device)
 
+  representation.pelvis_motion_goal = cfg.pelvis_motion_goal
   representation.bind(env.unwrapped, sim_context)
 
   print(
@@ -902,10 +904,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     if isinstance(policy_cfg, ActorCriticPolicyLearnerCfg):
       if self.cfg.actor_microbatch_size is not None and (
-        self.cfg.critic_variant != "sim-calibrated" or self.cfg.history_length != 1
+        self.cfg.critic_variant != "sim-calibrated"
         or self.cfg.slot_mix.get("motion") != 1.0 or self.cfg.actor_microbatch_size < 1
       ):
-        raise ValueError("Actor microbatching supports single-frame, motion-only sim-calibrated runs")
+        raise ValueError("Actor microbatching supports motion-only sim-calibrated runs")
       if self.cfg.critic_variant in {"official", "sim-calibrated"}:
         learner_cls = (
           SimulatorCalibratedActorCriticLearner
@@ -972,7 +974,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       sim_ctx,
       aux_state=aux_state,
       sim_actor_obs=sim_actor_obs if proprio else None,
-      noisy=proprio,
+      noisy=proprio and self.cfg.history_length == 1,
     )
     goals = {
       ts.name: ts.extract_training_goal(self.motion, motion_times, aux_state)
@@ -1244,6 +1246,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         # Skip ONNX export on huge datasets.
         if (
           self._representation.actor_obs_mode == "proprio"
+          and self.cfg.depth_fusion == "none"
           and self.motion.time_step_total <= 15_000
         ):
           checkpoint_files += export_actor_as_onnx(

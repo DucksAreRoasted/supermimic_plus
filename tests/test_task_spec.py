@@ -158,6 +158,7 @@ class TestInferenceHelpers:
 class TestResolveTaskSpecs:
   def test_motion_and_velocity(self):
     rep = MagicMock()
+    rep.pelvis_motion_goal = False
     specs = resolve_task_specs(TasksCfg(), rep, num_goals=87)
     names = [s.name for s in specs]
     assert names == ["motion", "velocity"]

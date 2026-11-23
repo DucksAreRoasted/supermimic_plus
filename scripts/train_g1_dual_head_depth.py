@@ -28,8 +28,16 @@ CLIPS = (
 )
 
 
+ACTOR_INPUTS = {
+  "proprio10": ("proprio", 10),
+  "proprio1": ("proprio", 1),
+  "state1": ("rep_state", 1),
+}
+
+
 def scratch_config(iterations, batch, seed, root_waypoints, num_envs, *, terrain_height_reset=False,
-                   official_backends=False, cache_reference=False, wm_lr=2e-5):
+                   official_backends=False, cache_reference=False, wm_lr=2e-5, actor_input="proprio10",
+                   pelvis_motion_goal=True):
   waypoint_label = "-waypoints" if root_waypoints else ""
   reset_label = "-terrainreset" if terrain_height_reset else ""
   speed_label = (f"-batch{batch}" if batch != 64 else "") + ("-tf32" if official_backends else "")
@@ -39,7 +47,15 @@ def scratch_config(iterations, batch, seed, root_waypoints, num_envs, *, terrain
     raise ValueError("The world-model learning rate must be positive and finite")
   if wm_lr != 2e-5:
     speed_label += f"-wmlr{wm_lr:g}"
+  actor_obs, history_length = ACTOR_INPUTS[actor_input]
+  if actor_input != "state1":
+    speed_label += f"-{actor_input}"
+  if pelvis_motion_goal:
+    speed_label += "-goal68"
   cfg = SuperMimicRunnerCfg(
+    pelvis_motion_goal=pelvis_motion_goal,
+    actor_obs=actor_obs,
+    history_length=history_length,
     run_name=f"g1-rough7-concat-wm-dualmlp128-cal0{waypoint_label}{reset_label}{speed_label}-scratch-env{num_envs}-{iterations}it-seed{seed}",
     max_iterations=iterations,
     log_interval=4 if iterations < 100 else 64,
@@ -130,6 +146,10 @@ def build_scratch_runner(cfg, num_envs, seed, *, clips=None):
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--iterations", type=int, default=40000)
+  parser.add_argument("--goal-width", type=int, choices=(64, 68),
+                      help="Reference features per frame (scratch default: 68, transfer: source layout)")
+  parser.add_argument("--actor-input", choices=tuple(ACTOR_INPUTS),
+                      help="Default: proprio10 from scratch, or the source Actor layout for visual transfer")
   parser.add_argument("--root-waypoints", action="store_true",
                       help="Expose current and future reference pelvis XY in the Actor decoder")
   parser.add_argument("--terrain-height-reset", action="store_true",
@@ -159,9 +179,24 @@ def main():
     parser.error("--policy-batch must be positive")
   if args.official_backends:
     configure_torch_backends()
+  actor_input = args.actor_input or "proprio10"
+  goal_width = args.goal_width or 68
+  if args.vision_base_checkpoint:
+    source = json.loads((args.vision_base_checkpoint / "run_manifest.json").read_text())
+    source_cfg = source["runner_cfg"]
+    source_width = 68 if source_cfg.get("pelvis_motion_goal", False) else 64
+    if args.goal_width is not None and args.goal_width != source_width:
+      parser.error(f"Visual transfer requires source goal width {source_width}")
+    goal_width = source_width
+    layout = (source_cfg.get("actor_obs", "rep_state"), source_cfg.get("history_length", 1))
+    if args.actor_input is None:
+      actor_input = next((name for name, dims in ACTOR_INPUTS.items() if dims == layout), None)
+    if actor_input is None or ACTOR_INPUTS[actor_input] != layout:
+      parser.error(f"Visual transfer requires the source Actor layout {layout}")
   cfg = scratch_config(args.iterations, args.batch, args.seed, args.root_waypoints, args.num_envs,
                        terrain_height_reset=args.terrain_height_reset, official_backends=args.official_backends,
-                       cache_reference=args.cache_reference, wm_lr=args.wm_lr)
+                       cache_reference=args.cache_reference, wm_lr=args.wm_lr, actor_input=actor_input,
+                       pelvis_motion_goal=goal_width == 68)
   if args.policy_batch is not None and args.policy_batch != args.batch:
     cfg.policy.batch_size = args.policy_batch
     cfg.run_name += f"-actorbatch{args.policy_batch}"
@@ -185,7 +220,6 @@ def main():
       parser.error("--vision-base-checkpoint requires --imagined-vision")
     cfg.init_model_dir = str(args.vision_base_checkpoint.resolve())
     if clips is not None:
-      source = json.loads((args.vision_base_checkpoint / "run_manifest.json").read_text())
       if [Path(p).name for p in source["motion_files"]] != [p.name for p in clips]:
         raise ValueError("Base checkpoint motions differ from the requested LAFAN40 protocol")
     cfg.run_name = cfg.run_name.replace("-scratch-", "-from-base-")

@@ -20,6 +20,7 @@ from supermimic.utils.warp_fk import WarpForwardKinematics
 @torch.no_grad()
 def fixed_starts(runner, batch_size):
   runner.env.reset()
+  runner._seed_sim_history()
   obs = runner.env.get_observations()
   state = obs["full_state"]
   times = runner.motion_cmd.time_steps.clone()
@@ -42,6 +43,10 @@ def fixed_starts(runner, batch_size):
     },
     batch_size=[len(state)],
   )
+  if runner.cfg.history_length > 1:
+    length = runner.cfg.history_length
+    rows["sensor_window"] = obs["actor"][:, None].expand(-1, length, -1)
+    rows["pad_mask"] = (torch.arange(length, device=state.device) < length - 1).expand(len(state), -1)
   return rows[torch.arange(batch_size, device=state.device) % len(state)].clone()
 
 
@@ -93,10 +98,9 @@ def main():
   cfg = checkpoint_config(args.checkpoint)
   if (
     cfg.imagined_vision not in ("render", "latent")
-    or cfg.history_length != 1
     or not cfg.policy.survival_masking
   ):
-    parser.error("Expected a single-frame visual checkpoint with survival masking")
+    parser.error("Expected a visual checkpoint with survival masking")
   cfg.init_model_dir = str(args.checkpoint.resolve())
   cfg.policy.batch_size = args.batch
   cfg.buffer_size = cfg.wm.horizon

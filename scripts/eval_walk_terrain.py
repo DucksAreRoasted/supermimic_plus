@@ -199,7 +199,7 @@ def evaluate(args):
       other.dynamics.eval()
       models[str(path)] = other
     driver_wm = wm
-    if actor_cfg.imagined_vision != "none" and args.driver and args.driver != args.checkpoint:
+    if (actor_cfg.imagined_vision != "none" or actor_cfg.pelvis_motion_goal != model_cfg.pelvis_motion_goal) and args.driver and args.driver != args.checkpoint:
       driver_wm = build_world_model(actor_cfg, env, device)
       driver_wm.load_bundle(torch.load(args.driver / "world_model.pt", map_location=device, weights_only=True))
     actor = build_actor(actor_cfg, driver_wm, device)
@@ -326,6 +326,7 @@ def evaluate(args):
     ]
     offsets = query.offsets.expand(args.num_envs, -1, -1)
     video_poses = []
+    history = None
     for t in range(args.steps):
       if args.video and t % 2 == 0:
         video_poses.append(sim.sim.data.qpos.clone())
@@ -333,7 +334,10 @@ def evaluate(args):
       state = rep.represent(obs["full_state"])
       if t % 32 == 0:
         predictions = dict.fromkeys(models, (aux, state))
-      goal = extract_actor_goal(obs["goal"])
+      if actor_cfg.pelvis_motion_goal:
+        _, goal = driver_wm.representation.compute_wm_goal(m.motion, m.time_steps, aux)
+      else:
+        goal = extract_actor_goal(obs["goal"])
       if sensed:
         if depth:
           data = camera.data
@@ -391,7 +395,15 @@ def evaluate(args):
           scan_totals["bend"] += (bend * active[:, None]).sum()
           scan_totals["coverage"] += (coverage * active[:, None]).sum()
           scan_totals["frames"] += active.sum() * bend.shape[1]
-      td = build_actor_obs_td({"motion": goal}, state.unsqueeze(1))
+      actor_frame = obs["actor"] if actor_cfg.actor_obs == "proprio" else state
+      if history is None:
+        history = actor_frame[:, None].repeat(1, actor_cfg.history_length, 1)
+      elif actor_cfg.history_length == 1:
+        history = actor_frame[:, None]
+      else:
+        shifted = torch.cat([history[:, 1:], actor_frame[:, None]], dim=1)
+        history = torch.where(done.bool().view(-1, 1, 1), actor_frame[:, None], shifted)
+      td = build_actor_obs_td({"motion": goal}, history)
       if actor_cfg.terrain_inputs != "blind":
         td["terrain"] = (
           terrain
