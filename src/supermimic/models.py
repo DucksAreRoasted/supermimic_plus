@@ -8,9 +8,9 @@ from rsl_rl.modules import EmpiricalNormalization
 from tensordict import TensorDict
 
 if TYPE_CHECKING:
-  from supermimic.tasks.walk_terrain import TerrainObservation
   from supermimic.representations import StateRepresentation
   from supermimic.tasks.task_spec import TaskSpec
+  from supermimic.tasks.walk_terrain import TerrainObservation
 
 
 class _CudaGraphNormalization(EmpiricalNormalization):
@@ -89,6 +89,7 @@ class Dynamics(nn.Module):
     residual_shared_trunk: bool = False,
     residual_low_rank: int | None = None,
     terrain_query: TerrainObservation | None = None,
+    shared_head_width: int = 0,
   ):
     super().__init__()
 
@@ -115,6 +116,21 @@ class Dynamics(nn.Module):
       hidden_dims,
       output_dim=representation.prediction_dim,
     )
+    self.vision = None
+    self.shared_head_width = shared_head_width
+    if shared_head_width < 0 or (shared_head_width and not (residual_correction and residual_shared_trunk)):
+      raise ValueError("Nonlinear heads require a positive width and a shared residual trunk")
+    self.head_mlps = nn.ModuleList()
+    if shared_head_width:
+      # Give both flat-ground ablation arms identical subsequent Actor/Critic
+      # initialization. Keep the archived terrain experiments' RNG sequence.
+      with torch.random.fork_rng(devices=[], enabled=terrain_query is None):
+        for _ in range(2):
+          head = nn.Sequential(nn.Linear(hidden_dims[-1], shared_head_width), nn.SiLU(),
+                               nn.Linear(shared_head_width, representation.prediction_dim))
+          nn.init.zeros_(head[-1].weight)
+          nn.init.zeros_(head[-1].bias)
+          self.head_mlps.append(head)
     self.residual_mlp = None
     self.residual_head = None
     if residual_correction:
@@ -163,8 +179,10 @@ class Dynamics(nn.Module):
     action: torch.Tensor,
     aux_state: torch.Tensor,
     sim_ctx: torch.Tensor,
+    *,
+    sensed_terrain: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    prediction = self.predict_delta(rep_state, action, aux_state, sim_ctx)
+    prediction = self.predict_delta(rep_state, action, aux_state, sim_ctx, sensed_terrain=sensed_terrain)
     return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
 
   def predict_delta(
@@ -185,7 +203,11 @@ class Dynamics(nn.Module):
     if self.residual_head is not None:
       trunk = self.mlp[:-1](features)
       prediction = self.mlp[-1](trunk)
-      prediction = prediction + self.residual_scale * self.residual_head(trunk)
+      correction = self.residual_head(trunk)
+      if self.shared_head_width:
+        prediction = prediction + self.head_mlps[0](trunk)
+        correction = correction + self.head_mlps[1](trunk)
+      prediction = prediction + self.residual_scale * correction
     else:
       prediction = self.mlp(features)
       if self.residual_mlp is not None:
@@ -273,10 +295,16 @@ class MultiEncoderAE(nn.Module):
       }
     )
     self.decoder = build_mlp(
-      latent_dim + history_length * obs_dim + terrain_obs_dim + (4 if use_root_waypoints else 0),
+      latent_dim + history_length * obs_dim + terrain_obs_dim,
       hidden_dims,
       output_dim=action_dim,
     )
+    if use_root_waypoints:
+      # Preserve the seeded decoder and RNG stream. Only the four new input
+      # columns start at zero and receive a gradient from the first update.
+      first = self.decoder[0]
+      first.weight = nn.Parameter(torch.nn.functional.pad(first.weight.detach(), (0, 4)))
+      first.in_features = first.weight.shape[1]
     # Do not allocate or initialize the prior when disabled. This preserves the
     # baseline parameter set and RNG initialization exactly for weight=0 runs.
     prior_dims = hidden_dims if prior_hidden_dims is None else prior_hidden_dims
@@ -294,6 +322,8 @@ class MultiEncoderAE(nn.Module):
         self.prior[-1].weight[self.latent_dim :].zero_()
         self.prior[-1].bias[self.latent_dim :].zero_()
 
+    self.visual_action = None
+    self.foot_depth_fusion: nn.Module | None = None
     self.set_slot_mix(slot_mix)
 
   def set_slot_mix(self, slot_mix: dict[str, float]) -> None:
@@ -321,6 +351,17 @@ class MultiEncoderAE(nn.Module):
     return ranges
 
   def forward(self, obs_td: TensorDict) -> torch.Tensor:
+    actions = self.decode_actions(obs_td)
+    if self.foot_depth_fusion is not None:
+      actions = self.foot_depth_fusion(
+        actions, obs_td["depth_tokens"], obs_td["future_feet"]
+      )
+    if self.visual_action is not None:
+      actions = actions + self.visual_action(obs_td["camera_latent"].detach())
+    return actions
+
+  def decode_actions(self, obs_td: TensorDict) -> torch.Tensor:
+    """Base decoder output, also used to measure the learned terrain modulation."""
     slots = self.slot_ranges(obs_td.shape[0])
     enc_outs: list[torch.Tensor] = []
     for name, (lo, hi) in zip(self._task_names, slots, strict=True):

@@ -62,6 +62,29 @@ def _make_env(history_length: int = 1) -> MultiTaskWorldModelEnv:
 
 
 class TestMultiTaskWorldModelEnv:
+  def test_dynamics_receives_current_measured_patch_after_step_and_reset(self):
+    from supermimic.tasks.foot_depth_actor import MeasuredPatch
+
+    env = _make_env()
+    patch = MeasuredPatch(torch.zeros(1, 2))
+    env.terrain_query = env.dynamics.terrain_query = patch
+    env.future_feet = lambda times: torch.zeros(len(times), 2, 3, 9)
+    env.actor_sees_terrain = True
+    env.representation.extract_aux_state.side_effect = lambda states: identity_aux(len(states))
+    env.dynamics.side_effect = lambda rep, action, aux, ctx, *, sensed_terrain: (aux, rep)
+    starts = env.sample_initial_states()
+    starts["depth_origin"] = torch.tensor([0., 0., 1., 0., 0., 0.]).expand(BATCH, -1)
+    for height in (1., 2.):
+      image = torch.ones(BATCH, 2, 25, 25)
+      image[:, 0] = height
+      starts["depth_image"] = image.flatten(1)
+      obs = env.reset(starts)
+      for _ in range(2):
+        prev = obs["terrain"]
+        torch.testing.assert_close(prev, torch.full_like(prev, height))
+        obs = env.step(torch.zeros(BATCH, ACTION_DIM))[0]
+        assert env.dynamics.call_args.kwargs["sensed_terrain"] is prev
+
   def test_termination_softness_reaches_the_base_env(self):
     assert _make_env()._termination_softness == SOFTNESS
 

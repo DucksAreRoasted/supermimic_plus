@@ -12,6 +12,7 @@ from supermimic.representations import root_waypoints
 from supermimic.tasks.task_spec import build_actor_obs_td
 
 if TYPE_CHECKING:
+  from supermimic.tasks.imagined_vision import DepthVision
   from supermimic.tasks.walk_terrain import TerrainObservation
   from supermimic.models import Dynamics
   from supermimic.replay_buffer import ReplayBuffer
@@ -42,7 +43,12 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     terrain_query: TerrainObservation | None = None,
     actor_sees_terrain: bool = False,
     use_root_waypoints: bool = False,
+    vision: DepthVision | None = None,
   ) -> None:
+    self.vision = vision
+    self.imagined_camera = None
+    self.future_feet = None
+    self._sensed_terrain = None
     self.task_specs = task_specs
     self.terrain_query = terrain_query
     self.actor_sees_terrain = actor_sees_terrain
@@ -59,6 +65,31 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       device=device,
     )
 
+  def _on_reset(self, batch: TensorDict) -> None:
+    if self.future_feet is not None:
+      self.terrain_query.bind_replay(batch)
+    if self.vision is not None:
+      from supermimic.tasks.imagined_vision import noise_ranges, unpack_depth
+      with torch.no_grad():
+        ranges = (self.imagined_camera.ranges(self.aux_state) if self.imagined_camera is not None
+                  else unpack_depth(batch["camera_pixels"]))
+        self.camera_latent = self.vision.encode(noise_ranges(ranges))
+    super()._on_reset(batch)
+
+  def _wm_step(self, rep_state, aux_state, action, last_action, sim_ctx):
+    result = super()._wm_step(rep_state, aux_state, action, last_action, sim_ctx,
+                              sensed_terrain=self._sensed_terrain)
+    vision = self.vision
+    if vision is not None:
+      from supermimic.tasks.imagined_vision import noise_ranges
+      with torch.no_grad():
+        next_aux, next_state = result[:2]
+        if self.imagined_camera is not None:
+          self.camera_latent = vision.encode(noise_ranges(self.imagined_camera.ranges(next_aux)))
+        else:
+          self.camera_latent = vision.next_latent(self.camera_latent, next_state, action)
+    return result
+
   def _build_task_goals(self) -> None:
     # The anchor task's goal is the actor goal already built in _update_goal; reuse it.
     anchor, *rest = self.task_specs
@@ -73,10 +104,19 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       self._task_goal_obs, self._sensor_history(), critic=self._critic_obs()
     )
     if self.terrain_query is not None:
-      patch = self.terrain_query.features(self.aux_state)
+      if self.future_feet is not None:
+        patch, tokens = self.terrain_query.features_and_tokens(self.aux_state)
+        obs["depth_tokens"] = tokens
+        obs["future_feet"] = self.future_feet(self.motion_times)
+        # reset() and step() both rebuild observations from the current pose.
+        self._sensed_terrain = patch if self.dynamics.terrain_query is self.terrain_query else None
+      else:
+        patch = self.terrain_query.features(self.aux_state)
       obs["critic"] = torch.cat([obs["critic"], patch], dim=-1)
       if self.actor_sees_terrain:
         obs["terrain"] = patch
+    if self.vision is not None:
+      obs["camera_latent"] = self.camera_latent.detach()
     if self.use_root_waypoints:
       obs["root_waypoints"] = root_waypoints(self._wm_goal_obs)
     return obs

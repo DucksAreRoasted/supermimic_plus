@@ -40,7 +40,9 @@ from supermimic.runners.exporter import export_actor_as_onnx
 from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
 from supermimic.runners.sim_calibration_window import SimulatorWindow
 from supermimic.sim_context import SimContext
-from supermimic.tasks.walk_terrain import TerrainObservation, WalkTerrain
+from supermimic.tasks.depth_mimic import DepthMemory, walking_camera
+from supermimic.tasks.foot_depth_actor import FootDepthFusion, FutureFeet, MeasuredPatch, file_hash
+from supermimic.tasks.walk_terrain import IrregularWalkTerrain, TerrainObservation, WalkTerrain
 from supermimic.tasks.task_spec import (
   TasksCfg,
   build_actor_obs_td,
@@ -67,6 +69,7 @@ class BaseRunnerCfg:
   actor_obs: str = "rep_state"  # "rep_state" or "proprio"
   log_interval: int = 10
   save_interval: int = 1000
+  keep_iteration_checkpoints: bool = False
   history_length: int = 1
   termination_softness: float = 0.05
   dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
@@ -78,6 +81,12 @@ class BaseRunnerCfg:
   """Optional narrower residual head for lower-cost correction experiments."""
   residual_shared_trunk: bool = False
   """Share the World Model trunk and use a zero-initialized residual output head."""
+  shared_head_width: int = 0
+  """Hidden width per nonlinear world-model head; zero uses the original linear heads."""
+  imagined_vision: Literal["none", "render", "latent"] = "none"
+  depth_fusion: Literal["none", "concat"] = "none"
+  cache_motion_reference: bool = False
+  terrain_landscape_seed: int | None = None
   residual_low_rank: int | None = None
   """Use low-rank factorized residual layers with this bottleneck rank."""
   reference_residual_policy: bool = False
@@ -94,15 +103,26 @@ class BaseRunnerCfg:
   terrain_lateral_height: float = 0.0
   terrain_inputs: Literal["blind", "actor", "actor-world"] = "blind"
   """All rough-terrain arms use the same privileged Critic."""
+  terrain_height_reset: bool = False
+  """Add the ground elevation at the sampled pelvis XY to the initial pose."""
   use_root_waypoints: bool = False
   """Add the current and near-future reference root XY to the terrain policy."""
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
   def configure_terrain(self, env_cfg) -> None:
+    if self.imagined_vision != "none" and (self.depth_fusion != "concat" or not self.shared_head_width):
+      raise ValueError("Imagined vision requires the camera-enabled dual-head G1 model")
+    if self.terrain_height_reset and (self.terrain_height <= 0 or self.cuda_graph_collection):
+      raise ValueError("Terrain-height resets require a walking course and the motion-command reset path")
     if self.use_root_waypoints and (not self.terrain_height or self.terrain_inputs == "blind"):
       raise ValueError("Root waypoint transfer requires a terrain-conditioned actor")
     if self.terrain_lateral_height<0 or (self.terrain_lateral_height and self.terrain_height<=0):
       raise ValueError("Cross-slope training requires a positive course height and nonnegative lateral height")
+    if self.depth_fusion != "none":
+      if (self.terrain_inputs != "actor-world" or self.history_length != 1 or self.reference_residual_policy
+          or self.mirror_augmentation or self.cuda_graph_collection):
+        raise ValueError("Depth fusion needs actor-world terrain, single-frame input and a camera-enabled collection step")
+      env_cfg.scene.sensors = (*env_cfg.scene.sensors, walking_camera())
     if self.terrain_height == 0 and self.terrain_inputs == "blind":
       return
     if self.terrain_height <= 0 or self.representation != "gencoord":
@@ -112,7 +132,16 @@ class BaseRunnerCfg:
     env_cfg.scene.spec_fn = WalkTerrain(
       self.terrain_height, self.terrain_phase_cells, lateral_height=self.terrain_lateral_height
     )
+    if self.terrain_landscape_seed is not None:
+      env_cfg.scene.spec_fn = IrregularWalkTerrain(height=self.terrain_height, lateral_height=self.terrain_lateral_height,
+                                                  landscape_seed=self.terrain_landscape_seed)
+      env_cfg.sim.nconmax = max(env_cfg.sim.nconmax or 0, 256)
+      env_cfg.sim.njmax = max(env_cfg.sim.njmax or 0, 1024)
     env_cfg.scene.env_spacing = 0.
+    if self.terrain_height_reset:
+      from supermimic.tasks.terrain_reset import TerrainResetMotionCommandCfg
+
+      env_cfg.commands["motion"] = TerrainResetMotionCommandCfg.from_motion(env_cfg.commands["motion"])
 
 
 BpttCfg = Annotated[BpttPolicyLearnerCfg, tyro.conf.subcommand(name="bptt")]
@@ -123,6 +152,7 @@ ActorCriticCfg = Annotated[
 
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
+  actor_microbatch_size: int | None = None
   critic_variant: Literal["official", "twin", "sim-calibrated"] = "official"
   twin_actor_aggregation: Literal["mean", "min", "kappa"] = "mean"
   twin_aggregation_kappa: float = 0.0
@@ -132,6 +162,7 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   sim_calibration_interval: int = 1
   sim_calibration_epochs: int = 2
   """Number of Critic regression passes over each fixed simulator target."""
+  init_depth_adapter: str | None = None
   init_model_dir: str | None = None
   """Optional local actor/world-model/critic checkpoint to warm-start from."""
   """Official single critic is unchanged; twin is an isolated experiment."""
@@ -187,13 +218,24 @@ class WorldModel:
   def bundle(self) -> dict:
     """The ``world_model.pt`` contents."""
     return {
+      "shared_head_width": self.dynamics.shared_head_width,
       "dynamics": self.dynamics.state_dict(),
       "sim_context": self.sim_context.state_dict(),
     }
 
-  def load_bundle(self, bundle: dict) -> None:
+  def load_bundle(self, bundle: dict, *, initialize_new_heads: bool = False) -> None:
     """Load a ``world_model.pt`` bundle."""
-    self.dynamics.load_state_dict(bundle["dynamics"])
+    state = bundle["dynamics"]
+    if (initialize_new_heads and self.dynamics.shared_head_width and not bundle.get("shared_head_width")
+        and "residual_head.weight" in state and not any(k.startswith("head_mlps.") for k in state)):
+      # Only a complete legacy linear pair may initialize the new zero-output branches.
+      additions = {"head_mlps." + k: v for k, v in self.dynamics.head_mlps.state_dict().items()}
+      for i in range(2):
+        for field_name in ("weight", "bias"):
+          key = f"head_mlps.{i}.2.{field_name}"
+          additions[key] = torch.zeros_like(additions[key])
+      state = {**state, **additions}
+    self.dynamics.load_state_dict(state)
     self.sim_context.load_state_dict(bundle["sim_context"])
 
 
@@ -267,9 +309,15 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     residual_scale=cfg.residual_scale,
     residual_hidden_dims=cfg.residual_hidden_dims,
     residual_shared_trunk=cfg.residual_shared_trunk,
+    shared_head_width=cfg.shared_head_width,
     residual_low_rank=cfg.residual_low_rank,
     terrain_query=terrain_query if cfg.terrain_inputs == "actor-world" else None,
   ).to(device)
+
+  if cfg.imagined_vision != "none":
+    from supermimic.tasks.imagined_vision import DepthVision
+    with torch.random.fork_rng(devices=[]):
+      dynamics.vision = DepthVision(cfg.imagined_vision, representation.rep_state_dim, num_actions).to(device)
 
   return WorldModel(
     representation=representation,
@@ -307,6 +355,13 @@ def build_actor(
     terrain_obs_dim=TerrainObservation.num_features if cfg.terrain_inputs != "blind" else 0,
     use_root_waypoints=cfg.use_root_waypoints,
   ).to(device)
+  if cfg.depth_fusion != "none":
+    actor.foot_depth_fusion = FootDepthFusion(cfg.depth_fusion, representation.fk.joint_names).to(device)
+  if cfg.imagined_vision != "none":
+    from supermimic.tasks.imagined_vision import LATENT_DIM
+    with torch.random.fork_rng(devices=[]):
+      actor.visual_action = nn.Linear(LATENT_DIM, wm.num_actions, bias=False).to(device)
+      nn.init.zeros_(actor.visual_action.weight)
   if cfg.reference_residual_policy:
     return ReferenceResidualPolicy(
       actor,
@@ -436,13 +491,22 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       },
     )
 
+    self.depth_memory = None
+    if self.cfg.depth_fusion != "none":
+      sensor = self.env.unwrapped.scene["walk_depth"]
+      self.depth_memory = DepthMemory(self.env.num_envs, self.device, self.env.unwrapped.step_dt, sensor.cfg.pattern)
+      self.sim_depth = MeasuredPatch(wm.terrain_query.offsets)
+      self.future_feet = FutureFeet(self.motion_cmd, cache_reference=self.cfg.cache_motion_reference)
+      self.imagination_depth = MeasuredPatch(wm.terrain_query.offsets)
+      self._dynamics.terrain_query = self.imagination_depth
+      self.world_model_learner.depth_patch = self.imagination_depth
     self._pending_norm_updates: list[tuple] = []
     self._sim_history: torch.Tensor | None = None
     # Keep only one finite simulator-return window. Storing every 4096-env
     # critic observation on GPU would grow without bound over a long run.
     self._sim_calibration_window = (
       SimulatorWindow(self.cfg.sim_calibration_horizon)
-      if self.cfg.critic_variant == "sim-calibrated" else None
+      if self.cfg.critic_variant == "sim-calibrated" and self.cfg.sim_calibration_weight > 0 else None
     )
 
   def _seed_sim_history(self) -> None:
@@ -542,6 +606,12 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "terminated": FieldSpec(dtype=torch.bool),
       "truncated": FieldSpec(dtype=torch.bool),
     }
+    if getattr(self.cfg, "depth_fusion", "none") != "none":
+      if self.cfg.imagined_vision != "none":
+        from supermimic.tasks.imagined_vision import PIXELS
+        schema["camera_pixels"] = FieldSpec(PIXELS, torch.uint8)
+      schema["depth_image"] = FieldSpec(2 * 25 * 25, torch.float16)
+      schema["depth_origin"] = FieldSpec(6)
     if self._stores_actor_obs:
       schema["actor_obs"] = FieldSpec(
         self._representation.proprio_obs_dim(self._num_actions)
@@ -582,8 +652,44 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       for key in critics.state_dict():
         if key == "0.weight" or key.endswith(".0.weight"):
           extend_terrain_projection(critic_state, critics, key)
+    if self.cfg.init_depth_adapter:
+      bundle = torch.load(self.cfg.init_depth_adapter, map_location=self.device, weights_only=True)
+      if (bundle["mode"] != self.cfg.depth_fusion or bundle["joint_names"] != list(self.motion.fk.joint_names)
+          or bundle["base_sha256"] != file_hash(required[0])
+          or any(k.startswith("foot_depth_fusion.") for k in actor_state)):
+        raise ValueError("Depth adapter must match the base Actor, joint order and configured fusion")
+      actor_state.update({"foot_depth_fusion." + k: v for k, v in bundle["state_dict"].items()})
+    # Transfer the verified dual-head baseline into a new visual branch. Strict loading
+    # still checks every existing tensor and rejects partial visual checkpoints.
+    if self.cfg.imagined_vision != "none":
+      source_cfg = json.loads((model_dir / "run_manifest.json").read_text())["runner_cfg"]
+      source_mode = source_cfg.get("imagined_vision", "none")
+      if source_mode == "none":
+        from_flat = (source_cfg["depth_fusion"] == "none" and source_cfg["terrain_inputs"] == "blind"
+                     and source_cfg["terrain_height"] == 0 and self.cfg.depth_fusion == "concat")
+        for field in ("shared_head_width", "residual_correction", "residual_shared_trunk",
+                      "use_root_waypoints", "latent_prior_weight",
+                      "latent_prior_blend", "sim_calibration_weight", "critic_variant"):
+          if source_cfg[field] != getattr(self.cfg, field):
+            raise ValueError(f"Visual transfer disagrees with source checkpoint on {field}")
+        if from_flat:
+          if not self.cfg.init_depth_adapter:
+            if any(k.startswith("foot_depth_fusion.") for k in actor_state):
+              raise ValueError("Flat Actor unexpectedly contains a depth adapter")
+            # The modulator's final weight and bias start at zero, preserving base actions.
+            actor_state.update({"foot_depth_fusion." + k: v for k, v in actor.foot_depth_fusion.state_dict().items()})
+        elif source_cfg["depth_fusion"] != self.cfg.depth_fusion:
+          raise ValueError("Visual transfer requires compatible depth fusion")
+        if "visual_action.weight" in actor_state or any(k.startswith("vision.") for k in wm_state["dynamics"]):
+          raise ValueError("Unexpected vision parameters in baseline checkpoint")
+        actor_state["visual_action.weight"] = torch.zeros_like(actor.visual_action.weight)
+        wm_state["dynamics"] = {**wm_state["dynamics"], **{
+          "vision." + k: v for k, v in self._dynamics.vision.state_dict().items()
+        }}
+      elif source_mode != self.cfg.imagined_vision:
+        raise ValueError(f"Cannot initialize {self.cfg.imagined_vision} vision from {source_mode}")
     actor.load_state_dict(actor_state, strict=True)
-    self._wm.load_bundle(wm_state)
+    self._wm.load_bundle(wm_state, initialize_new_heads=True)
     critics.load_state_dict(critic_state, strict=True)
     print(f"[INFO] Warm-started actor, world model, and critic from {model_dir}")
 
@@ -687,6 +793,14 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "created_at": datetime.now().astimezone().isoformat(),
       "command": shlex.join(sys.argv),
     }
+    if manifest["critic_variant"] == "sim-calibrated":
+      manifest["imagined_rollouts_per_policy_update_batch"] = 1 if self.cfg.sim_calibration_weight == 0 else 2
+    if self.cfg.keep_iteration_checkpoints or getattr(self.cfg, "depth_fusion", "none") != "none":
+      manifest["motion_files"] = self.motion_cmd.cfg.motion_file
+      manifest["seed"] = self.env.cfg.seed
+      manifest["base_sha256"] = {name: file_hash(Path(self.cfg.init_model_dir) / name)
+                                 for name in ("actor.pt", "world_model.pt", "critic.pt")} if self.cfg.init_model_dir else None
+      manifest["adapter_sha256"] = file_hash(Path(self.cfg.init_depth_adapter)) if self.cfg.init_depth_adapter else None
     (log_dir / "run_manifest.json").write_text(
       json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
       encoding="utf-8",
@@ -759,10 +873,27 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       terrain_query=self._wm.terrain_query,
       actor_sees_terrain=self.cfg.terrain_inputs != "blind",
       use_root_waypoints=self.cfg.use_root_waypoints,
+      vision=self._dynamics.vision,
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
       device=self.device,
     )
+    if self.cfg.depth_fusion != "none":
+      self.wm_env.terrain_query = self.imagination_depth
+      self.wm_env.future_feet = self.future_feet
+      if self.cfg.cache_motion_reference:
+        self.wm_env.reference_body_state = self.future_feet.body_state
+    if self.cfg.imagined_vision == "render":
+      from supermimic.tasks.imagined_vision import ImaginedCamera
+      self.wm_env.imagined_camera = ImaginedCamera(self.env, self.device, policy_cfg.batch_size)
+    if (
+      self.cfg.imagined_vision != "none" and self.cfg.representation == "gencoord"
+      and torch.device(self.device).type == "cuda"
+      and (os.getenv("SUPERMIMIC_DISABLE_COMPILE") == "1" or os.getenv("TORCH_COMPILE_DISABLE") == "1")
+    ):
+      from supermimic.utils.warp_fk import WarpForwardKinematics
+      self._representation.fk = WarpForwardKinematics(self._representation.fk)
+      print("[INFO] Eager visual rollout uses fused G1 forward kinematics and its input adjoint")
     if torch.cuda.is_available() and os.getenv("SUPERMIMIC_DISABLE_COMPILE") != "1":
       self.wm_env.step = torch.compile(self.wm_env.step)
       self.wm_env.reset = torch.compile(self.wm_env.reset)
@@ -770,6 +901,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     self._configure_reset_sampling()
 
     if isinstance(policy_cfg, ActorCriticPolicyLearnerCfg):
+      if self.cfg.actor_microbatch_size is not None and (
+        self.cfg.critic_variant != "sim-calibrated" or self.cfg.history_length != 1
+        or self.cfg.slot_mix.get("motion") != 1.0 or self.cfg.actor_microbatch_size < 1
+      ):
+        raise ValueError("Actor microbatching supports single-frame, motion-only sim-calibrated runs")
       if self.cfg.critic_variant in {"official", "sim-calibrated"}:
         learner_cls = (
           SimulatorCalibratedActorCriticLearner
@@ -778,16 +914,17 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         )
         learner_kwargs = {}
         if self.cfg.critic_variant == "sim-calibrated":
+          learner_kwargs["sim_calibration_weight"] = self.cfg.sim_calibration_weight
+          learner_kwargs["actor_microbatch_size"] = self.cfg.actor_microbatch_size
           learner_kwargs["sim_lambda"] = self.cfg.sim_calibration_lambda
           learner_kwargs["sim_calibration_epochs"] = self.cfg.sim_calibration_epochs
           learner_kwargs["sim_calibration_horizon"] = self.cfg.sim_calibration_horizon
-          learner_kwargs["sim_calibration_batch_size"] = policy_cfg.batch_size
-          learner_kwargs["sim_critic_input_dim"] = critic_input_dim
+          if self.cfg.sim_calibration_weight > 0:
+            learner_kwargs["sim_calibration_batch_size"] = policy_cfg.batch_size
+            learner_kwargs["sim_critic_input_dim"] = critic_input_dim
         self.policy_learner = learner_cls(
           actor, critic1, self.wm_env, policy_cfg, device=self.device, **learner_kwargs
         )
-        if self.cfg.critic_variant == "sim-calibrated":
-          self.policy_learner.sim_calibration_weight = self.cfg.sim_calibration_weight
       else:
         assert critic2 is not None
         self.policy_learner = TwinActorCriticPolicyLearner(
@@ -843,7 +980,20 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     }
     obs = build_actor_obs_td(goals, self._collection_history(sensor))
     if self.cfg.terrain_inputs != "blind":
-      obs["terrain"] = self._wm.terrain_query.features(aux_state)
+      if self.cfg.depth_fusion == "none":
+        obs["terrain"] = self._wm.terrain_query.features(aux_state)
+      else:
+        data = self.env.unwrapped.scene["walk_depth"].data
+        ranges = data.distances
+        noisy = torch.where(ranges > 0, ranges + .005 * torch.randn_like(ranges), ranges)
+        noisy = noisy.masked_fill(torch.rand_like(ranges) < .15, -1)
+        self.depth_memory.update(noisy, data.pos_w, data.quat_w)
+        if self._dynamics.vision is not None:
+          obs["camera_latent"] = self._dynamics.vision.encode(noisy).detach()
+        self.sim_depth.bind(*self.sim_depth.capture(self.depth_memory))
+        obs["terrain"] = self.sim_depth.features(aux_state)
+        obs["depth_tokens"] = self.sim_depth.tokens(aux_state)
+        obs["future_feet"] = self.future_feet(motion_times)
     if self.cfg.use_root_waypoints:
       full_goal, _ = self._representation.compute_wm_goal(self.motion, motion_times, aux_state)
       obs["root_waypoints"] = root_waypoints(full_goal)
@@ -910,14 +1060,22 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       actor_td = self._build_sim_obs_td(
         rep_state, aux_state, sim_actor_obs, motion_times, sim_ctx
       )
-      critic_obs = self._build_critic_obs(
-        rep_state, aux_state, motion_times, sim_ctx
-      ).detach()
+      window = self._sim_calibration_window
+      if window is not None:
+        critic_obs = self._build_critic_obs(
+          rep_state, aux_state, motion_times, sim_ctx
+        ).detach()
 
       actions = self.policy_learner.actor(actor_td)
       actions = actions + torch.randn_like(actions) * self.policy_learner.cfg.noise
 
       extra_fields = {"sim_ctx": sim_ctx}
+      if self.depth_memory is not None:
+        extra_fields["depth_image"] = self.sim_depth.image.flatten(1).to(torch.float16)
+        extra_fields["depth_origin"] = self.sim_depth.origin
+        if self._dynamics.vision is not None:
+          from supermimic.tasks.imagined_vision import pack_depth
+          extra_fields["camera_pixels"] = pack_depth(self.env.unwrapped.scene["walk_depth"].data.distances)
       if self._stores_actor_obs:
         extra_fields["actor_obs"] = sim_actor_obs
 
@@ -930,7 +1088,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       terminated = self.env.unwrapped.termination_manager.terminated
       manager = self.env.unwrapped.termination_manager
       truncated = manager.time_outs.to(self.device, torch.bool)
-      if self.cfg.critic_variant == "sim-calibrated":
+      if window is not None:
         next_full_state = next_obs["full_state"].to(self.device)
         next_rep_state = self._representation.represent(next_full_state)
         next_aux_state = self._representation.extract_aux_state(next_full_state)
@@ -941,13 +1099,14 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           self.motion_cmd.time_steps.to(self.device),
           next_sim_ctx,
         ).detach()
-        assert self._sim_calibration_window is not None
-        self._sim_calibration_window.append(
+        window.append(
           critic_obs, next_critic_obs, rewards, dones, terminated, manager.get_term("motion_end")
         )
+      if self.depth_memory is not None:
+        self.depth_memory.reset(dones.bool())
       self._advance_sim_history(next_obs["actor"].to(self.device), dones)
       self.logger.process_env_step(
-        rewards, dones.bool() if self._sim_calibration_window is not None else terminated, extras
+        rewards, dones.bool() if self.cfg.critic_variant == "sim-calibrated" else terminated, extras
       )
       if self.cfg.failure_priority:
         self.replay_buffer.update_failure_priority(
@@ -1017,9 +1176,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         wm_learn_time += time.time() - start_wm_time
 
         start_policy_time = time.time()
-        if self.cfg.critic_variant == "sim-calibrated":
-          window = self._sim_calibration_window
-          assert window is not None
+        window = self._sim_calibration_window
+        if window is not None:
           self.policy_learner.clear_simulator_batch()
           if step % self.cfg.sim_calibration_interval == 0 and window.full:
             self.policy_learner.set_simulator_batch(*window.batch())
@@ -1027,6 +1185,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         self._update_ema_actor()
         policy_learn_time += time.time() - start_policy_time
 
+        if self.cfg.shared_head_width:
+          metrics = torch.stack([v.reshape(()) for v in (*wm_logs.values(), *policy_logs.values())])
+          if not metrics.isfinite().all().item():
+            raise FloatingPointError(f"Non-finite training metrics at iteration {step + 1}")
         loss_dict.update(wm_logs)
         loss_dict.update(policy_logs)
 
@@ -1055,20 +1217,28 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         step + 1
       ) % self.cfg.save_interval == 0 or step + 1 == self.cfg.max_iterations:
         # The previous version must be logged before its files are overwritten.
-        world_model_path = str(log_dir / "world_model.pt")
-        actor_path = str(log_dir / "actor.pt")
+        save_dir = log_dir
+        if self.cfg.keep_iteration_checkpoints or self.cfg.depth_fusion != "none":
+          checkpoints = log_dir / "checkpoints"
+          save_dir = checkpoints / f".writing-{step + 1:06d}"
+          save_dir.mkdir(parents=True)
+          manifest = json.loads((log_dir / "run_manifest.json").read_text())
+          manifest["iteration"] = step + 1
+          (save_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        world_model_path = str(save_dir / "world_model.pt")
+        actor_path = str(save_dir / "actor.pt")
         torch.save(self._wm.bundle(), world_model_path)
         torch.save(self.policy_learner.actor.state_dict(), actor_path)
         checkpoint_files = [world_model_path, actor_path]
         if self._ema_actor_state is not None:
-          ema_actor_path = str(log_dir / "ema_actor.pt")
+          ema_actor_path = str(save_dir / "ema_actor.pt")
           torch.save(self._ema_actor_state, ema_actor_path)
           checkpoint_files.append(ema_actor_path)
         critics = getattr(self.policy_learner, "critics", None)
         if critics is None:
           critics = getattr(self.policy_learner, "critic", None)
         if critics is not None:
-          critic_path = str(log_dir / "critic.pt")
+          critic_path = str(save_dir / "critic.pt")
           torch.save(critics.state_dict(), critic_path)
           checkpoint_files.append(critic_path)
         # Skip ONNX export on huge datasets.
@@ -1083,6 +1253,12 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
             run_name=self.cfg.run_name or self.task_id,
             term_widths=self._representation.proprio_term_widths(self._num_actions),
           )
+        if save_dir != log_dir:
+          saved = save_dir.rename(checkpoints / f"iter-{step + 1:06d}")
+          link = log_dir / ".next-checkpoint"
+          link.symlink_to(saved.relative_to(log_dir), target_is_directory=True)
+          link.replace(log_dir / "latest")
+          checkpoint_files = [str(saved / Path(f).name) for f in checkpoint_files]
         print(f"[INFO] Saved checkpoint: {', '.join(checkpoint_files)}")
 
     self._cleanup()

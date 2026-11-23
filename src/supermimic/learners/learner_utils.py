@@ -98,6 +98,11 @@ def _optimize_step(
   for optimizer in optimizers:
     optimizer.zero_grad(set_to_none=True)
   loss.backward()
+  return _step_with_grads(optimizers, params, max_norm, clip_value)
+
+
+def _step_with_grads(optimizers, params, max_norm, clip_value):
+  """Clip the complete gradient and apply one optimizer update."""
   grad_norm = None
   if params is not None and max_norm is not None:
     # Don't set error_if_nonfinite=True: it forces a per-step CPU<->GPU sync.

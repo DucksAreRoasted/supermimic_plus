@@ -10,6 +10,47 @@ from supermimic.tasks.walk_terrain import (
 )
 
 
+def test_terrain_reset_only_lifts_sampled_positions(monkeypatch):
+  from mjlab.tasks.tracking.mdp.commands import MotionCommand
+  from supermimic.tasks.terrain_reset import TerrainResetMotionCommand
+
+  ground = TerrainObservation(IrregularWalkTerrain(height=0.09, landscape_seed=701))
+  cmd = object.__new__(TerrainResetMotionCommand)
+  cmd.ground = ground
+  ids = torch.tensor([5, 1])
+  roots = torch.tensor([[1., 0., .8], [32., 0., .7]])
+  original = roots.clone()
+  extra = tuple(torch.ones((2, width)) for width in (4, 3, 3, 29, 29))
+  captured = []
+  monkeypatch.setattr(MotionCommand, "_write_reference_state_to_sim",
+                      lambda self, *args: captured.append(args))
+  cmd._write_reference_state_to_sim(ids, roots, *extra)
+  out_ids, placed, *unchanged = captured.pop()
+  expected = ground.height_at(original[:, :2])
+  assert expected[0] > 0 and expected[1] == 0
+  assert out_ids is ids and all(a is b for a, b in zip(unchanged, extra, strict=True))
+  torch.testing.assert_close(roots, original)
+  torch.testing.assert_close(placed[:, :2], original[:, :2])
+  torch.testing.assert_close(placed[:, 2], original[:, 2] + expected)
+
+
+def test_terrain_reset_preserves_motion_configuration():
+  from dataclasses import asdict
+  from mjlab.tasks.registry import load_env_cfg
+  from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
+  from supermimic.tasks.terrain_reset import TerrainResetMotionCommandCfg
+
+  cfg = load_env_cfg("SuperMimic-GenCoord-G1", play=False)
+  motion = cfg.commands["motion"]
+  common = dict(terrain_height=0.09, terrain_landscape_seed=701)
+  SuperMimicRunnerCfg(**common).configure_terrain(cfg)
+  assert cfg.commands["motion"] is motion
+  changed = load_env_cfg("SuperMimic-GenCoord-G1", play=False)
+  SuperMimicRunnerCfg(**common, terrain_height_reset=True).configure_terrain(changed)
+  assert isinstance(changed.commands["motion"], TerrainResetMotionCommandCfg)
+  assert asdict(changed.commands["motion"]) == asdict(motion)
+
+
 @pytest.mark.parametrize(
   "course",
   [

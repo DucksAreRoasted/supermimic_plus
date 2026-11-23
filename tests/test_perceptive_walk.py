@@ -7,6 +7,7 @@ from mjlab.asset_zoo.robots.unitree_g1.g1_constants import get_spec
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
 from mjlab.utils.forward_kinematics import ForwardKinematics
 
+from supermimic import representations
 from supermimic.representations import (
   _assemble_goal,
   goal_window_indices,
@@ -78,6 +79,28 @@ def motion_window(tmp_path):
     SimpleNamespace(motion=motion, robot=robot, cfg=SimpleNamespace(body_names=ankles)),
     0.02,
   )
+
+
+def test_wm_goal_reuses_one_frame_lookup_and_preserves_root_gradients(motion_window, monkeypatch):
+  motion = motion_window.motion
+  times = torch.cat((torch.zeros_like(motion.motion_ends[:1]), motion.motion_ends - 1))
+  root = torch.cat((motion.root_pos_w[times], motion.root_quat_w[times]), -1).detach().requires_grad_()
+  idx = goal_window_indices(motion, times)
+  expected = _assemble_goal(motion_goal_window(motion, times), root[:, :3], root[:, 3:7],
+                            motion.root_pos_w[idx], motion.root_quat_w[idx])
+  calls = []
+  def counted(loader, frames):
+    calls.append(frames)
+    return goal_window_indices(loader, frames)
+  monkeypatch.setattr(representations, "goal_window_indices", counted)
+  rep = representations.GenCoordRepresentation(motion.joint_pos.shape[-1], motion.joint_pos[0])
+  actual = rep.compute_wm_goal(motion, times, root)
+  assert len(calls) == 1
+  for a, b in zip(actual, expected, strict=True):
+    torch.testing.assert_close(a, b)
+  def gradient(goals):
+    return torch.autograd.grad(sum(t.sum() for t in goals), root)[0]
+  torch.testing.assert_close(gradient(actual), gradient(expected))
 
 
 def test_flat_or_unknown_keeps_raw_goal(motion_window):

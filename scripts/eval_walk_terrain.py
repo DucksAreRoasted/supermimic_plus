@@ -24,6 +24,12 @@ from supermimic.tasks.depth_mimic import (
   DepthTrackingController,
   walking_camera,
 )
+from supermimic.tasks.foot_depth_actor import (
+  FutureFeet,
+  MeasuredPatch,
+  file_hash,
+  load_fusion,
+)
 from supermimic.tasks.perceptive_walk import (
   LocalGroundScan,
   TerrainMotionWindow,
@@ -110,6 +116,14 @@ def render_walk(path, model, poses, reference, dt):
 @torch.inference_mode()
 def evaluate(args):
   device = args.device
+  actor_cfg = checkpoint_config(args.driver or args.checkpoint)
+  embedded = actor_cfg.depth_fusion != "none"
+  if embedded and args.fusion_checkpoint:
+    raise ValueError("This Actor already includes its trained depth adapter")
+  learned_fusion = embedded or args.fusion_checkpoint is not None
+  fusion_eval = learned_fusion or args.record_fusion_bank
+  if fusion_eval and (args.perception != "depth" or args.stride_gain):
+    raise ValueError("Learned fusion requires raw depth and unmodified motion")
   course = WalkTerrain(args.height, args.phase, lateral_height=args.lateral_height)
   if args.landscape_seed is not None:
     course = IrregularWalkTerrain(
@@ -173,15 +187,22 @@ def evaluate(args):
     )
     wm.dynamics.eval()
     models = {str(args.checkpoint): wm}
+    measured_models = {str(args.checkpoint)} if model_cfg.depth_fusion != "none" else set()
     for path in args.compare_world_models:
-      other = build_world_model(checkpoint_config(path), env, device)
+      other_cfg = checkpoint_config(path)
+      if other_cfg.depth_fusion != "none":
+        measured_models.add(str(path))
+      other = build_world_model(other_cfg, env, device)
       other.load_bundle(
         torch.load(path / "world_model.pt", map_location=device, weights_only=True)
       )
       other.dynamics.eval()
       models[str(path)] = other
-    actor_cfg = checkpoint_config(args.driver or args.checkpoint)
-    actor = build_actor(actor_cfg, wm, device)
+    driver_wm = wm
+    if actor_cfg.imagined_vision != "none" and args.driver and args.driver != args.checkpoint:
+      driver_wm = build_world_model(actor_cfg, env, device)
+      driver_wm.load_bundle(torch.load(args.driver / "world_model.pt", map_location=device, weights_only=True))
+    actor = build_actor(actor_cfg, driver_wm, device)
     actor.load_state_dict(
       torch.load(
         (args.driver or args.checkpoint) / "actor.pt",
@@ -207,6 +228,25 @@ def evaluate(args):
         prediction_steps=args.prediction_steps,
         stride_gain=args.stride_gain,
       )
+    if measured_models and not fusion_eval:
+      raise ValueError("Measuring online depth dynamics requires a depth-equipped driver")
+    if measured_models:
+      prediction_patch = MeasuredPatch(query.offsets)
+      for name in measured_models:
+        models[name].dynamics.terrain_query = prediction_patch
+    if fusion_eval:
+      patch = MeasuredPatch(query.offsets)
+      previous = torch.zeros(args.num_envs, env.num_actions, device=device)
+      records = []
+      if learned_fusion:
+        reference_feet = FutureFeet(m)
+        fusion_mode = actor_cfg.depth_fusion if embedded else load_fusion(
+          actor,
+          args.fusion_checkpoint,
+          (args.driver or args.checkpoint) / "actor.pt",
+          m.motion.fk.joint_names,
+          device,
+        )
     for i, t in enumerate(starts):
       m.reset_to_frame(torch.tensor([i], device=device), t)
     sim.scene.write_data_to_sim()
@@ -260,16 +300,24 @@ def evaluate(args):
     returns = torch.zeros_like(active, dtype=torch.float64)
     steps = torch.zeros_like(active, dtype=torch.long)
     body_error = torch.zeros_like(returns)
+    body_trace = []
     upper_error = torch.zeros_like(returns)
     scan_totals = {
       name: returns.new_zeros(())
       for name in ("error", "visible", "points", "bend", "coverage", "frames")
     }
+    fusion_deltas = torch.zeros(3, device=device, dtype=torch.float64)
     initial_scan_action_delta = None
     root_error = torch.zeros_like(returns)
+    if learned_fusion:
+      start_ref_xy = m.anchor_pos_w[:, :2].clone()
+      last_ref_xy = start_ref_xy.clone()
+      last_robot_xy = obs["full_state"][:, :2].clone()
+      termination_terms = {k: torch.zeros_like(active) for k in sim.termination_manager.active_terms}
     floor0 = query.height_at(obs["full_state"][:, :2])
     low, high = floor0, floor0
-    wm_metrics = {name: {h: [] for h in (1, 8, 32)} for name in models}
+    prediction_horizons = (1, 8, 16, 32)
+    wm_metrics = {name: {h: [] for h in prediction_horizons} for name in models}
     ankles = [m.cfg.body_names.index(s + "_ankle_roll_link") for s in ("left", "right")]
     upper = [
       i
@@ -304,7 +352,28 @@ def evaluate(args):
           terrain, heights, valid = controller.observe(
             ranges, data.pos_w, data.quat_w, offsets
           )
-          goal = controller.goal(goal, aux)
+          if fusion_eval:
+            image, origin = patch.capture(memory)
+            patch.bind(image, origin)
+            if measured_models and t % 32 == 0:
+              prediction_patch.bind(image, origin)
+            terrain = patch.features(aux)
+            if args.record_fusion_bank and t % 6 == 0 and active.any():
+              records.append(
+                {
+                  key: val[active].cpu()
+                  for key, val in dict(
+                    image=image,
+                    origin=origin,
+                    state=obs["full_state"],
+                    motion_time=m.time_steps,
+                    sim_ctx=ctx,
+                    prev_action=previous,
+                  ).items()
+                }
+              )
+          else:
+            goal = controller.goal(goal, aux)
         else:
           scan = LocalGroundScan(sensor.data)
           heights, valid = scan.at(offsets)
@@ -333,8 +402,29 @@ def evaluate(args):
         )
       if actor_cfg.use_root_waypoints:
         td["root_waypoints"] = root_waypoints(obs["goal"])
+      if learned_fusion:
+        td["depth_tokens"] = patch.tokens(aux)
+        td["future_feet"] = reference_feet(m.time_steps)
+      if actor_cfg.imagined_vision != "none":
+        if not depth:
+          raise ValueError("The visual policy needs its real depth sensor")
+        td["camera_latent"] = driver_wm.dynamics.vision.encode(ranges)
       actions = actor(td)
-      if depth:
+      if learned_fusion and t % 32 == 0:
+        head = actor.foot_depth_fusion
+        base = actor.decode_actions(td)
+        masked = td["depth_tokens"].clone()
+        masked[..., 2:] = 0
+        blind = head(base, masked, td["future_feet"])
+        if actor.visual_action is not None:
+          blind = blind + actor.visual_action(td["camera_latent"])
+        leg = head.legs.flatten()
+        fusion_deltas[0] += ((actions - base)[:, leg].abs().mean(-1) * active).sum()
+        fusion_deltas[1] += ((actions - blind)[:, leg].abs().mean(-1) * active).sum()
+        fusion_deltas[2] += active.sum()
+      if fusion_eval:
+        previous = actions.detach()
+      elif depth:
         actions = controller.action(actions, aux, state, terrain)
       if (
         t == 0
@@ -348,6 +438,8 @@ def evaluate(args):
         predictions[name] = model.dynamics(pred_state, actions, pred_aux, ctx)
       m._update_metrics()
       body_error += torch.where(active, m.metrics["error_body_pos"], 0.0)
+      if learned_fusion:
+        body_trace.append(m.metrics["error_body_pos"].detach().clone())
       if sensed:
         upper_distance = (
           m.body_pos_relative_w[:, upper] - m.robot_body_pos_w[:, upper]
@@ -358,16 +450,23 @@ def evaluate(args):
         controller.reset(done.bool())
       returns += torch.where(active, r, 0.0)
       steps += active.long()
+      if learned_fusion:
+        first_done = active & done.bool()
+        for name, occurred in termination_terms.items():
+          occurred |= first_done & sim.termination_manager.get_term(name).bool()
       active = active & ~done.bool()
       real = rep.extract_aux_state(obs["full_state"])
       root_error = torch.where(
         active, (real[:, :2] - m.anchor_pos_w[:, :2]).norm(dim=-1), root_error
       )
+      if learned_fusion:
+        last_ref_xy = torch.where(active[:, None], m.anchor_pos_w[:, :2], last_ref_xy)
+        last_robot_xy = torch.where(active[:, None], real[:, :2], last_robot_xy)
       height = query.height_at(real[:, :2])
       low = torch.where(active, torch.minimum(low, height), low)
       high = torch.where(active, torch.maximum(high, height), high)
       h = t % 32 + 1
-      if h not in (1, 8, 32) or not active.any():
+      if h not in prediction_horizons or not active.any():
         continue
       for name, (pred_aux, pred_state) in predictions.items():
         feet = rep.world_frame_bodies(pred_aux, pred_state)[0][:, ankles]
@@ -389,6 +488,18 @@ def evaluate(args):
             )
           )
         )
+    if args.record_fusion_bank:
+      args.record_fusion_bank.parent.mkdir(parents=True, exist_ok=True)
+      torch.save(
+        dict(
+          motion=str(args.motion.resolve()),
+          clip_sha256=file_hash(args.motion),
+          base_sha256=file_hash((args.driver or args.checkpoint) / "actor.pt"),
+          frames=len(m.motion.joint_pos),
+          tensors={k: torch.cat([r[k] for r in records]) for k in records[0]},
+        ),
+        args.record_fusion_bank,
+      )
     success = active & (root_error <= 0.4)
     if not args.flat:
       success &= (high - low) >= 0.02
@@ -405,6 +516,21 @@ def evaluate(args):
       )
       for i, t in enumerate(starts)
     ]
+    if learned_fusion:
+      displacement = last_ref_xy - start_ref_xy
+      distance = displacement.norm(dim=-1)
+      forward_xy = displacement / distance[:, None].clamp_min(1.e-6)
+      offset = last_robot_xy - last_ref_xy
+      along = (forward_xy * offset).sum(-1)
+      lateral = forward_xy[:, 0] * offset[:, 1] - forward_xy[:, 1] * offset[:, 0]
+      body_trace_cm = (100 * torch.stack(body_trace, dim=1)).cpu()
+      for i, row in enumerate(rows):
+        row["termination_terms"] = [name for name, occurred in termination_terms.items() if occurred[i]]
+        row["last_ref_displacement_m"] = float(distance[i])
+        row["last_along_error_m"] = float(along[i]) if distance[i] > 0.10 else None
+        row["last_lateral_error_m"] = float(lateral[i]) if distance[i] > 0.10 else None
+        row["body_error_trace_cm"] = body_trace_cm[i, : row["steps"]].tolist()
+        row["upper_body_error_cm"] = float(100 * upper_error[i] / row["steps"])
     report = dict(
       checkpoint=str(args.checkpoint),
       driver=str(args.driver or args.checkpoint),
@@ -415,6 +541,14 @@ def evaluate(args):
       phase_cells=args.phase,
       flat=args.flat,
       perception=args.perception,
+      fusion_mode=fusion_mode if learned_fusion else None,
+      fusion_sha256=file_hash(args.fusion_checkpoint or ((args.driver or args.checkpoint) / "actor.pt"))
+      if learned_fusion else None,
+      external_joint_compensation=bool(
+        depth
+        and not fusion_eval
+        and (controller.use_balance or controller.predictor is not None)
+      ),
       stride_gain=controller.stride_gain if depth else 0.0,
       depth_noise_m=args.depth_noise_m,
       depth_dropout=args.depth_dropout,
@@ -440,6 +574,10 @@ def evaluate(args):
       mean_body_error_cm=float(np.mean([r["mean_body_error_cm"] for r in rows])),
       windows_detail=rows,
     )
+    if learned_fusion:
+      total, masked, count = fusion_deltas.tolist()
+      report["mean_leg_action_delta_from_base"] = total / count
+      report["mean_leg_action_delta_masking_fusion_depth"] = masked / count
     if sensed:
       totals = {k: float(v) for k, v in scan_totals.items()}
       report["upper_body_links"] = [m.cfg.body_names[i] for i in upper]
@@ -555,6 +693,8 @@ def main():
     help="Illustrate the first passing window in this run",
   )
   parser.add_argument("--flat", action="store_true")
+  parser.add_argument("--record-fusion-bank", type=Path)
+  parser.add_argument("--fusion-checkpoint", type=Path)
   parser.add_argument(
     "--perception",
     choices=(

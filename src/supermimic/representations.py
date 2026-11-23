@@ -205,8 +205,11 @@ def motion_goal_window(
   ``[joint_pos(J), joint_vel(J)]``.
   """
   idx = goal_window_indices(motion, motion_times)
-  frames = torch.cat([motion.joint_pos[idx], motion.joint_vel[idx]], dim=-1)
-  return frames.reshape(frames.shape[0], -1)
+  return _joint_targets_at(motion, idx)
+
+
+def _joint_targets_at(motion: MotionLoader, idx: torch.Tensor) -> torch.Tensor:
+  return torch.cat((motion.joint_pos[idx], motion.joint_vel[idx]), dim=-1).flatten(1)
 
 
 def motion_anchor_window(
@@ -422,8 +425,9 @@ class StateRepresentation(nn.Module, ABC):
     The single goal-build path shared by the WM env, the task goal extractor, and
     the viewer so every site produces an identical layout.
     """
-    content = motion_goal_window(motion, motion_times)
-    target_pos, target_quat = motion_anchor_window(motion, motion_times)
+    idx = goal_window_indices(motion, motion_times)
+    content = _joint_targets_at(motion, idx)
+    target_pos, target_quat = motion.root_pos_w[idx], motion.root_quat_w[idx]
     root_pos, root_quat = aux_state[..., :3], aux_state[..., 3:7]
     return _compiled_assemble_goal(
       content, root_pos, root_quat, target_pos, target_quat

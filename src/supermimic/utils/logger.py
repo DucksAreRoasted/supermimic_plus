@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import statistics
-import time
 from collections import deque
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
+
+
+def _format_duration(seconds: float) -> str:
+  hours, remainder = divmod(int(seconds), 3600)
+  minutes, seconds_left = divmod(remainder, 60)
+  return f"{hours:02d}:{minutes:02d}:{seconds_left:02d}"
 
 
 class Logger:
@@ -144,8 +149,8 @@ class Logger:
     log_string += (
       f"""{"-" * width}\n"""
       f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
-      f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-      f"""{"ETA:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(eta))}\n"""
+      f"""{"Time elapsed:":>{pad}} {_format_duration(self.tot_time)}\n"""
+      f"""{"ETA:":>{pad}} {_format_duration(eta)}\n"""
     )
 
     return log_string

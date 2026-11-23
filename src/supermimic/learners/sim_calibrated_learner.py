@@ -1,11 +1,11 @@
-"""Official actor-critic learner with an extra real-simulator value update."""
+"""Imagined actor-critic updates with optional simulator value calibration."""
 
 from __future__ import annotations
 
 import torch
 from tensordict import TensorDict
 
-from supermimic.learners.learner_utils import _optimize_step
+from supermimic.learners.learner_utils import _optimize_step, _step_with_grads
 from supermimic.learners.policy_learner import ActorCriticPolicyLearner, gae_returns
 
 
@@ -23,20 +23,35 @@ def masked_sim_mean(x, valid, count):
   return torch.where(valid, x, 0.0).sum() / count
 
 
+def _critic_transition(obs, reward, done):
+  return TensorDict(
+    {"critic": obs["critic"].detach(), "reward": reward.detach(), "done": done.detach()},
+    batch_size=reward.shape,
+  )
+
+
 class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
   def __init__(
     self,
     *args,
     sim_lambda: float = 1.0,
+    sim_calibration_weight: float = 0.0,
     sim_calibration_horizon: int = 32,
     sim_calibration_batch_size: int | None = None,
     sim_critic_input_dim: int | None = None,
+    actor_microbatch_size: int | None = None,
     **kwargs,
   ):
     self.sim_calibration_epochs = int(kwargs.pop("sim_calibration_epochs", 1))
     if self.sim_calibration_epochs < 1:
       raise ValueError("sim_calibration_epochs must be at least 1")
     super().__init__(*args, **kwargs)
+    self.sim_calibration_weight = sim_calibration_weight
+    self.actor_microbatch_size = actor_microbatch_size
+    if actor_microbatch_size is not None and actor_microbatch_size < self.cfg.batch_size:
+      # Replaying a single graph for the full set of 32-step visual microbatches
+      # crashes on the L40. Keep this update eager while the WM uses its graph.
+      self._captured_update = self._update_from
     self.sim_lambda = sim_lambda
     self.sim_calibration_horizon = int(sim_calibration_horizon)
     self._simulator_obs: torch.Tensor | None = None
@@ -61,38 +76,67 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     value = super()._bootstrap(obs, survival, term_prob)
     return self._beta_v() * value
 
+  def _update_critic_before_actor(self, start):
+    rollout = []
+    with torch.no_grad():
+      obs = self.wm_env.reset(start)
+      for _ in range(self.cfg.horizon):
+        actions = self._rollout_actor(obs)
+        next_obs, reward, term_prob, _ = self.wm_env.step(actions)
+        rollout.append(_critic_transition(obs, reward, term_prob))
+        obs = next_obs
+    return self._fit_critic(rollout, obs)
+
   def _train_batch(self, start):
+    shared_rollouts = [] if self.sim_calibration_weight == 0 else None
+    if shared_rollouts is None:
+      critic_logs = self._update_critic_before_actor(start)
+
+    chunks = (start,) if self.actor_microbatch_size is None else start.split(self.actor_microbatch_size, dim=0)
+    for optimizer in self.actor_optimizers:
+      optimizer.zero_grad(set_to_none=True)
+    actor_logs = {}
+    for chunk in chunks:
+      weight = len(chunk) / len(start)
+      loss, logs = self._actor_objective(chunk, shared_rollouts)
+      (loss * weight).backward()
+      for key, value in logs.items():
+        actor_logs[key] = actor_logs.get(key, 0.0) + weight * value
+    grad_norm = _step_with_grads(self.actor_optimizers, self.actor_params, 1.0, self.cfg.grad_clip_value)
+
+    if shared_rollouts is not None:
+      # Join environments, not time: GAE must bootstrap each trajectory from
+      # its own terminal state. Fit once on the full effective batch.
+      steps, terminal = shared_rollouts[0]
+      if len(shared_rollouts) > 1:
+        steps = torch.cat([s for s, _ in shared_rollouts], dim=1)
+        terminal = torch.cat([v for _, v in shared_rollouts], dim=0)
+      critic_logs = self._fit_critic_batch(steps, terminal)
+    self._actor_updates += 1
+    return {**actor_logs, "grad_norm": grad_norm, "actor_beta_v": self._actor_beta_v, **critic_logs}
+
+  def _actor_objective(self, start, shared_rollouts=None):
     cfg = self.cfg
     obs = self.wm_env.reset(start)
-    survival = 1.0
-    rollout = []
-    for _ in range(cfg.horizon):
-      actions = self._rollout_actor(obs)
-      next_obs, reward, term_prob, _ = self.wm_env.step(actions)
-      rollout.append(TensorDict({"critic": obs["critic"].detach(), "reward": reward.detach(), "done": term_prob.detach()}, batch_size=reward.shape))
-      if cfg.survival_masking:
-        survival = survival * (1 - term_prob)
-      obs = next_obs
-    critic_logs = self._fit_critic(rollout, obs)
-    obs = self.wm_env.reset(start)
     reward_ret, aux_loss, survival = 0.0, 0.0, 1.0
+    critic_steps = []
     for t in range(cfg.horizon):
       actions = self._rollout_actor(obs)
-      obs, reward, term_prob, _ = self.wm_env.step(actions)
+      next_obs, reward, term_prob, _ = self.wm_env.step(actions)
+      if shared_rollouts is not None:
+        critic_steps.append(_critic_transition(obs, reward, term_prob))
+      obs = next_obs
       reward_ret = reward_ret + cfg.gamma**t * survival * reward
       aux_loss = aux_loss + getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
       if cfg.survival_masking:
         survival = survival * (1 - term_prob)
+    if shared_rollouts is not None:
+      shared_rollouts.append((torch.stack(critic_steps), obs["critic"].detach()))
     terminal = self._bootstrap(obs, survival, term_prob)
     total_return = reward_ret + terminal
     loss = (-total_return + aux_loss).mean()
-    grad_norm = _optimize_step(self.actor_optimizers, loss, self.actor_params, 1.0, cfg.grad_clip_value)
-    self._actor_updates += 1
-    return {
+    return loss, {
       "return": total_return.mean().detach(),
-      "grad_norm": grad_norm,
-      "actor_beta_v": self._actor_beta_v,
-      **critic_logs,
       **getattr(self.actor, "auxiliary_stats", lambda: {})(),
     }
 
@@ -164,11 +208,13 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     return super()._graph_state() + simulator_state
 
   def _fit_critic(self, rollout, last_obs) -> dict[str, torch.Tensor]:
-    sim_weight = getattr(self, "sim_calibration_weight", 0.0)
-    steps = torch.stack(rollout)
+    return self._fit_critic_batch(torch.stack(rollout), last_obs["critic"])
+
+  def _fit_critic_batch(self, steps, terminal_obs) -> dict[str, torch.Tensor]:
+    sim_weight = self.sim_calibration_weight
     with torch.no_grad():
       values = self.critic(steps["critic"])
-      last_value = self.critic(last_obs["critic"])
+      last_value = self.critic(terminal_obs)
     imagined_returns = gae_returns(
       values,
       last_value,
@@ -180,9 +226,7 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
     self.critic.requires_grad_(True)
     imagined_obs = steps["critic"].flatten(0, 1)
     imagined_targets = imagined_returns.flatten(0, 1).detach()
-    imagined_loss = torch.nn.functional.mse_loss(
-      self.critic(imagined_obs), imagined_targets
-    )
+    imagined_loss = torch.nn.functional.mse_loss(values.flatten(0, 1), imagined_targets)
 
     sim_loss = torch.zeros((), device=imagined_loss.device)
     sim_return = torch.zeros((), device=imagined_loss.device)
@@ -208,9 +252,10 @@ class SimulatorCalibratedActorCriticLearner(ActorCriticPolicyLearner):
           self.cfg.gamma,
           self.sim_lambda,
         ).clamp(max=self._v_max)
-      sim_prediction = self.critic(sim_obs[:-1].flatten(0, 1))
       sim_targets = sim_returns.flatten(0, 1).detach()
-      sim_loss = masked_sim_mean((sim_prediction - sim_targets).square(), valid, valid_count)
+      sim_loss = masked_sim_mean(
+        (sim_values.flatten(0, 1) - sim_targets).square(), valid, valid_count
+      )
       sim_return = masked_sim_mean(sim_targets, valid, valid_count)
 
     # Keep both return targets fixed while reusing this real simulator window.

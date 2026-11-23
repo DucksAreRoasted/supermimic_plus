@@ -64,6 +64,7 @@ class WorldModelEnv(ABC):
     self._num_actions = env.num_actions
     motion_cmd = env.unwrapped.command_manager.get_term("motion")
     self.motion = motion_cmd.motion
+    self.reference_body_state = self.motion.body_state
     self._anchor_index = motion_cmd.motion_anchor_body_index
 
     if termination_softness <= 0.0:
@@ -167,6 +168,8 @@ class WorldModelEnv(ABC):
     action: torch.Tensor,
     last_action: torch.Tensor,
     sim_ctx: torch.Tensor,
+    *,
+    sensed_terrain: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bundled dynamics + termination + reward for one env step.
 
@@ -176,9 +179,12 @@ class WorldModelEnv(ABC):
     score the post-step state against the cached reference body state, the way
     the simulator scores it before advancing the clip.
     """
-    next_aux_state, next_rep_state = self.dynamics(
-      rep_state, action, aux_state, sim_ctx
-    )
+    if sensed_terrain is None:
+      next_aux_state, next_rep_state = self.dynamics(rep_state, action, aux_state, sim_ctx)
+    else:
+      next_aux_state, next_rep_state = self.dynamics(
+        rep_state, action, aux_state, sim_ctx, sensed_terrain=sensed_terrain
+      )
     next_joint_state = self.representation.joint_state(next_rep_state)
     ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
       self._ref_body_state
@@ -240,7 +246,7 @@ class WorldModelEnv(ABC):
 
   def _update_goal(self) -> None:
     """Compute the reference body state at ``motion_times`` and rebuild goals."""
-    self._ref_body_state = self.motion.body_state(self.motion_times)
+    self._ref_body_state = self.reference_body_state(self.motion_times)
     self._wm_goal_obs, self._actor_goal_obs = self.representation.compute_wm_goal(
       self.motion, self.motion_times, self.aux_state
     )

@@ -1,0 +1,250 @@
+{
+  "seed": 42,
+  "clips": [
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/dance1_subject1.npz",
+      "sha256": "a9c5c065d3f6c4f037eeede6b1d840ac518e3c938c0f81ad56fd0887fa9ca6da",
+      "frames": 6574,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/dance1_subject2.npz",
+      "sha256": "98921f0d8e465287ccf907dcd04ead59e4f0f8ca353fc4e63d2f084540be7d37",
+      "frames": 6574,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/dance1_subject3.npz",
+      "sha256": "0e84542cd85e83e67f37529cf21592810a4f18cff41d239cb798d92946939363",
+      "frames": 6574,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/dance2_subject1.npz",
+      "sha256": "f95ed325c2dd7ddad9f659c1bcf0d1ec3b4ad7890415d2a36c0c0e2ee9412355",
+      "frames": 11284,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/dance2_subject2.npz",
+      "sha256": "9d40394a9e1a8801c1136246ce0621b7bfd842045133f189ea21a05586e6a3ae",
+      "frames": 11284,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/dance2_subject3.npz",
+      "sha256": "9dfe0e518937d2670454de63b5263640081273a0efa3ce08c29cc2c9aa2b9c98",
+      "frames": 11284,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/dance2_subject4.npz",
+      "sha256": "0c685ea5c5119663c98a7b5d66ca815e7f4ad614ed97a3487b1e8b37e0ca6aaf",
+      "frames": 11284,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/dance2_subject5.npz",
+      "sha256": "7ca80191e502f40fffd6c603265517615c51a9d975e9ac698dade261ecba05e1",
+      "frames": 11284,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/fallAndGetUp1_subject1.npz",
+      "sha256": "f12fd830ea7b012ce6fa21c18749f760840a36148e41f6329c39ddb617a81cde",
+      "frames": 8411,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/fallAndGetUp1_subject4.npz",
+      "sha256": "33446a4b33b20f5e41fe9440fefa63194f91722a0026d430ba26d3c30931dec6",
+      "frames": 8411,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/fallAndGetUp1_subject5.npz",
+      "sha256": "c792c81dfbc295be44ed855a252eec59317d736f4e3217bfeb2a6f0b69847a59",
+      "frames": 8411,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/fallAndGetUp2_subject2.npz",
+      "sha256": "e8ef008761c24d75d22f9b4039d071cde06be5657dd8e6596e9cf87dc189965c",
+      "frames": 8196,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/fallAndGetUp2_subject3.npz",
+      "sha256": "cd7d27e3c0bc4b3f577618a129b4546511096181fed442689ad71880fa40dcf8",
+      "frames": 8196,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/fallAndGetUp3_subject1.npz",
+      "sha256": "792d5ca3acad7781e9bef24b641275e3defb25e7b23e638b74db5faeebe7e4c2",
+      "frames": 5109,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/fight1_subject2.npz",
+      "sha256": "482893d9157822112add197b6275f79758ff212725f06b93fa0e7f3883d93a41",
+      "frames": 12244,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/fight1_subject3.npz",
+      "sha256": "ea5aaa6ce3d4b9646eb7f2acefcea326d5c31dbb3ea3782b55ab3eb171cc3c0c",
+      "frames": 12244,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/fight1_subject5.npz",
+      "sha256": "b124c7d00194ea7bf1ed3fbff14a1ee5c9af0976521514ca4b50eba31e956161",
+      "frames": 12244,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/fightAndSports1_subject1.npz",
+      "sha256": "9e5648806ebd288e082c60c0085dadb8d34aba624f669738d7f0126f6bcb6bdb",
+      "frames": 12257,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/fightAndSports1_subject4.npz",
+      "sha256": "8c890dac13b0a2e464aa4c7827accca740c95f4454e622a9f7d5a85c42b38a2c",
+      "frames": 12257,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/jumps1_subject1.npz",
+      "sha256": "38d0d59ca2a40af9316900adb931b75bfc0f3a44c232e14b630aa89df91ea41b",
+      "frames": 12222,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/jumps1_subject2.npz",
+      "sha256": "48161daac80d4bc881adea9a60ba26056e00d6c183523e6230e2d4b8439ed1e4",
+      "frames": 12222,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/jumps1_subject5.npz",
+      "sha256": "402229abf5f91e632ceb19d3423a4f3b8b01de38471059d8e42caecdc9358704",
+      "frames": 12222,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/run1_subject2.npz",
+      "sha256": "07c212af6603dee9f9782a44d67c28faf6ca29f54dbeded41cb90b5a92cf03d5",
+      "frames": 11891,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/run1_subject5.npz",
+      "sha256": "df207bbe7e163159067e12bfee048818873a91e2750460529f1bd890643de88b",
+      "frames": 11891,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/run2_subject1.npz",
+      "sha256": "f5fa1c5ae2b2f036de7200a2649ae703cf3b0d6c3a0ffa2cb49948a156dd56a7",
+      "frames": 12241,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/run2_subject4.npz",
+      "sha256": "9a8605700aeab8ea8485c213ee98baaef3771ff9c466efd9157c7eed3f336dcf",
+      "frames": 12241,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/sprint1_subject2.npz",
+      "sha256": "0d861798ecf66ad089ab97ecb1da8bfb7f9db8cfa07dc87e6f8af52e99798880",
+      "frames": 13656,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/sprint1_subject4.npz",
+      "sha256": "cce01fd54c674ba4413a6e20e73b4da452884786917e5fca2c4a91ffb4bd91d5",
+      "frames": 13656,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk1_subject1.npz",
+      "sha256": "1cdda0859e97d406d2da3063d6617cdac6aaa4a8d035f93e183e1caffdd29798",
+      "frames": 13066,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk1_subject2.npz",
+      "sha256": "d047707ebca6078986d9776cd439d32285b7baf620ecc2fe538eabbd6e3c3055",
+      "frames": 13066,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk1_subject5.npz",
+      "sha256": "1c4432c1daaa164591e45324abe2c8d6ecb520c1e8fff4658644c0643d2f2b3b",
+      "frames": 13066,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk2_subject1.npz",
+      "sha256": "5d026150e7641b2c9bec077c8c13982c517a8122479814bcca81568075260ddd",
+      "frames": 11909,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk2_subject3.npz",
+      "sha256": "47562b24a184ea5cfb123f3d833f08c464bf4d2d02ad086439be3ecd88302ee4",
+      "frames": 11909,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk2_subject4.npz",
+      "sha256": "3855403b2cfb717be534aa98ebf64ab117bc20e8a0ceb1cb704fd5864a47e398",
+      "frames": 11909,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk3_subject1.npz",
+      "sha256": "4d8d4b937b6fe545b94503845ed5572f1aeb7f3c5e3e16bd01a5ec3419c22442",
+      "frames": 12331,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk3_subject2.npz",
+      "sha256": "bd7eaeb4be9771fe3d5247e72ee44a80b381775530fb2cd35ef22fb622a94e7f",
+      "frames": 12331,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk3_subject3.npz",
+      "sha256": "322f073659f232ec895f7cdbfe30b7fe5c244a962e110ef801e153577c8d946f",
+      "frames": 12331,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk3_subject4.npz",
+      "sha256": "da763c38b8c07e1f05a5b6854ae6bc9ff791ba90cf9fb2cc6c0b8704c62ef730",
+      "frames": 12331,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk3_subject5.npz",
+      "sha256": "63aa5f90ed1a685c7e18fe56925c155e1a39309999cc09fe4d0c4b673a37d2c0",
+      "frames": 12331,
+      "local_start": 0
+    },
+    {
+      "path": "data/modelscope/LAFAN1_Retargeting_Dataset/npz/walk4_subject1.npz",
+      "sha256": "8b3807c7f7eeee64c0aee792f58211be929e022eb73ed47da3f03758a8deda87",
+      "frames": 8196,
+      "local_start": 0
+    }
+  ],
+  "domain_randomization": false,
+  "action_noise": false,
+  "obs_noise": false,
+  "termination": "first fall or natural clip end",
+  "aggregation": "one vote per clip"
+}
