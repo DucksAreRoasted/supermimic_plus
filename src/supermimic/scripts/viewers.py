@@ -19,8 +19,10 @@ from supermimic.representations import (
   MaxCoordRepresentation,
   StateRepresentation,
   extract_actor_goal,
+  root_waypoints,
 )
 from supermimic.sim_context import SimContext
+from supermimic.tasks.walk_terrain import TerrainObservation
 from supermimic.tasks.task_spec import (
   ContinuousGoalSpec,
   DiscreteGoalSpec,
@@ -55,6 +57,12 @@ class SuperMimicViewerMixin:
     self.task_specs: dict[str, TaskSpec] = {ts.name: ts for ts in task_specs}
     self.set_task(initial_task)
     device = next(self.policy.parameters()).device
+    base_policy = getattr(self.policy, "actor", self.policy)
+    self.use_root_waypoints = getattr(base_policy, "use_root_waypoints", False)
+    self.actor_terrain = (
+      TerrainObservation(self.env.unwrapped.cfg.scene.spec_fn).to(device)
+      if getattr(base_policy, "terrain_obs_dim", 0) else None
+    )
     self._raw_goal_state: dict[str, torch.Tensor] = {
       name: torch.zeros(1, ts.raw_goal_dim, device=device)
       for name, ts in self.task_specs.items()
@@ -254,6 +262,10 @@ class SuperMimicViewerMixin:
         actor_obs = build_actor_obs_td(
           {self.current_task: actor_goal}, self._gt_history
         )
+        if self.actor_terrain is not None:
+          actor_obs["terrain"] = self.actor_terrain.features(gt_aux)
+        if self.use_root_waypoints:
+          actor_obs["root_waypoints"] = root_waypoints(curr_goals)
         actions = self.policy(actor_obs)
 
         # Env Step (Ground Truth simulation)
@@ -290,6 +302,10 @@ class SuperMimicViewerMixin:
         wm_actor_obs = build_actor_obs_td(
           {self.current_task: wm_actor_goal}, self._wm_history
         )
+        if self.actor_terrain is not None:
+          wm_actor_obs["terrain"] = self.actor_terrain.features(self.curr_wm_aux)
+        if self.use_root_waypoints:
+          wm_actor_obs["root_waypoints"] = root_waypoints(wm_goal)
         wm_actions = self.policy(wm_actor_obs)
 
         next_aux, next_rep_state = self.dynamics(

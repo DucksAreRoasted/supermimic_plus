@@ -91,7 +91,7 @@ def make_motion_task(representation: "StateRepresentation", num_goals: int) -> T
 
   return TaskSpec(
     name="motion",
-    goal_dim=actor_goal_dim(num_goals),
+    goal_dim=actor_goal_dim(num_goals, representation.pelvis_motion_goal),
     extract_training_goal=extract,
   )
 

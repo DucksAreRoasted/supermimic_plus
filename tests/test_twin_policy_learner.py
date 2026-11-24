@@ -167,3 +167,87 @@ def test_critic_diagnostics_without_finite_value_bound(gamma):
   assert "Policy/value_above_bound_fraction" not in stats
   assert stats["Policy/critic_disagreement_abs"].item() == 0.0
   assert all(torch.isfinite(value) for value in stats.values())
+
+
+@pytest.mark.parametrize("weight", [0.0, 0.1])
+def test_sim_calibration_weight_selects_rollout_and_update_order(weight):
+  class Actor(_DummyActor):
+    def forward(self, obs):
+      return torch.ones_like(obs["actor"]) * self.weight
+
+  actor = Actor()
+  env = _TwoStepEnv()
+  learner = SimulatorCalibratedActorCriticLearner(
+    actor, _ConstantCritic(0.2), env, ActorCriticPolicyLearnerCfg(horizon=2, gamma=0.99),
+    sim_calibration_weight=weight, sim_calibration_horizon=2,
+  )
+  if weight:
+    resets = torch.zeros(2, 2, dtype=torch.bool)
+    learner.set_simulator_batch(torch.zeros(3, 2, 1), torch.ones(2, 2), resets, resets)
+  grad_enabled = []
+  events = []
+  actor.register_forward_hook(lambda *_: grad_enabled.append(torch.is_grad_enabled()))
+  for name, optimizer in (("actor", learner.actor_optimizers[0]), ("critic", learner.critic_optimizers[0])):
+    optimizer.register_step_post_hook(lambda *_, label=name: events.append(label))
+  before = actor.weight.detach().clone()
+  result = learner.update()
+  assert grad_enabled == ([True, True] if weight == 0 else [False, False, True, True])
+  assert events == (["actor", "critic"] if weight == 0 else ["critic", "actor"])
+  if weight == 0:
+    assert result["Policy/reward"].item() == pytest.approx((1 + .99 * .5 + .99**2 * .5 * .2) / 2)
+  assert bool(result["Policy/sim_calibration_loss"] > 0) == bool(weight)
+  assert result["Policy/grad_norm"] > 0
+  assert not torch.equal(actor.weight, before)
+
+
+def test_actor_microbatch_matches_one_full_update_with_unequal_chunks():
+  class Env(_TwoStepEnv):
+    def sample_initial_states(self):
+      return TensorDict({"initial": torch.linspace(-1, 3, 5)[:, None]}, batch_size=[5])
+
+    def reset(self, batch):
+      self.state = batch["initial"]
+      return self._obs()
+
+    def _obs(self):
+      return TensorDict({"actor": self.state, "critic": self.state}, batch_size=[len(self.state)])
+
+    def step(self, actions):
+      self.state = self.state + .1 * actions
+      return self._obs(), (actions - .3).squeeze(-1), self.state[:, 0].sigmoid() * .1, {}
+
+  def experiment(chunk):
+    actor = _DummyActor()
+    env = Env()
+    learner = SimulatorCalibratedActorCriticLearner(
+      actor, _ConstantCritic(.2), env, ActorCriticPolicyLearnerCfg(horizon=32, gamma=.99, batch_size=5),
+      actor_microbatch_size=chunk,
+    )
+    if chunk is not None and chunk < learner.cfg.batch_size:
+      assert learner._captured_update == learner._update_from
+    imagined_rows = []
+    actor.register_forward_hook(lambda _, args, out: imagined_rows.append(len(args[0])))
+    fit = learner._fit_critic_batch
+    batches = []
+    def checked_fit(steps, terminal):
+      assert steps.batch_size == (32, 5) and terminal.shape == (5, 1)
+      assert not terminal.requires_grad and all(not x.requires_grad for x in steps.values())
+      batches.append((steps.clone(), terminal.clone()))
+      return fit(steps, terminal)
+    learner._fit_critic_batch = checked_fit
+    logs = learner.update()
+    assert sum(imagined_rows) == 5 * 32
+    assert len(batches) == 1
+    return actor.weight.detach(), learner.critic.value.detach(), logs, learner._actor_updates, batches[0]
+
+  w, v, logs, count, (steps, terminal) = experiment(None)
+  split_w, split_v, split_logs, split_count, (split_steps, split_terminal) = experiment(2)
+  for key in steps.keys():
+    torch.testing.assert_close(steps[key], split_steps[key])
+  torch.testing.assert_close(terminal, split_terminal)
+  assert count == split_count == 1
+  assert w.abs() > 0
+  torch.testing.assert_close(w, split_w)
+  torch.testing.assert_close(v, split_v)
+  for key in logs:
+    torch.testing.assert_close(logs[key], split_logs[key])

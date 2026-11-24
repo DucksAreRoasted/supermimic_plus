@@ -62,6 +62,29 @@ def _make_env(history_length: int = 1) -> MultiTaskWorldModelEnv:
 
 
 class TestMultiTaskWorldModelEnv:
+  def test_dynamics_receives_current_measured_patch_after_step_and_reset(self):
+    from supermimic.tasks.foot_depth_actor import MeasuredPatch
+
+    env = _make_env()
+    patch = MeasuredPatch(torch.zeros(1, 2))
+    env.terrain_query = env.dynamics.terrain_query = patch
+    env.future_feet = lambda times: torch.zeros(len(times), 2, 3, 9)
+    env.actor_sees_terrain = True
+    env.representation.extract_aux_state.side_effect = lambda states: identity_aux(len(states))
+    env.dynamics.side_effect = lambda rep, action, aux, ctx, *, sensed_terrain: (aux, rep)
+    starts = env.sample_initial_states()
+    starts["depth_origin"] = torch.tensor([0., 0., 1., 0., 0., 0.]).expand(BATCH, -1)
+    for height in (1., 2.):
+      image = torch.ones(BATCH, 2, 25, 25)
+      image[:, 0] = height
+      starts["depth_image"] = image.flatten(1)
+      obs = env.reset(starts)
+      for _ in range(2):
+        prev = obs["terrain"]
+        torch.testing.assert_close(prev, torch.full_like(prev, height))
+        obs = env.step(torch.zeros(BATCH, ACTION_DIM))[0]
+        assert env.dynamics.call_args.kwargs["sensed_terrain"] is prev
+
   def test_termination_softness_reaches_the_base_env(self):
     assert _make_env()._termination_softness == SOFTNESS
 
@@ -111,8 +134,8 @@ class TestHistoryRing:
     history = obs["history"]
     assert history.shape == (BATCH, self.H, env._latest_sensor.shape[-1])
     # Past slots hold the sampled window's real predecessors (frame k == k);
-    # the newest slot is the freshly synthesized sensor of the init state.
-    for k in range(self.H - 1):
+    # the newest slot holds the recorded sensor at the init state.
+    for k in range(self.H):
       assert torch.allclose(history[:, k], torch.full_like(history[:, k], float(k)))
     assert torch.equal(history[:, -1], env._latest_sensor)
 
@@ -132,6 +155,17 @@ class TestHistoryRing:
     assert torch.equal(history[:, 0], history[:, 2])
     # ...and they are noised, not the clean buffer value.
     assert not torch.allclose(history[:, 0], clean[:, 2])
+
+  def test_first_frame_repeats_one_measurement_in_short_microbatch(self):
+    env = _make_env(history_length=10)
+    env.representation.add_proprio_noise.side_effect = lambda x: x + torch.rand_like(x)
+    start = env.sample_initial_states()[:3]
+    start["pad_mask"][:, :-1] = True
+    env._update_goal = lambda: None
+    env._on_reset(start)
+    history = env._sensor_history()
+    torch.testing.assert_close(history, history[:, -1:].expand_as(history))
+    assert history.shape[:2] == (3, 10)
 
   def test_step_shifts_and_appends_fresh_frame(self):
     env = _make_env(history_length=self.H)

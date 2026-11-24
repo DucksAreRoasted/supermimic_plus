@@ -254,3 +254,29 @@ class TestProprioNoiseSpecConsistency:
       else:
         assert term.noise.n_min == -half, name
         assert term.noise.n_max == half, name
+
+
+def test_extended_motion_goal_uses_aligned_pelvis_targets_without_crossing_clips():
+  from types import SimpleNamespace
+
+  rep = GenCoordRepresentation(29, torch.zeros(29))
+  frame = torch.arange(24).float()
+  xyz = torch.stack([frame, -frame, frame / 2], dim=1)
+  quat = torch.zeros(24, 4)
+  quat[:, 0] = 1
+  motion = SimpleNamespace(
+    root_pos_w=xyz, root_quat_w=quat, root_lin_vel_w=3 * xyz,
+    joint_pos=torch.zeros(24, 29), joint_vel=torch.zeros(24, 29),
+    motion_ends=torch.tensor([12, 24]),
+  )
+  times = torch.tensor([3, 12])
+  aux = torch.cat([xyz[times], quat[times]], dim=1)
+  wm, legacy = rep.compute_wm_goal(motion, times, aux)
+  rep.pelvis_motion_goal = True
+  new_wm, extended = rep.compute_wm_goal(motion, times, aux)
+  torch.testing.assert_close(new_wm, wm)
+  torch.testing.assert_close(extended[:, :640], legacy)
+  idx = torch.tensor([[3, 8] + [11] * 8, [12, 17, 22] + [23] * 7])
+  extra = extended[:, 640:].reshape(2, 10, 4)
+  torch.testing.assert_close(extra[..., :3], xyz[idx] - xyz[times, None])
+  torch.testing.assert_close(extra[..., 3], motion.root_lin_vel_w[idx, 2])

@@ -64,6 +64,7 @@ class WorldModelEnv(ABC):
     self._num_actions = env.num_actions
     motion_cmd = env.unwrapped.command_manager.get_term("motion")
     self.motion = motion_cmd.motion
+    self.reference_body_state = self.motion.body_state
     self._anchor_index = motion_cmd.motion_anchor_body_index
 
     if termination_softness <= 0.0:
@@ -167,6 +168,8 @@ class WorldModelEnv(ABC):
     action: torch.Tensor,
     last_action: torch.Tensor,
     sim_ctx: torch.Tensor,
+    *,
+    sensed_terrain: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bundled dynamics + termination + reward for one env step.
 
@@ -176,9 +179,12 @@ class WorldModelEnv(ABC):
     score the post-step state against the cached reference body state, the way
     the simulator scores it before advancing the clip.
     """
-    next_aux_state, next_rep_state = self.dynamics(
-      rep_state, action, aux_state, sim_ctx
-    )
+    if sensed_terrain is None:
+      next_aux_state, next_rep_state = self.dynamics(rep_state, action, aux_state, sim_ctx)
+    else:
+      next_aux_state, next_rep_state = self.dynamics(
+        rep_state, action, aux_state, sim_ctx, sensed_terrain=sensed_terrain
+      )
     next_joint_state = self.representation.joint_state(next_rep_state)
     ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
       self._ref_body_state
@@ -223,10 +229,14 @@ class WorldModelEnv(ABC):
     self.motion_times = batch["motion_time"]
     self._update_goal()
     if self.history_length > 1:
-      self._past_sensors = self._warmstart_past_sensors(
-        batch["sensor_window"], batch["pad_mask"]
-      )
-    self._latest_sensor = self._synth_sensor()
+      window = self.representation.add_proprio_noise(batch["sensor_window"])
+      padded = batch["pad_mask"]
+      first = (~padded).int().argmax(dim=1)
+      oldest = window[torch.arange(len(window), device=window.device), first]
+      self._past_sensors = torch.where(padded[:, :-1, None], oldest[:, None], window[:, :-1])
+      self._latest_sensor = window[:, -1]
+    else:
+      self._latest_sensor = self._synth_sensor()
 
   def _compute_commands(self) -> None:
     """Advance the reference clip one frame (clamped at clip ends) and refresh."""
@@ -240,7 +250,7 @@ class WorldModelEnv(ABC):
 
   def _update_goal(self) -> None:
     """Compute the reference body state at ``motion_times`` and rebuild goals."""
-    self._ref_body_state = self.motion.body_state(self.motion_times)
+    self._ref_body_state = self.reference_body_state(self.motion_times)
     self._wm_goal_obs, self._actor_goal_obs = self.representation.compute_wm_goal(
       self.motion, self.motion_times, self.aux_state
     )
@@ -267,18 +277,6 @@ class WorldModelEnv(ABC):
     batch["sensor_window"] = window["actor_obs"]
     batch["pad_mask"] = padded
     return batch
-
-  def _warmstart_past_sensors(
-    self, sensor_window: torch.Tensor, pad_mask: torch.Tensor
-  ) -> torch.Tensor:
-    """Noise the sampled predecessor window; clamp-padded slots (before the
-    episode start) share the oldest real frame's single noise realization, the
-    way the real-sim ring's reset padding does."""
-    noisy = self.representation.add_proprio_noise(sensor_window[:, :-1])
-    pad = pad_mask[:, :-1]  # padding is a leading run (sample_causal)
-    first_real = (~pad).int().argmax(dim=1)
-    shared = noisy[torch.arange(self.num_envs, device=self.device), first_real]
-    return torch.where(pad.unsqueeze(-1), shared.unsqueeze(1), noisy)
 
   def _unpack_initial_states(
     self, batch: TensorDict

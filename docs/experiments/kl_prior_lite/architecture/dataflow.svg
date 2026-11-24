@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 762" width="1000" height="762" role="img" aria-labelledby="title desc"><title id="title">G1 动作跟踪：一次训练更新的数据流</title><desc id="desc">MuJoCo 采集分成 replay 和 32 步校准窗；拟合世界模型后先生成想象目标，联合更新一个 Critic，再重新展开想象轨迹更新 Actor。KL-lite 只在 Actor 更新中增加 KL 正则。</desc><defs><marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8 Z" fill="#42586c"/></marker></defs><rect width="100%" height="100%" fill="#fafbfc"/><g font-family="Noto Sans CJK SC, sans-serif">
+<text x="32" y="38" font-size="27" fill="#163447" font-weight="700">G1 动作跟踪｜一次训练更新的数据流</text>
+<text x="33" y="65" font-size="16" fill="#33495a" font-weight="400">e64e34f   /   40 个 LAFAN1 参考片段   /   4,096 个环境   /   单 Critic</text>
+<path d="M255 165 V202" fill="none" stroke="#42586c" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr)" />
+<path d="M740 165 V202" fill="none" stroke="#42586c" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr)" />
+<path d="M255 288 V329" fill="none" stroke="#42586c" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr)" />
+<path d="M255 421 V466" fill="none" stroke="#42586c" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr)" />
+<path d="M730 288 V466" fill="none" stroke="#42586c" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr)" />
+<path d="M450 514 H548" fill="none" stroke="#42586c" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr)" />
+<path d="M733 557 V588 H260 V615" fill="none" stroke="#42586c" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr)" />
+<path d="M450 664 H548" fill="none" stroke="#42586c" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr)" />
+<path d="M944 663 H978 V132 H946" fill="none" stroke="#42586c" stroke-width="2" stroke-linejoin="round" marker-end="url(#arr)" stroke-dasharray="6 5" />
+<rect x="41" y="92" width="904" height="73" rx="11" fill="#e9f2f7" stroke="#185676" stroke-width="1.4"/>
+<text x="58" y="122" font-size="21" fill="#185676" font-weight="700">① 采集真实转移：同一个 Actor 跟踪参考动作，驱动 MuJoCo Warp</text>
+<text x="58" y="148" font-size="16" fill="#33495a" font-weight="400">状态、动作和仿真条件用于学动力学；奖励和回合边界用于校准价值。</text>
+<rect x="41" y="203" width="409" height="85" rx="11" fill="#edf5fa" stroke="#21627e" stroke-width="1.4"/>
+<text x="58" y="233" font-size="21" fill="#21627e" font-weight="700">② 长回放池  Replay</text>
+<text x="58" y="259" font-size="16" fill="#33495a" font-weight="400">保留状态、动作、参考时间和仿真条件。</text>
+<rect x="548" y="203" width="397" height="85" rx="11" fill="#fff4e1" stroke="#895722" stroke-width="1.4"/>
+<text x="565" y="233" font-size="21" fill="#895722" font-weight="700">③ 最近 32 步的真实窗口</text>
+<text x="565" y="259" font-size="16" fill="#33495a" font-weight="400">逐步保存奖励、Critic 观测和 reset 边界。</text>
+<rect x="41" y="330" width="409" height="91" rx="11" fill="#eaf4ef" stroke="#24654d" stroke-width="1.4"/>
+<text x="58" y="360" font-size="21" fill="#24654d" font-weight="700">④ 拟合世界模型</text>
+<text x="58" y="386" font-size="16" fill="#33495a" font-weight="400">共享主干 → 基础头 + 0.1 × 残差头</text>
+<text x="58" y="409" font-size="16" fill="#33495a" font-weight="400">预测速度增量，再解析积分得到下一状态。</text>
+<rect x="41" y="467" width="409" height="90" rx="11" fill="#eaf4ef" stroke="#24654d" stroke-width="1.4"/>
+<text x="58" y="497" font-size="21" fill="#24654d" font-weight="700">⑤ 第一次想象：32 步</text>
+<text x="58" y="523" font-size="16" fill="#33495a" font-weight="400">从 Replay 取起点，Actor 在世界模型里行动。</text>
+<text x="58" y="546" font-size="16" fill="#33495a" font-weight="400">这批想象状态和奖励只用于构造 Critic 标签。</text>
+<rect x="548" y="467" width="397" height="90" rx="11" fill="#fff4e1" stroke="#895722" stroke-width="1.4"/>
+<text x="565" y="497" font-size="21" fill="#895722" font-weight="700">⑥ 更新同一个 Critic：两轮回归</text>
+<text x="565" y="523" font-size="16" fill="#33495a" font-weight="400">想象损失 + 0.1 × 有效仿真样本损失。</text>
+<text x="565" y="546" font-size="16" fill="#33495a" font-weight="400">两轮回归期间，两套目标值保持固定。</text>
+<text x="466" y="503" font-size="14" fill="#33495a" font-weight="400">标签</text>
+<text x="473" y="579" font-size="14" fill="#33495a" font-weight="400">更新后的末端价值</text>
+<rect x="41" y="616" width="409" height="97" rx="11" fill="#eaf4ef" stroke="#24654d" stroke-width="1.4"/>
+<text x="58" y="646" font-size="21" fill="#24654d" font-weight="700">⑦ 从同一起点重新想象 32 步</text>
+<text x="58" y="672" font-size="16" fill="#33495a" font-weight="400">重新累积跟踪奖励，到末端查询新 Critic。</text>
+<text x="58" y="695" font-size="16" fill="#33495a" font-weight="400">固定模型参数，梯度仍可穿过模型回到 Actor。</text>
+<rect x="548" y="616" width="397" height="97" rx="11" fill="#f5edfa" stroke="#704086" stroke-width="1.4"/>
+<text x="565" y="646" font-size="21" fill="#704086" font-weight="700">⑧ 用 BPTT 更新 Actor</text>
+<text x="565" y="672" font-size="16" fill="#33495a" font-weight="400">无 prior：优化想象回报。</text>
+<text x="565" y="695" font-size="16" fill="#33495a" font-weight="400">KL-lite：额外加入 0.001 × latent KL。</text>
+<text x="47" y="743" font-size="15" fill="#33495a" font-weight="400">实线：数据或更新依赖。右侧虚线：后续采集使用更新后的 Actor；MuJoCo 本身不参与反向传播。</text>
+</g></svg>

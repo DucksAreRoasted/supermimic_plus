@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,12 +13,25 @@ from supermimic.learners.policy_learner import (
   BpttPolicyLearnerCfg,
 )
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
-from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
+from supermimic.runners.supermimic_runner import BaseRunner, SuperMimicRunnerCfg
 
 
 def _serialized(cfg: SuperMimicRunnerCfg) -> dict:
   """What wandb hands back: the cfg after a JSON round-trip."""
   return json.loads(json.dumps(asdict(cfg)))
+
+
+def test_flat_checkpoints_do_not_add_camera_fields_to_replay():
+  runner = SimpleNamespace(
+    cfg=SuperMimicRunnerCfg(),
+    _representation=SimpleNamespace(full_state_dim=71),
+    _sim_context=SimpleNamespace(output_dim=33),
+    _stores_actor_obs=False,
+    _num_actions=29,
+  )
+  schema = BaseRunner._buffer_schema(runner)
+  runner.cfg.keep_iteration_checkpoints = True
+  assert BaseRunner._buffer_schema(runner) == schema
 
 
 @pytest.mark.parametrize(

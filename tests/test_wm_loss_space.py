@@ -253,3 +253,66 @@ def test_residual_correction_starts_as_base_dynamics():
   shared_out = shared(rep_state, action, aux, sim_ctx)
   for actual, expected in zip(shared_out, base_out):
     torch.testing.assert_close(actual, expected)
+
+
+def test_flat_head_ablation_preserves_shared_initialization_and_rng():
+  rep = _make_representation("gencoord")
+  def initialize(width):
+    with torch.random.fork_rng(devices=[]):
+      torch.manual_seed(42)
+      dynamics = Dynamics(
+        rep, NUM_ACTIONS, 1, torch.ones(NUM_ACTIONS), torch.zeros(NUM_ACTIONS), (16, 12),
+        residual_correction=True, residual_shared_trunk=True, shared_head_width=width,
+      )
+      return dynamics.state_dict(), torch.get_rng_state()
+
+  linear, linear_rng = initialize(0)
+  nonlinear, nonlinear_rng = initialize(8)
+  assert torch.equal(linear_rng, nonlinear_rng)
+  for key, value in linear.items():
+    torch.testing.assert_close(value, nonlinear[key], rtol=0, atol=0)
+
+
+def test_two_nonlinear_heads_migrate_train_and_reload_strictly():
+  from supermimic.runners.supermimic_runner import WorldModel
+
+  rep = _make_representation("gencoord")
+
+  def model(width):
+    dynamics = Dynamics(rep, NUM_ACTIONS, 1, torch.ones(NUM_ACTIONS), torch.zeros(NUM_ACTIONS),
+                        (16, 12), residual_correction=True, residual_shared_trunk=True,
+                        shared_head_width=width)
+    return WorldModel(rep, dynamics, torch.nn.Identity(), 0, NUM_ACTIONS)
+
+  original, new = model(0), model(8)
+  with torch.no_grad():
+    original.dynamics.residual_head.weight.normal_()
+  legacy = original.bundle()
+  legacy.pop("shared_head_width")
+  args = (_randn(4, rep.rep_state_dim), _randn(4, NUM_ACTIONS), _randn(4, 7), _randn(4, 1))
+  expected = original.dynamics.predict_delta(*args).detach()
+
+  with pytest.raises(RuntimeError, match="Missing key"):
+    new.load_bundle(legacy)
+  new.load_bundle(legacy, initialize_new_heads=True)
+  torch.testing.assert_close(new.dynamics.predict_delta(*args), expected, rtol=0, atol=0)
+
+  optimizer = torch.optim.Adam(new.dynamics.parameters(), lr=.002)
+  for step in range(2):
+    optimizer.zero_grad()
+    new.dynamics.predict_delta(*args).square().mean().backward()
+    for head in new.dynamics.head_mlps:
+      assert head[-1].weight.grad.norm() > 0
+      if step:
+        assert head[0].weight.grad.norm() > 0
+    optimizer.step()
+
+  saved = new.bundle()
+  other = model(8)
+  other.load_bundle(saved)
+  torch.testing.assert_close(other.dynamics.predict_delta(*args), new.dynamics.predict_delta(*args), atol=0, rtol=0)
+  del saved["dynamics"]["head_mlps.1.2.bias"]
+  with pytest.raises(RuntimeError, match="Missing key"):
+    other.load_bundle(saved, initialize_new_heads=True)
+  new.load_bundle(legacy, initialize_new_heads=True)
+  torch.testing.assert_close(new.dynamics.predict_delta(*args), expected, rtol=0, atol=0)

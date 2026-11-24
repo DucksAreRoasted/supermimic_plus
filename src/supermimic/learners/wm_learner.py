@@ -61,6 +61,7 @@ class WorldModelLearner:
     self.representation = representation
     self.cfg = cfg
     self.device = device
+    self.depth_patch = None
     self.mirror_perm = mirror_perm
     self.mirror_sign = mirror_sign
     self.mirror_context_slices = mirror_context_slices or {}
@@ -113,11 +114,18 @@ class WorldModelLearner:
     self.dynamics.train()
     for p in self._all_params:
       p.requires_grad_(True)
-    batches = torch.stack([td.select("state", "action", "sim_ctx") for td in data])
+    keys = ["state", "action", "sim_ctx"]
+    if self.depth_patch is not None:
+      keys += ["depth_image", "depth_origin"]
+    if self.dynamics.vision is not None:
+      keys.append("camera_pixels")
+    batches = torch.stack([td.select(*keys) for td in data])
     return self._captured_update(batches)
 
   def _update_from(self, batches: TensorDict) -> dict[str, torch.Tensor]:
     stats = []
+    head_grads = []
+    recon_losses, forecast_losses = [], []
 
     for td in batches.unbind(0):
       if self.mirror_perm is not None:
@@ -142,6 +150,8 @@ class WorldModelLearner:
         mirrored["action"] = action
         mirrored["sim_ctx"] = sim_ctx
         td = torch.stack([td, mirrored], 0).flatten(0, 1)
+      if self.depth_patch is not None:
+        self.depth_patch.bind_replay(td[:, 0])
       full_states = td["state"]
       actions = td["action"]
 
@@ -166,14 +176,36 @@ class WorldModelLearner:
       )
 
       # 3. Backprop
-      _optimize_step(self.optimizers, loss_state, self._all_params, max_norm=1.0)
+      loss = loss_state
+      if self.dynamics.vision is not None:
+        recon, forecast = self.dynamics.vision.losses(td["camera_pixels"], pred_rep_states, actions)
+        loss = loss + recon
+        recon_losses.append(recon.detach())
+        if forecast is not None:
+          loss = loss + forecast
+          forecast_losses.append(forecast.detach())
+      _optimize_step(self.optimizers, loss, self._all_params, max_norm=1.0)
+
+      if self.dynamics.shared_head_width:
+        head_grads.append(torch.stack([layer.weight.grad.norm()
+                                       for head in self.dynamics.head_mlps
+                                       for layer in (head[0], head[-1])]).detach())
 
       # 4. Logging
       stats.append(torch.cat([loss_state.unsqueeze(0), group_mse]).detach())
 
     names = ["state", *self.loss_group_weights]
     means = torch.stack(stats).mean(0)
-    return {f"Loss/{name}": m for name, m in zip(names, means, strict=True)}
+    metrics = {f"Loss/{name}": m for name, m in zip(names, means, strict=True)}
+    if recon_losses:
+      metrics["Vision/reconstruction"] = torch.stack(recon_losses).mean()
+    if forecast_losses:
+      metrics["Vision/latent_prediction"] = torch.stack(forecast_losses).mean()
+    if head_grads:
+      grad_names = ("main_hidden", "main_output", "residual_hidden", "residual_output")
+      metrics.update({f"WM/grad_{name}": value for name, value in
+                      zip(grad_names, torch.stack(head_grads).mean(0), strict=True)})
+    return metrics
 
   def _rollout(
     self,

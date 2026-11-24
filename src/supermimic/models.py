@@ -10,6 +10,7 @@ from tensordict import TensorDict
 if TYPE_CHECKING:
   from supermimic.representations import StateRepresentation
   from supermimic.tasks.task_spec import TaskSpec
+  from supermimic.tasks.walk_terrain import TerrainObservation
 
 
 class _CudaGraphNormalization(EmpiricalNormalization):
@@ -87,6 +88,8 @@ class Dynamics(nn.Module):
     residual_hidden_dims: tuple[int, ...] | None = None,
     residual_shared_trunk: bool = False,
     residual_low_rank: int | None = None,
+    terrain_query: TerrainObservation | None = None,
+    shared_head_width: int = 0,
   ):
     super().__init__()
 
@@ -97,6 +100,10 @@ class Dynamics(nn.Module):
     self.residual_correction = residual_correction
     self.residual_scale = float(residual_scale)
     self.residual_shared_trunk = bool(residual_shared_trunk)
+    self.terrain_query = terrain_query
+    input_dim = self.num_rep_state + num_actions + sim_ctx_dim
+    if terrain_query is not None:
+      input_dim += terrain_query.num_features
 
     self.register_buffer("action_scale", action_scale.clone())
     self.register_buffer("action_offset", action_offset.clone())
@@ -105,10 +112,25 @@ class Dynamics(nn.Module):
     self.action_normalizer = _CudaGraphNormalization(num_actions)
 
     self.mlp = build_mlp(
-      self.num_rep_state + num_actions + sim_ctx_dim,
+      input_dim,
       hidden_dims,
       output_dim=representation.prediction_dim,
     )
+    self.vision = None
+    self.shared_head_width = shared_head_width
+    if shared_head_width < 0 or (shared_head_width and not (residual_correction and residual_shared_trunk)):
+      raise ValueError("Nonlinear heads require a positive width and a shared residual trunk")
+    self.head_mlps = nn.ModuleList()
+    if shared_head_width:
+      # Give both flat-ground ablation arms identical subsequent Actor/Critic
+      # initialization. Keep the archived terrain experiments' RNG sequence.
+      with torch.random.fork_rng(devices=[], enabled=terrain_query is None):
+        for _ in range(2):
+          head = nn.Sequential(nn.Linear(hidden_dims[-1], shared_head_width), nn.SiLU(),
+                               nn.Linear(shared_head_width, representation.prediction_dim))
+          nn.init.zeros_(head[-1].weight)
+          nn.init.zeros_(head[-1].bias)
+          self.head_mlps.append(head)
     self.residual_mlp = None
     self.residual_head = None
     if residual_correction:
@@ -122,14 +144,14 @@ class Dynamics(nn.Module):
         residual_dims = hidden_dims if residual_hidden_dims is None else residual_hidden_dims
         self.residual_mlp = (
           build_low_rank_mlp(
-            self.num_rep_state + num_actions + sim_ctx_dim,
+            input_dim,
             residual_dims,
             representation.prediction_dim,
             residual_low_rank,
           )
           if residual_low_rank is not None
           else build_mlp(
-            self.num_rep_state + num_actions + sim_ctx_dim,
+            input_dim,
             residual_dims,
             output_dim=representation.prediction_dim,
           )
@@ -157,19 +179,40 @@ class Dynamics(nn.Module):
     action: torch.Tensor,
     aux_state: torch.Tensor,
     sim_ctx: torch.Tensor,
+    *,
+    sensed_terrain: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
+    prediction = self.predict_delta(rep_state, action, aux_state, sim_ctx, sensed_terrain=sensed_terrain)
+    return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
+
+  def predict_delta(
+    self, rep_state: torch.Tensor, action: torch.Tensor, aux_state: torch.Tensor,
+    sim_ctx: torch.Tensor, *, sensed_terrain: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    """Predict velocity increments using supplied depth features or the training terrain."""
     state_norm = self.state_normalizer(rep_state)
     action_norm = self.action_normalizer(self.proc(action))
     features = torch.cat([state_norm, action_norm, sim_ctx], dim=-1)
+    if self.terrain_query is not None:
+      terrain = (
+        self.terrain_query.features(aux_state)
+        if sensed_terrain is None
+        else sensed_terrain
+      )
+      features = torch.cat([features, terrain], dim=-1)
     if self.residual_head is not None:
       trunk = self.mlp[:-1](features)
       prediction = self.mlp[-1](trunk)
-      prediction = prediction + self.residual_scale * self.residual_head(trunk)
+      correction = self.residual_head(trunk)
+      if self.shared_head_width:
+        prediction = prediction + self.head_mlps[0](trunk)
+        correction = correction + self.head_mlps[1](trunk)
+      prediction = prediction + self.residual_scale * correction
     else:
       prediction = self.mlp(features)
       if self.residual_mlp is not None:
         prediction = prediction + self.residual_scale * self.residual_mlp(features)
-    return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
+    return prediction
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
     return [self.state_normalizer, self.action_normalizer]
@@ -208,6 +251,8 @@ class MultiEncoderAE(nn.Module):
     latent_prior_mode: str = "mse",
     latent_prior_blend: float = 0.0,
     prior_hidden_dims: tuple[int, ...] | None = None,
+    terrain_obs_dim: int = 0,
+    use_root_waypoints: bool = False,
   ):
     super().__init__()
     if not task_specs:
@@ -216,6 +261,8 @@ class MultiEncoderAE(nn.Module):
     self.history_length = history_length
     self.latent_dim = latent_dim
     self.latent_bc_weight = latent_bc_weight
+    self.terrain_obs_dim = terrain_obs_dim
+    self.use_root_waypoints = use_root_waypoints
     self.latent_prior_weight = latent_prior_weight
     if not 0.0 <= latent_prior_blend <= 1.0:
       raise ValueError(
@@ -248,10 +295,16 @@ class MultiEncoderAE(nn.Module):
       }
     )
     self.decoder = build_mlp(
-      latent_dim + history_length * obs_dim,
+      latent_dim + history_length * obs_dim + terrain_obs_dim,
       hidden_dims,
       output_dim=action_dim,
     )
+    if use_root_waypoints:
+      # Preserve the seeded decoder and RNG stream. Only the four new input
+      # columns start at zero and receive a gradient from the first update.
+      first = self.decoder[0]
+      first.weight = nn.Parameter(torch.nn.functional.pad(first.weight.detach(), (0, 4)))
+      first.in_features = first.weight.shape[1]
     # Do not allocate or initialize the prior when disabled. This preserves the
     # baseline parameter set and RNG initialization exactly for weight=0 runs.
     prior_dims = hidden_dims if prior_hidden_dims is None else prior_hidden_dims
@@ -269,6 +322,8 @@ class MultiEncoderAE(nn.Module):
         self.prior[-1].weight[self.latent_dim :].zero_()
         self.prior[-1].bias[self.latent_dim :].zero_()
 
+    self.visual_action = None
+    self.foot_depth_fusion: nn.Module | None = None
     self.set_slot_mix(slot_mix)
 
   def set_slot_mix(self, slot_mix: dict[str, float]) -> None:
@@ -296,6 +351,17 @@ class MultiEncoderAE(nn.Module):
     return ranges
 
   def forward(self, obs_td: TensorDict) -> torch.Tensor:
+    actions = self.decode_actions(obs_td)
+    if self.foot_depth_fusion is not None:
+      actions = self.foot_depth_fusion(
+        actions, obs_td["depth_tokens"], obs_td["future_feet"]
+      )
+    if self.visual_action is not None:
+      actions = actions + self.visual_action(obs_td["camera_latent"].detach())
+    return actions
+
+  def decode_actions(self, obs_td: TensorDict) -> torch.Tensor:
+    """Base decoder output, also used to measure the learned terrain modulation."""
     slots = self.slot_ranges(obs_td.shape[0])
     enc_outs: list[torch.Tensor] = []
     for name, (lo, hi) in zip(self._task_names, slots, strict=True):
@@ -331,7 +397,12 @@ class MultiEncoderAE(nn.Module):
     )
 
     history_n = self.obs_normalizer(obs_td["history"])
-    return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
+    decoder_inputs = [z, history_n.flatten(start_dim=1)]
+    if self.terrain_obs_dim:
+      decoder_inputs.append(obs_td["terrain"])
+    if self.use_root_waypoints:
+      decoder_inputs.append(obs_td["root_waypoints"])
+    return self.decoder(torch.cat(decoder_inputs, dim=-1))
 
   def _compute_aux_loss(
     self,
