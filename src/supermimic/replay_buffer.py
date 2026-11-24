@@ -41,6 +41,12 @@ class ReplayBuffer:
       batch_size=[num_envs, buffer_size],
     )
 
+  def clear(self) -> None:
+    """Discard stored transitions without reallocating the replay tensors."""
+    self.num_transitions = 0
+    self._step = 0
+    self._env_priority.fill_(1)
+
   def insert(self, td: TensorDict) -> None:
     if td.batch_size != torch.Size([self.num_envs]):
       raise ValueError(

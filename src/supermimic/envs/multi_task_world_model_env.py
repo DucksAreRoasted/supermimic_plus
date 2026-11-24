@@ -46,6 +46,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     vision: DepthVision | None = None,
   ) -> None:
     self.vision = vision
+    self.hold_imagined_vision = False
     self.imagined_camera = None
     self.future_feet = None
     self._sensed_terrain = None
@@ -86,7 +87,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
         next_aux, next_state = result[:2]
         if self.imagined_camera is not None:
           self.camera_latent = vision.encode(noise_ranges(self.imagined_camera.ranges(next_aux)))
-        else:
+        elif not self.hold_imagined_vision:
           self.camera_latent = vision.next_latent(self.camera_latent, next_state, action)
     return result
 

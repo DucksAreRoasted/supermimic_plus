@@ -85,6 +85,8 @@ class BaseRunnerCfg:
   shared_head_width: int = 0
   """Hidden width per nonlinear world-model head; zero uses the original linear heads."""
   imagined_vision: Literal["none", "render", "latent"] = "none"
+  hold_imagined_vision: bool = False
+  terrain_curriculum: tuple[tuple[int, float], ...] = ()
   flat_depth_arm: Literal["base", "aux", "full"] | None = None
   depth_fusion: Literal["none", "concat"] = "none"
   cache_motion_reference: bool = False
@@ -112,6 +114,13 @@ class BaseRunnerCfg:
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
   def configure_terrain(self, env_cfg) -> None:
+    if self.hold_imagined_vision and self.imagined_vision != "latent":
+      raise ValueError("Holding visual features requires the latent vision model")
+    if self.terrain_curriculum and (
+      self.terrain_curriculum[0][0] != 0 or self.terrain_landscape_seed is None
+      or not self.terrain_height_reset or self.depth_fusion != "concat"
+    ):
+      raise ValueError("Terrain curriculum requires an initial stage, irregular terrain resets and depth sensing")
     if self.flat_depth_arm is not None:
       expected = "none" if self.flat_depth_arm == "base" else "latent"
       if (self.imagined_vision != expected or self.depth_fusion != "concat"
@@ -899,6 +908,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self.wm_env.future_feet = self.future_feet
       if self.cfg.cache_motion_reference:
         self.wm_env.reference_body_state = self.future_feet.body_state
+    self.wm_env.hold_imagined_vision = self.cfg.hold_imagined_vision
     if self.cfg.imagined_vision == "render":
       from supermimic.tasks.imagined_vision import ImaginedCamera
       self.wm_env.imagined_camera = ImaginedCamera(self.env, self.device, policy_cfg.batch_size)
@@ -1157,6 +1167,12 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     log_dir = self._create_log_dir()
     print(f"[INFO] TensorBoard logs: {log_dir}")
 
+    stages = dict(self.cfg.terrain_curriculum)
+    if stages:
+      from supermimic.tasks.terrain_reset import TerrainHeightSchedule
+
+      terrain_schedule = TerrainHeightSchedule(self.env.unwrapped.sim, self.motion_cmd, self._wm.terrain_query)
+      terrain_schedule.apply(stages[0])
     self.env.reset()
     self._seed_sim_history()
 
@@ -1177,6 +1193,17 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     loss_dict: dict[str, torch.Tensor] = {}
     log_count = 0
     for step in range(self.cfg.max_iterations):
+      if step in stages:
+        print(f"[INFO] Terrain stage at {step}: scale={stages[step]}", flush=True)
+        if step > 0:
+          terrain_schedule.apply(stages[step])
+          with torch.inference_mode():
+            self.env.reset()
+            self.depth_memory.reset(torch.ones(self.env.num_envs, dtype=torch.bool, device=self.device))
+          self.replay_buffer.clear()
+          self.logger.cur_reward_sum.zero_()
+          self.logger.cur_episode_length.zero_()
+          self._seed_sim_history()
       num_collected_steps += self.step()
 
       for _ in range(should_train(step)):

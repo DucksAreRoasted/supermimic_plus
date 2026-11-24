@@ -155,6 +155,10 @@ def main():
                       help="Default: proprio10 from scratch, or the source Actor layout for visual transfer")
   parser.add_argument("--root-waypoints", action="store_true",
                       help="Expose current and future reference pelvis XY in the Actor decoder")
+  parser.add_argument("--terrain-curriculum", action="store_true",
+                      help="Start flat, then ramp to the existing mild rough-ground benchmark")
+  parser.add_argument("--hold-imagined-vision", action="store_true",
+                      help="Train latent forecasts, but hold the initial feature during policy rollouts")
   parser.add_argument("--terrain-height-reset", action="store_true",
                       help="Add the local ground height to the sampled pelvis reset pose")
   parser.add_argument("--num-envs", type=int, default=4096)
@@ -204,6 +208,23 @@ def main():
                        terrain_height_reset=args.terrain_height_reset, official_backends=args.official_backends,
                        cache_reference=args.cache_reference, wm_lr=args.wm_lr, actor_input=actor_input,
                        pelvis_motion_goal=goal_width == 68)
+  if args.terrain_curriculum:
+    if (args.iterations < 20 or args.flat_depth_arm or args.vision_base_checkpoint
+        or not args.terrain_height_reset or args.imagined_vision == "render"):
+      parser.error("Terrain curriculum requires a scratch run of at least 20 iterations with terrain-height resets")
+    cfg.terrain_height *= 0.25
+    cfg.terrain_lateral_height *= 0.25
+    cfg.terrain_landscape_seed = 1701
+    cfg.terrain_curriculum = tuple(
+      (args.iterations * percent // 100, scale)
+      for percent, scale in ((0, 0.0), (20, 0.25), (30, 0.5), (40, 0.75), (50, 1.0))
+    )
+    cfg.run_name += "-curriculum"
+  cfg.hold_imagined_vision = args.hold_imagined_vision
+  if args.hold_imagined_vision:
+    if args.imagined_vision != "latent":
+      parser.error("--hold-imagined-vision requires --imagined-vision latent")
+    cfg.run_name += "-held"
   if args.flat_depth_arm:
     if (args.vision_base_checkpoint or args.terrain_height_reset or args.root_waypoints
         or args.imagined_vision != "none"):
