@@ -282,3 +282,18 @@ class TestUpdateNormalization:
     vel_norm = actor.goal_normalizers["velocity"]
     assert torch.isfinite(vel_norm._mean).all()
     assert torch.isfinite(vel_norm._std).all()
+
+
+def test_hidden_visual_projection_preserves_initial_actions_and_blocks_encoder_gradients():
+  actor = _make_actor()
+  obs = make_actor_obs(BATCH, history_length=1)
+  z = torch.randn(BATCH, 32, requires_grad=True)
+  obs["camera_latent"] = z
+  original = actor(obs).detach()
+  actor.visual_hidden = torch.nn.Linear(32, actor.decoder[0].out_features, bias=False)
+  torch.nn.init.zeros_(actor.visual_hidden.weight)
+  actions = actor(obs)
+  torch.testing.assert_close(actions, original, atol=0, rtol=0)
+  actions.square().mean().backward()
+  assert actor.visual_hidden.weight.grad.norm() > 0
+  assert z.grad is None

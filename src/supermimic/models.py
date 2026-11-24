@@ -332,6 +332,7 @@ class MultiEncoderAE(nn.Module):
         self.prior[-1].weight[self.latent_dim :].zero_()
         self.prior[-1].bias[self.latent_dim :].zero_()
 
+    self.visual_hidden = None
     self.visual_action = None
     self.foot_depth_fusion: nn.Module | None = None
     self.set_slot_mix(slot_mix)
@@ -412,7 +413,14 @@ class MultiEncoderAE(nn.Module):
       decoder_inputs.append(obs_td["terrain"])
     if self.use_root_waypoints:
       decoder_inputs.append(obs_td["root_waypoints"])
-    return self.decoder(torch.cat(decoder_inputs, dim=-1))
+    inputs = torch.cat(decoder_inputs, dim=-1)
+    if self.visual_hidden is None:
+      return self.decoder(inputs)
+    # Splitting the first affine map preserves the seeded state/goal weights.
+    hidden = self.decoder[0](inputs) + self.visual_hidden(obs_td["camera_latent"].detach())
+    for layer in self.decoder[1:]:
+      hidden = layer(hidden)
+    return hidden
 
   def _compute_aux_loss(
     self,

@@ -28,6 +28,7 @@ class WorldModelLearnerCfg:
   num_batches: int = 10
   batch_size: int = 2048
   horizon: int = 8
+  detach_visual_state: bool = False
 
   # Loss Weights (Bryson's Rule) — integrated root pose, both representations
   nominal_error_root_pose_pos: float = 0.01
@@ -178,7 +179,8 @@ class WorldModelLearner:
       # 3. Backprop
       loss = loss_state
       if self.dynamics.vision is not None:
-        recon, forecast = self.dynamics.vision.losses(td["camera_pixels"], pred_rep_states, actions)
+        visual_states = pred_rep_states.detach() if self.cfg.detach_visual_state else pred_rep_states
+        recon, forecast = self.dynamics.vision.losses(td["camera_pixels"], visual_states, actions)
         loss = loss + recon
         recon_losses.append(recon.detach())
         if forecast is not None:

@@ -176,6 +176,9 @@ def main():
                       help="Use replay and optimization settings from an archived run manifest")
   parser.add_argument("--flat-depth-arm", choices=("base", "aux", "full"),
                       help="Flat ground with leg fusion; compare no vision, auxiliary-only, or full latent")
+  parser.add_argument("--max-iteration-compute-seconds", type=float, default=0.0)
+  parser.add_argument("--vision-hidden-fusion", action="store_true")
+  parser.add_argument("--detach-visual-state", action="store_true")
   parser.add_argument("--imagined-vision", choices=("none", "render", "latent"), default="none")
   parser.add_argument("--lafan40-protocol", type=Path, help="Use all 40 checksum-verified clips, in protocol order")
   parser.add_argument("--seed", type=int, default=42)
@@ -220,6 +223,11 @@ def main():
       for percent, scale in ((0, 0.0), (20, 0.25), (30, 0.5), (40, 0.75), (50, 1.0))
     )
     cfg.run_name += "-curriculum"
+  cfg.max_iteration_compute_seconds = args.max_iteration_compute_seconds
+  cfg.vision_hidden_fusion = args.vision_hidden_fusion
+  cfg.wm.detach_visual_state = args.detach_visual_state
+  if cfg.vision_hidden_fusion:
+    cfg.run_name += "-hiddenfusion"
   cfg.hold_imagined_vision = args.hold_imagined_vision
   if args.hold_imagined_vision:
     if args.imagined_vision != "latent":
@@ -282,7 +290,7 @@ def main():
     )
   }
   print(json.dumps({"initial_parameter_sha256": initial}), flush=True)
-  if args.flat_depth_arm:
+  if args.flat_depth_arm or args.terrain_curriculum:
     from tensordict import TensorDict
 
     # Fixed nonzero inputs exercise both leg modulators and the optional visual projection.
@@ -303,7 +311,7 @@ def main():
     }, batch_size=[4])
     with torch.no_grad():
       action = actor(obs).contiguous().cpu().numpy()
-    shared = dict(actor=initial_parameter_hash(actor, exclude_prefix="visual_action."),
+    shared = dict(actor=initial_parameter_hash(actor, exclude_prefix=("visual_action.", "visual_hidden.")),
                   dynamics=initial_parameter_hash(runner._dynamics, exclude_prefix="vision."),
                   critic=initial["critic"], action=hashlib.sha256(action.tobytes()).hexdigest())
     print(json.dumps({"shared_initialization": shared}), flush=True)

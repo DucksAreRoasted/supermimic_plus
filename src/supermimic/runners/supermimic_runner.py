@@ -85,6 +85,8 @@ class BaseRunnerCfg:
   shared_head_width: int = 0
   """Hidden width per nonlinear world-model head; zero uses the original linear heads."""
   imagined_vision: Literal["none", "render", "latent"] = "none"
+  max_iteration_compute_seconds: float = 0.0
+  vision_hidden_fusion: bool = False
   hold_imagined_vision: bool = False
   terrain_curriculum: tuple[tuple[int, float], ...] = ()
   flat_depth_arm: Literal["base", "aux", "full"] | None = None
@@ -114,6 +116,8 @@ class BaseRunnerCfg:
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
   def configure_terrain(self, env_cfg) -> None:
+    if self.vision_hidden_fusion and (self.imagined_vision == "none" or self.flat_depth_arm == "aux"):
+      raise ValueError("Hidden visual fusion requires an active visual Actor")
     if self.hold_imagined_vision and self.imagined_vision != "latent":
       raise ValueError("Holding visual features requires the latent vision model")
     if self.terrain_curriculum and (
@@ -379,8 +383,13 @@ def build_actor(
   if cfg.imagined_vision != "none" and cfg.flat_depth_arm != "aux":
     from supermimic.tasks.imagined_vision import LATENT_DIM
     with torch.random.fork_rng(devices=[]):
-      actor.visual_action = nn.Linear(LATENT_DIM, wm.num_actions, bias=False).to(device)
-      nn.init.zeros_(actor.visual_action.weight)
+      width = actor.decoder[0].out_features if cfg.vision_hidden_fusion else wm.num_actions
+      projection = nn.Linear(LATENT_DIM, width, bias=False).to(device)
+      nn.init.zeros_(projection.weight)
+      if cfg.vision_hidden_fusion:
+        actor.visual_hidden = projection
+      else:
+        actor.visual_action = projection
   if cfg.reference_residual_policy:
     return ReferenceResidualPolicy(
       actor,
@@ -707,7 +716,8 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
           raise ValueError("Visual transfer requires compatible depth fusion")
         if "visual_action.weight" in actor_state or any(k.startswith("vision.") for k in wm_state["dynamics"]):
           raise ValueError("Unexpected vision parameters in baseline checkpoint")
-        actor_state["visual_action.weight"] = torch.zeros_like(actor.visual_action.weight)
+        projection = "visual_hidden" if self.cfg.vision_hidden_fusion else "visual_action"
+        actor_state[projection + ".weight"] = torch.zeros_like(getattr(actor, projection).weight)
         wm_state["dynamics"] = {**wm_state["dynamics"], **{
           "vision." + k: v for k, v in self._dynamics.vision.state_dict().items()
         }}
@@ -1204,6 +1214,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           self.logger.cur_reward_sum.zero_()
           self.logger.cur_episode_length.zero_()
           self._seed_sim_history()
+      if self.cfg.max_iteration_compute_seconds:
+        torch.cuda.synchronize(self.device)
+        iteration_started = time.perf_counter()
       num_collected_steps += self.step()
 
       for _ in range(should_train(step)):
@@ -1236,6 +1249,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         loss_dict.update(wm_logs)
         loss_dict.update(policy_logs)
 
+      if self.cfg.max_iteration_compute_seconds:
+        torch.cuda.synchronize(self.device)
+        seconds = time.perf_counter() - iteration_started
+        with open("iteration-seconds.tsv", "a") as timing:
+          print(step + 1, seconds, sep="\t", file=timing)
+        if step >= 64 and seconds > self.cfg.max_iteration_compute_seconds:
+          raise RuntimeError(f"Iteration {step + 1} compute time exceeded limit: {seconds:.3f}s")
       if step % self.cfg.log_interval == 0:
         elapsed_time = time.time() - start_time
         total_train_time = wm_learn_time + policy_learn_time
