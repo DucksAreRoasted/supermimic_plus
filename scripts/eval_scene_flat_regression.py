@@ -30,7 +30,8 @@ from supermimic.tasks.walk_terrain import (
 
 
 @torch.inference_mode()
-def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save_starts=False):
+def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save_starts=False,
+             rough_scale=1.0, leg_ablation=None):
   cfg = load_env_cfg("SuperMimic-GenCoord-G1", play=True)
   runner = checkpoint_config(checkpoint)
   camera_cfg = walking_camera() if runner.depth_fusion != "none" else None
@@ -45,7 +46,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
   if rough_seed is not None:
     from supermimic.tasks.terrain_reset import TerrainResetMotionCommandCfg
 
-    cfg.scene.spec_fn = IrregularWalkTerrain(height=0.09, lateral_height=0.04, landscape_seed=rough_seed)
+    cfg.scene.spec_fn = IrregularWalkTerrain(height=0.09 * rough_scale, lateral_height=0.04 * rough_scale, landscape_seed=rough_seed)
     cfg.scene.env_spacing = 0.0
     cfg.commands["motion"] = TerrainResetMotionCommandCfg.from_motion(cfg.commands["motion"])
     cfg.sim.mujoco.iterations = cfg.sim.mujoco.ls_iterations = 60
@@ -125,6 +126,18 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
                               if k.startswith("vision.")})
       del bundle
     n = len(clips)
+    correction_sum = torch.zeros(n, device=device, dtype=torch.float64)
+    if leg_ablation is not None:
+      if actor.foot_depth_fusion is None:
+        raise ValueError("Leg ablation requires a trained leg modulator")
+      def measure_leg_delta(module, inputs, output):
+        base = inputs[0]
+        delta = (output - base)[:, module.legs.flatten()]
+        if leg_ablation == "off":
+          return base
+        correction_sum.add_(delta.abs().mean(-1) * active)
+        return output
+      actor.foot_depth_fusion.register_forward_hook(measure_leg_delta)
     ground = TerrainObservation(cfg.scene.spec_fn).to(device)
     if camera_cfg is not None:
       camera = sim.scene["walk_depth"]
@@ -144,20 +157,28 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     history = None
     slip_distance = torch.zeros_like(xy_error)
     stance_time = torch.zeros_like(xy_error)
-    measure_slip = runner.flat_depth_arm is not None and rough_seed is None
+    measure_slip = (runner.flat_depth_arm is not None and rough_seed is None) or leg_ablation is not None
     if measure_slip:
       foot_ids, _ = motion.robot.find_sites(["left_foot", "right_foot"])
       if len(foot_ids) != 2:
         raise ValueError("Expected both sole sites for the stance-slip metric")
-      previous_feet = None
+      previous_feet = previous_stance = None
+      landing_history = torch.zeros((5, n), device=device, dtype=torch.long)
+      landings = torch.zeros_like(counts)
+      failed_landings = torch.zeros_like(counts)
     for t in range(max(frames)):
       if measure_slip:
         feet = motion.robot.data.site_pos_w[:, foot_ids]
+        near = feet[..., 2] - ground.height_at(feet[..., :2]) < .02
         if previous_feet is not None:
-          stance = (feet[..., 2] < .02) & (previous_feet[..., 2] < .02) & active[:, None]
+          landed = (near & ~previous_stance & active[:, None]).sum(1)
+          landings += landed
+          landing_history[t % 5] = landed
+          stance = near & previous_stance & active[:, None]
           slip_distance += ((feet[..., :2] - previous_feet[..., :2]).norm(dim=-1) * stance).sum(1)
           stance_time += stance.sum(1) * sim.step_dt
         previous_feet = feet.clone()
+        previous_stance = near
       motion._update_metrics()
       xy = (motion.motion.root_pos_w[motion.time_steps, :2] + sim.scene.env_origins[:, :2]
             - sim.sim.data.qpos[:, :2]).norm(dim=-1)
@@ -204,6 +225,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
         raise RuntimeError("Unexpected timeout during a flat regression clip")
       totals["return"] += torch.where(active, reward, 0.0)
       counts += active.long()
+      if measure_slip:
+        failed_landings += (active & terminated) * landing_history.sum(0)
       completed |= active & ended & ~terminated
       active &= ~done
       if t % 1000 == 0:
@@ -229,6 +252,9 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       for i, row in enumerate(rows):
         row["stance_sole_speed_m_s"] = float(slip_distance[i] / stance_time[i]) if stance_time[i] > 0 else None
         row["stance_foot_seconds"] = float(stance_time[i])
+        if leg_ablation is not None:
+          row.update(landings=int(landings[i]), landings_followed_by_failure_5steps=int(failed_landings[i]),
+                     mean_abs_applied_leg_delta=float(correction_sum[i] / counts[i]))
     return dict(
       checkpoint=str(checkpoint),
       actor_sha256=hashlib.sha256((checkpoint / "actor.pt").read_bytes()).hexdigest(),
@@ -236,6 +262,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       completed=int(completed.sum()),
       motions=n,
       terrain_seed=rough_seed,
+      rough_scale=rough_scale if rough_seed is not None else None,
+      leg_ablation=leg_ablation,
       starts_sha256=hashlib.sha256(starts_file.read_bytes()).hexdigest(),
       mean_pelvis_xy_error_m=float((xy_error / counts).mean()),
       means={
@@ -255,10 +283,15 @@ if __name__ == "__main__":
   p.add_argument("--device", default="cuda:0")
   p.add_argument("--rough-seed", type=int, help="Evaluate all clips on an irregular 9/4 cm field")
   p.add_argument("--save-starts", action="store_true", help="Create a new paired start snapshot")
+  p.add_argument("--rough-scale", type=float, default=1.0)
+  p.add_argument("--leg-ablation", choices=("on", "off"))
   a = p.parse_args()
+  if not np.isfinite(a.rough_scale) or a.rough_scale <= 0:
+    p.error("rough-scale must be finite and positive")
   result = evaluate(
     a.checkpoint, json.loads(a.protocol.read_text()), a.starts, a.device,
     rough_seed=a.rough_seed, save_starts=a.save_starts,
+    rough_scale=a.rough_scale, leg_ablation=a.leg_ablation,
   )
   a.output.parent.mkdir(exist_ok=True, parents=True)
   a.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
