@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import mjlab.tasks  # noqa: F401
 import numpy as np
 import torch
+from mjlab.utils.lab_api.math import quat_apply_inverse, yaw_quat
 from eval_walk_terrain import checkpoint_config
 from mjlab.tasks.registry import load_env_cfg
 
@@ -31,7 +32,7 @@ from supermimic.tasks.walk_terrain import (
 
 @torch.inference_mode()
 def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save_starts=False,
-             rough_scale=1.0, leg_ablation=None):
+             rough_scale=1.0, leg_ablation=None, base_terrain=None):
   cfg = load_env_cfg("SuperMimic-GenCoord-G1", play=True)
   runner = checkpoint_config(checkpoint)
   camera_cfg = walking_camera() if runner.depth_fusion != "none" else None
@@ -126,6 +127,17 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
                               if k.startswith("vision.")})
       del bundle
     n = len(clips)
+    if base_terrain is not None and (camera_cfg is None or runner.terrain_inputs == "blind"):
+      raise ValueError("Base terrain ablation requires the measured terrain input")
+    motion_groups = ("forward", "lateral", "turn", "backward", "other")
+    if base_terrain is not None:
+      # Per-motion counts grouped by reference travel direction at each active step.
+      terrain_counts = torch.zeros(n, len(motion_groups), 4, device=device, dtype=torch.long)
+      group_ids = torch.arange(len(motion_groups), device=device)
+      root_history = torch.empty(12, n, 7, device=device)
+      group_history = torch.empty(12, n, device=device, dtype=torch.long)
+      landing_counts = torch.zeros(n, len(motion_groups), 3, 2, device=device, dtype=torch.long)
+
     correction_sum = torch.zeros(n, device=device, dtype=torch.float64)
     if leg_ablation is not None:
       if actor.foot_depth_fusion is None:
@@ -144,6 +156,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       memory = DepthMemory(n, device, sim.step_dt, camera_cfg.pattern)
       patch = MeasuredPatch(ground.offsets)
       future_feet = FutureFeet(motion)
+    if base_terrain is not None:
+      grid_min, grid_max = ground.offsets.amin(0), ground.offsets.amax(0)
     active = torch.ones(n, dtype=torch.bool, device=device)
     counts = torch.zeros(n, dtype=torch.int64, device=device)
     completed = torch.zeros_like(active)
@@ -157,7 +171,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     history = None
     slip_distance = torch.zeros_like(xy_error)
     stance_time = torch.zeros_like(xy_error)
-    measure_slip = (runner.flat_depth_arm is not None and rough_seed is None) or leg_ablation is not None
+    measure_slip = (runner.flat_depth_arm is not None and rough_seed is None) or leg_ablation is not None or base_terrain is not None
     if measure_slip:
       foot_ids, _ = motion.robot.find_sites(["left_foot", "right_foot"])
       if len(foot_ids) != 2:
@@ -168,6 +182,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       failed_landings = torch.zeros_like(counts)
     for t in range(max(frames)):
       if measure_slip:
+        previous_stance_at_start = previous_stance
         feet = motion.robot.data.site_pos_w[:, foot_ids]
         near = feet[..., 2] - ground.height_at(feet[..., :2]) < .02
         if previous_feet is not None:
@@ -203,9 +218,47 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
         memory.update(data.distances, data.pos_w, data.quat_w)
         patch.bind(*patch.capture(memory))
         aux = representation.extract_aux_state(obs["full_state"])
-        td["terrain"] = patch.features(aux)
         td["depth_tokens"] = patch.tokens(aux)
         td["future_feet"] = future_feet(motion.time_steps)
+        base_samples = patch.sample(aux, patch.base_offsets)
+        heights = base_samples[..., 0]
+        td["terrain"] = torch.zeros_like(heights) if base_terrain == "off" else heights
+        if base_terrain is not None:
+          visible = base_samples[..., 1].sum(-1).long()
+          now = motion.time_steps
+          ref = motion.motion
+          ends = ref.motion_ends[torch.searchsorted(ref.motion_ends, now, right=True)]
+          lookahead = torch.minimum(now + 12, ends - 1)
+          yaw = yaw_quat(ref.root_quat_w[now])
+          travel = quat_apply_inverse(yaw, ref.root_pos_w[lookahead] - ref.root_pos_w[now])
+          future_yaw = yaw_quat(ref.root_quat_w[lookahead])
+          turn = (yaw * future_yaw).sum(-1).abs() < 0.99145  # 15 degrees in 12 steps
+          x, y = travel[:, :2].unbind(-1)
+          group = torch.full_like(now, 4)
+          group = torch.where(x > 0.05, 0, group)
+          group = torch.where(x < -0.05, 3, group)
+          group = torch.where((y.abs() > x.abs()) & (y.abs() > 0.05), 1, group)
+          group = torch.where(turn, 2, group)
+          nominal = td["future_feet"][..., :2]
+          inside = ((nominal >= grid_min) & (nominal <= grid_max)).all(-1).sum((1, 2))
+          steps_by_group = (group[:, None] == group_ids) & active[:, None]
+          terrain_counts += steps_by_group[..., None] * torch.stack(
+            (torch.ones_like(visible), visible, inside, torch.full_like(inside, 6)), -1
+          )[:, None]
+          if t:
+            touchdown = near & ~previous_stance_at_start & active[:, None]
+            for slot, horizon in enumerate((4, 8, 12)):
+              if t < horizon:
+                break
+              old_root = root_history[(t - horizon) % 12]
+              old_group = group_history[(t - horizon) % 12]
+              old_yaw = yaw_quat(old_root[:, 3:7])[:, None].expand(-1, 2, -1).contiguous()
+              local = quat_apply_inverse(old_yaw, feet - old_root[:, None, :3])[..., :2]
+              covered = ((local >= grid_min) & (local <= grid_max)).all(-1)
+              tally = torch.stack(((touchdown & covered).sum(1), touchdown.sum(1)), -1)
+              landing_counts[:, :, slot] += (old_group[:, None] == group_ids)[..., None] * tally[:, None]
+          root_history[t % 12] = aux
+          group_history[t % 12] = group
         if vision is not None:
           td["camera_latent"] = vision.encode(data.distances)
       elif runner.terrain_inputs != "blind":
@@ -255,6 +308,14 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
         if leg_ablation is not None:
           row.update(landings=int(landings[i]), landings_followed_by_failure_5steps=int(failed_landings[i]),
                      mean_abs_applied_leg_delta=float(correction_sum[i] / counts[i]))
+    if base_terrain is not None:
+      for row, measurements, touchdowns in zip(rows, terrain_counts.tolist(), landing_counts.tolist(), strict=True):
+        row["terrain_by_motion"] = {
+          group: dict(steps=step_count, valid_points=valid, nominal_inside=inside, nominal_total=total,
+                      touchdown_coverage=dict(zip(("4", "8", "12"), coverage, strict=True)))
+          for group, (step_count, valid, inside, total), coverage
+          in zip(motion_groups, measurements, touchdowns, strict=True)
+        }
     return dict(
       checkpoint=str(checkpoint),
       actor_sha256=hashlib.sha256((checkpoint / "actor.pt").read_bytes()).hexdigest(),
@@ -264,6 +325,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       terrain_seed=rough_seed,
       rough_scale=rough_scale if rough_seed is not None else None,
       leg_ablation=leg_ablation,
+      base_terrain=base_terrain,
       starts_sha256=hashlib.sha256(starts_file.read_bytes()).hexdigest(),
       mean_pelvis_xy_error_m=float((xy_error / counts).mean()),
       means={
@@ -285,13 +347,14 @@ if __name__ == "__main__":
   p.add_argument("--save-starts", action="store_true", help="Create a new paired start snapshot")
   p.add_argument("--rough-scale", type=float, default=1.0)
   p.add_argument("--leg-ablation", choices=("on", "off"))
+  p.add_argument("--base-terrain", choices=("on", "off"), help="Measure or zero only the Actor terrain input")
   a = p.parse_args()
   if not np.isfinite(a.rough_scale) or a.rough_scale <= 0:
     p.error("rough-scale must be finite and positive")
   result = evaluate(
     a.checkpoint, json.loads(a.protocol.read_text()), a.starts, a.device,
     rough_seed=a.rough_seed, save_starts=a.save_starts,
-    rough_scale=a.rough_scale, leg_ablation=a.leg_ablation,
+    rough_scale=a.rough_scale, leg_ablation=a.leg_ablation, base_terrain=a.base_terrain,
   )
   a.output.parent.mkdir(exist_ok=True, parents=True)
   a.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
