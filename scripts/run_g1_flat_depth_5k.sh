@@ -16,7 +16,7 @@ for arm in base aux full; do
   echo "Training $arm" > status
   "$python_bin" "$repo/scripts/train_g1_dual_head_depth.py" --flat-depth-arm "$arm" \
     --lafan40-protocol "$protocol" --cache-reference --official-backends --goal-width 68 \
-    --actor-input proprio10 --seed 42 --iterations 5000 --num-envs 4096 \
+    --actor-input proprio1 --seed 42 --iterations 5000 --num-envs 4096 \
     --batch 2048 --policy-batch 4096 --actor-microbatch 2048 > "$arm.log" 2>&1
 done
 cd "$repo"
