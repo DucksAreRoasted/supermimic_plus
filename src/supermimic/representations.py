@@ -78,8 +78,10 @@ def create_representation(
     raise ValueError(
       f"Unknown representation: {name}. Must be 'gencoord' or 'maxcoord'."
     )
+  if actor_obs_mode == "proprio_pelvis" and name != "gencoord":
+    raise ValueError("Pelvis proprioception requires generalized coordinates")
   rep.actor_obs_mode = actor_obs_mode
-  if actor_obs_mode == "proprio":
+  if actor_obs_mode in ("proprio", "proprio_pelvis"):
     rep.register_buffer(
       "_proprio_noise_bounds",
       rep.proprio_noise_bounds(num_actions, default_joint_pos.device),
@@ -272,7 +274,7 @@ class StateRepresentation(nn.Module, ABC):
   rep_state_dim: int
   prediction_dim: int
   num_joints: int
-  actor_obs_mode: Literal["rep_state", "proprio"] = "rep_state"
+  actor_obs_mode: Literal["rep_state", "proprio", "proprio_pelvis"] = "rep_state"
 
   # Each channel group's nominal-error field on ``WorldModelLearnerCfg``. Every
   # representation scores the integrated root pose; subclasses add their own.
@@ -350,7 +352,7 @@ class StateRepresentation(nn.Module, ABC):
 
   def proprio_obs_dim(self, num_actions: int) -> int:
     """Dim of the deploy-shape sensor proprio."""
-    return sum(self.proprio_term_widths(num_actions))
+    return sum(self.proprio_term_widths(num_actions)) + (4 if self.actor_obs_mode == "proprio_pelvis" else 0)
 
   def proprio_term_widths(self, num_actions: int) -> list[int]:
     """Widths of ``[projected_gravity, base_ang_vel, joint_pos, joint_vel, actions]``,
@@ -380,7 +382,17 @@ class StateRepresentation(nn.Module, ABC):
   def add_proprio_noise(self, obs: torch.Tensor) -> torch.Tensor:
     """Add per-dim uniform proprio jitter — the single noise site shared by the
     synthesized sensor and the real-sim / imagination history rings."""
+    if self.actor_obs_mode == "proprio_pelvis":
+      base = obs[..., :-4]
+      noisy = base + ((torch.rand_like(base) * 2 - 1) * self._proprio_noise_bounds).detach()
+      return torch.cat((noisy, obs[..., -4:]), -1)
     return obs + ((torch.rand_like(obs) * 2 - 1) * self._proprio_noise_bounds).detach()
+
+  def append_pelvis_sensor(self, obs: torch.Tensor, rep_state: torch.Tensor) -> torch.Tensor:
+    if self.actor_obs_mode != "proprio_pelvis":
+      return obs
+    height, _, velocity, _, _, _ = decompose_rep_state(rep_state)
+    return torch.cat((obs, height, velocity), -1)
 
   def compute_actor_sensor(
     self,
@@ -413,6 +425,7 @@ class StateRepresentation(nn.Module, ABC):
         )
       obs = self.compute_wm_obs(rep_state, aux_state, joint_state, sim_ctx)
       obs = torch.cat([obs, last_action], dim=-1)
+    obs = self.append_pelvis_sensor(obs, rep_state)
     if noisy:
       obs = self.add_proprio_noise(obs)
     return obs

@@ -29,6 +29,7 @@ CLIPS = (
 
 
 ACTOR_INPUTS = {
+  "proprio97x10": ("proprio_pelvis", 10),
   "proprio10": ("proprio", 10),
   "proprio1": ("proprio", 1),
   "state1": ("rep_state", 1),
@@ -267,8 +268,14 @@ def main():
     def probe_input(*shape):
       return torch.linspace(-1, 1, math.prod(shape), device=runner.device).reshape(shape)
 
+    width = actor.obs_normalizer.mean.numel()
+    if cfg.actor_obs == "proprio_pelvis":
+      history = torch.cat((probe_input(4, cfg.history_length, width - 4),
+                           probe_input(4, cfg.history_length, 4)), -1)
+    else:
+      history = probe_input(4, cfg.history_length, width)
     obs = TensorDict({
-      "history": probe_input(4, cfg.history_length, actor.obs_normalizer.mean.numel()),
+      "history": history,
       "goal_motion": probe_input(4, actor.task_specs[0].goal_dim),
       "terrain": probe_input(4, 15), "future_feet": probe_input(4, 2, 3, 9),
       "depth_tokens": probe_input(4, 49, 4), "camera_latent": probe_input(4, 32),

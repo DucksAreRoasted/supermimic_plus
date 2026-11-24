@@ -199,7 +199,8 @@ def evaluate(args):
       other.dynamics.eval()
       models[str(path)] = other
     driver_wm = wm
-    if (actor_cfg.imagined_vision != "none" or actor_cfg.pelvis_motion_goal != model_cfg.pelvis_motion_goal) and args.driver and args.driver != args.checkpoint:
+    if (actor_cfg.imagined_vision != "none" or actor_cfg.pelvis_motion_goal != model_cfg.pelvis_motion_goal
+        or actor_cfg.actor_obs != model_cfg.actor_obs) and args.driver and args.driver != args.checkpoint:
       driver_wm = build_world_model(actor_cfg, env, device)
       driver_wm.load_bundle(torch.load(args.driver / "world_model.pt", map_location=device, weights_only=True))
     actor = build_actor(actor_cfg, driver_wm, device)
@@ -395,7 +396,8 @@ def evaluate(args):
           scan_totals["bend"] += (bend * active[:, None]).sum()
           scan_totals["coverage"] += (coverage * active[:, None]).sum()
           scan_totals["frames"] += active.sum() * bend.shape[1]
-      actor_frame = obs["actor"] if actor_cfg.actor_obs == "proprio" else state
+      actor_frame = (state if actor_cfg.actor_obs == "rep_state"
+                     else driver_wm.representation.append_pelvis_sensor(obs["actor"], state))
       if history is None:
         history = actor_frame[:, None].repeat(1, actor_cfg.history_length, 1)
       elif actor_cfg.history_length == 1:

@@ -105,6 +105,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
         obs[key] = torch.as_tensor(saved[key], device=device)
     representation = GenCoordRepresentation(29, motion.robot.data.default_joint_pos[0])
     # The physical Actor only needs the reference FK joint order for foot fusion.
+    representation.actor_obs_mode = runner.actor_obs
     representation.fk = motion.motion.fk
     representation.pelvis_motion_goal = runner.pelvis_motion_goal
     world = SimpleNamespace(
@@ -169,7 +170,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
         _, goal = representation.compute_wm_goal(motion.motion, motion.time_steps, aux)
       else:
         goal = extract_actor_goal(obs["goal"])
-      sensor = obs["actor"] if runner.actor_obs == "proprio" else rep
+      sensor = (rep if runner.actor_obs == "rep_state"
+                else representation.append_pelvis_sensor(obs["actor"], rep))
       if history is None:
         history = sensor[:, None].repeat(1, runner.history_length, 1)
       else:

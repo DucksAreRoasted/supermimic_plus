@@ -253,6 +253,7 @@ class MultiEncoderAE(nn.Module):
     prior_hidden_dims: tuple[int, ...] | None = None,
     terrain_obs_dim: int = 0,
     use_root_waypoints: bool = False,
+    zero_init_frame_suffix: int = 0,
   ):
     super().__init__()
     if not task_specs:
@@ -295,10 +296,19 @@ class MultiEncoderAE(nn.Module):
       }
     )
     self.decoder = build_mlp(
-      latent_dim + history_length * obs_dim + terrain_obs_dim,
+      latent_dim + history_length * (obs_dim - zero_init_frame_suffix) + terrain_obs_dim,
       hidden_dims,
       output_dim=action_dim,
     )
+    if zero_init_frame_suffix:
+      # Draw exactly the control decoder, then insert trainable zeros in every frame.
+      first = self.decoder[0]
+      frame_end = latent_dim + history_length * (obs_dim - zero_init_frame_suffix)
+      weight = first.weight.detach()
+      frames = weight[:, latent_dim:frame_end].reshape(len(weight), history_length, -1)
+      expanded = torch.nn.functional.pad(frames, (0, zero_init_frame_suffix)).flatten(1)
+      first.weight = nn.Parameter(torch.cat((weight[:, :latent_dim], expanded, weight[:, frame_end:]), 1))
+      first.in_features = first.weight.shape[1]
     if use_root_waypoints:
       # Preserve the seeded decoder and RNG stream. Only the four new input
       # columns start at zero and receive a gradient from the first update.

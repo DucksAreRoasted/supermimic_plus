@@ -8,16 +8,16 @@ import torch
 from supermimic.runners.supermimic_runner import BaseRunner
 
 
-def _runner(history_length: int) -> SimpleNamespace:
+def _runner(history_length: int) -> BaseRunner:
   rep = MagicMock()
   rep.add_proprio_noise.side_effect = lambda x: x + torch.rand_like(x)
-  return SimpleNamespace(
-    cfg=SimpleNamespace(history_length=history_length),
-    _representation=rep,
-    _sim_history=None,
-    device="cpu",
-    env=MagicMock(),
-  )
+  runner = BaseRunner.__new__(BaseRunner)
+  runner.cfg = SimpleNamespace(history_length=history_length, actor_obs="proprio")
+  runner._representation = rep
+  runner._sim_history = None
+  runner.device = "cpu"
+  runner.env = MagicMock()
+  return runner
 
 
 def test_seed_repeats_one_noised_frame():

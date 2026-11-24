@@ -252,7 +252,7 @@ class SuperMimicViewerMixin:
         gt_aux = self.representation.extract_aux_state(curr_gt_states)
         actor_goal = self._build_actor_goal(curr_goals, gt_aux)
         gt_rep_state = self.representation.represent(curr_gt_states)
-        proprio = self.representation.actor_obs_mode == "proprio"
+        proprio = self.representation.actor_obs_mode in ("proprio", "proprio_pelvis")
         sensor = self.representation.compute_actor_sensor(
           gt_rep_state,
           self.sim_ctx,

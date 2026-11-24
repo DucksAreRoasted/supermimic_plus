@@ -7,10 +7,10 @@ from statistics import mean
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 
-def summarize(out):
+def summarize(out, arms=("base", "aux", "full")):
   reports = {}
   reference = None
-  for arm in ("base", "aux", "full"):
+  for arm in arms:
     trial = json.loads((out / f"{arm}.json").read_text())
     rows = trial["per_motion"]
     panel = (trial["starts_sha256"], [(r["motion"], r["planned_frames"]) for r in rows])
@@ -36,4 +36,4 @@ def summarize(out):
 
 
 if __name__ == "__main__":
-  print(json.dumps(summarize(Path(sys.argv[1])), indent=2, allow_nan=False))
+  print(json.dumps(summarize(Path(sys.argv[1]), sys.argv[2:] or ("base", "aux", "full")), indent=2, allow_nan=False))

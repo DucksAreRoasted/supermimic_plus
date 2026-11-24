@@ -66,6 +66,34 @@ class TestDecoderHistory:
     assert not torch.allclose(a1, a2)
 
 
+def test_pelvis_extension_preserves_shared_weights_and_actions():
+  def build(suffix):
+    torch.manual_seed(42)
+    return MultiEncoderAE(
+      obs_dim=93 + suffix, action_dim=29, task_specs=make_actor_specs(),
+      slot_mix={"motion": 1., "velocity": 0.}, latent_dim=32, hidden_dims=(64, 64),
+      latent_bc_weight=0., history_length=10, terrain_obs_dim=15,
+      zero_init_frame_suffix=suffix,
+    )
+
+  control, extended = build(0), build(4)
+  original = control.decoder[0].weight
+  expanded = extended.decoder[0].weight
+  frames = expanded[:, 32:-15].reshape(64, 10, 97)
+  assert frames[..., 93:].count_nonzero() == 0
+  restored = torch.cat((expanded[:, :32], frames[..., :93].flatten(1), expanded[:, -15:]), 1)
+  torch.testing.assert_close(restored, original, rtol=0, atol=0)
+  obs = make_actor_obs(BATCH, history_length=10)
+  obs["history"] = torch.randn(BATCH, 10, 93)
+  obs["terrain"] = torch.randn(BATCH, 15)
+  action = control(obs)
+  obs["history"] = torch.cat((obs["history"], torch.randn(BATCH, 10, 4)), -1)
+  output = extended(obs)
+  torch.testing.assert_close(output, action)
+  output.sum().backward()
+  assert extended.decoder[0].weight.grad[:, 32:-15].reshape(64, 10, 97)[..., -4:].abs().sum() > 0
+
+
 class TestForwardShape:
   def test_output_shape(self):
     actor = _make_actor()

@@ -265,7 +265,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
 
   Resets ``env`` to read its observation dimensions.
   """
-  if cfg.history_length > 1 and cfg.actor_obs != "proprio":
+  if cfg.history_length > 1 and cfg.actor_obs not in ("proprio", "proprio_pelvis"):
     raise RuntimeError(
       "history_length > 1 requires actor_obs='proprio' (--runner.actor-obs proprio)"
     )
@@ -363,6 +363,7 @@ def build_actor(
     history_length=cfg.history_length,
     terrain_obs_dim=TerrainObservation.num_features if cfg.terrain_inputs != "blind" else 0,
     use_root_waypoints=cfg.use_root_waypoints,
+    zero_init_frame_suffix=4 if cfg.actor_obs == "proprio_pelvis" else 0,
   ).to(device)
   if cfg.depth_fusion != "none":
     actor.foot_depth_fusion = FootDepthFusion(cfg.depth_fusion, representation.fk.joint_names).to(device)
@@ -522,10 +523,16 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     """Seed the real-sim obs-history ring with the noised current sensor."""
     if self.cfg.history_length == 1:
       return
-    seed = self._representation.add_proprio_noise(
-      self.env.get_observations()["actor"].to(self.device)
-    )
+    obs = self.env.get_observations()
+    seed = self._representation.add_proprio_noise(self._sim_proprio(obs))
     self._sim_history = seed.unsqueeze(1).repeat(1, self.cfg.history_length, 1)
+
+  def _sim_proprio(self, obs) -> torch.Tensor:
+    sensor = obs["actor"].to(self.device)
+    if self.cfg.actor_obs == "proprio_pelvis":
+      rep = self._representation.represent(obs["full_state"].to(self.device))
+      sensor = self._representation.append_pelvis_sensor(sensor, rep)
+    return sensor
 
   def _collection_history(self, sensor: torch.Tensor) -> torch.Tensor:
     """The ``(B, history_length, sensor_dim)`` window for a real-sim actor step.
@@ -602,7 +609,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     """The buffer carries the real sensor only for its sole reader, the
     history warm-start (``WorldModelEnv.sample_initial_states``)."""
     return (
-      self._representation.actor_obs_mode == "proprio" and self.cfg.history_length > 1
+      self._representation.actor_obs_mode in ("proprio", "proprio_pelvis") and self.cfg.history_length > 1
     )
 
   def _buffer_schema(self) -> dict[str, FieldSpec]:
@@ -976,7 +983,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     motion_times: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> TensorDict:
-    proprio = self.cfg.actor_obs == "proprio"
+    proprio = self.cfg.actor_obs in ("proprio", "proprio_pelvis")
     sensor = self._representation.compute_actor_sensor(
       rep_state,
       sim_ctx,
@@ -1087,7 +1094,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           from supermimic.tasks.imagined_vision import pack_depth
           extra_fields["camera_pixels"] = pack_depth(self.env.unwrapped.scene["walk_depth"].data.distances)
       if self._stores_actor_obs:
-        extra_fields["actor_obs"] = sim_actor_obs
+        extra_fields["actor_obs"] = self._representation.append_pelvis_sensor(sim_actor_obs, rep_state)
 
       next_obs, rewards, dones, extras = self._step_and_store(
         actions,
@@ -1114,7 +1121,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         )
       if self.depth_memory is not None:
         self.depth_memory.reset(dones.bool())
-      self._advance_sim_history(next_obs["actor"].to(self.device), dones)
+      self._advance_sim_history(self._sim_proprio(next_obs), dones)
       self.logger.process_env_step(
         rewards, dones.bool() if self.cfg.critic_variant == "sim-calibrated" else terminated, extras
       )
