@@ -144,3 +144,20 @@ def test_joint_world_model_starts_at_physics_control_and_learns_visual_dynamics(
   _, _, z2 = wm.joint_step(state, args[1], aux, args[3], z1)
   (z2-target).square().mean().backward()
   assert wm.mlp[0].weight.grad.norm() > 0 and wm.visual_input.weight.grad.norm() > 0
+
+
+def test_imagined_joint_state_keeps_the_action_gradient_through_latent():
+  from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
+
+  # The first action influences only z, which influences physics one step later.
+  def step(state, action, aux, ctx, z, *, sensed_terrain):
+    return aux, state + z, z + action
+
+  env = SimpleNamespace(vision=object(), dynamics=SimpleNamespace(visual_input=object(), joint_step=step),
+                        camera_latent=torch.zeros(1), _sensed_terrain=None,
+                        _score_step=lambda aux, state, action, last: state)
+  zero = torch.zeros(1)
+  action = torch.ones(1, requires_grad=True)
+  state = MultiTaskWorldModelEnv._wm_step(env, zero, zero, action, zero, zero)
+  state = MultiTaskWorldModelEnv._wm_step(env, state, zero, zero, zero, zero)
+  torch.testing.assert_close(torch.autograd.grad(state.sum(), action)[0], torch.ones_like(action))
