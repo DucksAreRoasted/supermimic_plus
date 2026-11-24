@@ -26,7 +26,10 @@ def collect(runner):
   runner.env.reset()
   runner._seed_sim_history()
   # Preserve checkpoint normalization statistics throughout this evaluation.
-  with patch.object(runner, "_flush_normalization", runner._pending_norm_updates.clear):
+  with (
+    patch.object(runner, "_flush_normalization", runner._pending_norm_updates.clear),
+    patch.object(runner.logger, "process_env_step", lambda *_: None),
+  ):
     for _ in range(96):
       runner.step()
   return runner.replay_buffer.sample(33, 128).clone()
