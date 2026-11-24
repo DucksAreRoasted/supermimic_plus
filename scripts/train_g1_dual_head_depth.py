@@ -167,6 +167,8 @@ def main():
   parser.add_argument("--official-backends", action="store_true",
                       help="Use the same Torch backend and TF32 configuration as the official entry point")
   parser.add_argument("--vision-base-checkpoint", type=Path, help="Initialize the two physical heads, Actor and Critic from an existing checkpoint")
+  parser.add_argument("--training-reference", type=Path,
+                      help="Use replay and optimization settings from an archived run manifest")
   parser.add_argument("--flat-depth-arm", choices=("base", "aux", "full"),
                       help="Flat ground with leg fusion; compare no vision, auxiliary-only, or full latent")
   parser.add_argument("--imagined-vision", choices=("none", "render", "latent"), default="none")
@@ -218,6 +220,18 @@ def main():
       parser.error("--actor-microbatch must fit the effective policy batch")
     cfg.actor_microbatch_size = args.actor_microbatch
     cfg.run_name += f"-micro{args.actor_microbatch}"
+  if args.training_reference:
+    ref = json.loads(args.training_reference.read_text())["runner_cfg"]
+    cfg.replay_ratio = ref["replay_ratio"]
+    cfg.buffer_size = ref["buffer_size"]
+    cfg.wm.lr = ref["wm"]["lr"]
+    cfg.wm.num_batches = ref["wm"]["num_batches"]
+    cfg.policy.lr = ref["policy"]["lr"]
+    cfg.policy.progress_lr_start = ref["policy"]["progress_lr_start"]
+    cfg.policy.progress_lr_end = ref["policy"]["progress_lr_end"]
+    cfg.policy.progress_lr_steps = ref["policy"]["progress_lr_steps"]
+    cfg.log_interval = ref["log_interval"]
+    cfg.run_name += "-reference-training"
   clips = None
   if args.lafan40_protocol:
     clips = protocol_clips(args.lafan40_protocol)
