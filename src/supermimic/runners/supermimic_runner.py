@@ -86,6 +86,7 @@ class BaseRunnerCfg:
   """Hidden width per nonlinear world-model head; zero uses the original linear heads."""
   imagined_vision: Literal["none", "render", "latent"] = "none"
   max_iteration_compute_seconds: float = 0.0
+  joint_visual_dynamics: bool = False
   vision_hidden_fusion: bool = False
   hold_imagined_vision: bool = False
   terrain_curriculum: tuple[tuple[int, float], ...] = ()
@@ -116,6 +117,8 @@ class BaseRunnerCfg:
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
   def configure_terrain(self, env_cfg) -> None:
+    if self.joint_visual_dynamics and (self.imagined_vision != "latent" or self.hold_imagined_vision or self.wm.detach_visual_state):
+      raise ValueError("Joint dynamics requires autoregressive latent vision and joint gradients")
     if self.vision_hidden_fusion and (self.imagined_vision == "none" or self.flat_depth_arm == "aux"):
       raise ValueError("Hidden visual fusion requires an active visual Actor")
     if self.hold_imagined_vision and self.imagined_vision != "latent":
@@ -337,9 +340,13 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
   ).to(device)
 
   if cfg.imagined_vision != "none":
-    from supermimic.tasks.imagined_vision import DepthVision
+    from supermimic.tasks.imagined_vision import DepthVision, LATENT_DIM
     with torch.random.fork_rng(devices=[]):
-      dynamics.vision = DepthVision(cfg.imagined_vision, representation.rep_state_dim, num_actions).to(device)
+      dynamics.vision = DepthVision(cfg.imagined_vision, representation.rep_state_dim, num_actions,
+                                   joint=cfg.joint_visual_dynamics)
+      if cfg.joint_visual_dynamics:
+        dynamics.enable_joint_vision(LATENT_DIM)
+      dynamics.to(device)
 
   return WorldModel(
     representation=representation,

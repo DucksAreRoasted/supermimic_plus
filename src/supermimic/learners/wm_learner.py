@@ -80,6 +80,7 @@ class WorldModelLearner:
       for name, attr in representation.LOSS_WEIGHT_CONFIG.items()
     }
 
+    self._compiled_joint_rollout = torch.compile(self._joint_rollout)
     self._compiled_rollout = torch.compile(self._rollout)
     self._compiled_compute_losses = torch.compile(self._compute_losses)
     self._compiled_represent = torch.compile(self.representation.represent)
@@ -164,9 +165,14 @@ class WorldModelLearner:
 
       sim_ctx = td["sim_ctx"][:, 0]
 
-      pred_rep_states, pred_aux_states = self._compiled_rollout(
-        init_rep_state, actions, init_aux, sim_ctx
-      )
+      joint = self.dynamics.visual_input is not None
+      if joint:
+        encoded, recon = self.dynamics.vision.reconstruction(td["camera_pixels"])
+        pred_rep_states, pred_aux_states, forecasts = self._compiled_joint_rollout(
+          init_rep_state, actions, init_aux, sim_ctx, encoded[:, 0].detach())
+        forecast = torch.nn.functional.mse_loss(forecasts, encoded[:, 1:].detach())
+      else:
+        pred_rep_states, pred_aux_states = self._compiled_rollout(init_rep_state, actions, init_aux, sim_ctx)
 
       # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
       loss_state, group_mse = self._compiled_compute_losses(
@@ -179,8 +185,9 @@ class WorldModelLearner:
       # 3. Backprop
       loss = loss_state
       if self.dynamics.vision is not None:
-        visual_states = pred_rep_states.detach() if self.cfg.detach_visual_state else pred_rep_states
-        recon, forecast = self.dynamics.vision.losses(td["camera_pixels"], visual_states, actions)
+        if not joint:
+          visual_states = pred_rep_states.detach() if self.cfg.detach_visual_state else pred_rep_states
+          recon, forecast = self.dynamics.vision.losses(td["camera_pixels"], visual_states, actions)
         loss = loss + recon
         recon_losses.append(recon.detach())
         if forecast is not None:
@@ -208,6 +215,15 @@ class WorldModelLearner:
       metrics.update({f"WM/grad_{name}": value for name, value in
                       zip(grad_names, torch.stack(head_grads).mean(0), strict=True)})
     return metrics
+
+  def _joint_rollout(self, state, actions, aux, ctx, z):
+    states, aux_states, latents = [], [], []
+    for k in range(actions.shape[1] - 1):
+      aux, state, z = self.dynamics.joint_step(state, actions[:, k], aux, ctx, z)
+      states.append(state)
+      aux_states.append(aux)
+      latents.append(z)
+    return torch.stack(states, 1), torch.stack(aux_states, 1), torch.stack(latents, 1)
 
   def _rollout(
     self,

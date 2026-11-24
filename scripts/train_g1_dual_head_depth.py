@@ -177,6 +177,7 @@ def main():
   parser.add_argument("--flat-depth-arm", choices=("base", "aux", "full"),
                       help="Flat ground with leg fusion; compare no vision, auxiliary-only, or full latent")
   parser.add_argument("--max-iteration-compute-seconds", type=float, default=0.0)
+  parser.add_argument("--joint-visual-dynamics", action="store_true")
   parser.add_argument("--vision-hidden-fusion", action="store_true")
   parser.add_argument("--detach-visual-state", action="store_true")
   parser.add_argument("--imagined-vision", choices=("none", "render", "latent"), default="none")
@@ -224,6 +225,9 @@ def main():
     )
     cfg.run_name += "-curriculum"
   cfg.max_iteration_compute_seconds = args.max_iteration_compute_seconds
+  cfg.joint_visual_dynamics = args.joint_visual_dynamics
+  if cfg.joint_visual_dynamics:
+    cfg.run_name += "-jointwm"
   cfg.vision_hidden_fusion = args.vision_hidden_fusion
   cfg.wm.detach_visual_state = args.detach_visual_state
   if cfg.vision_hidden_fusion:
@@ -312,7 +316,7 @@ def main():
     with torch.no_grad():
       action = actor(obs).contiguous().cpu().numpy()
     shared = dict(actor=initial_parameter_hash(actor, exclude_prefix=("visual_action.", "visual_hidden.")),
-                  dynamics=initial_parameter_hash(runner._dynamics, exclude_prefix="vision."),
+                  dynamics=initial_parameter_hash(runner._dynamics, exclude_prefix=("vision.", "visual_input.", "visual_delta.")),
                   critic=initial["critic"], action=hashlib.sha256(action.tobytes()).hexdigest())
     print(json.dumps({"shared_initialization": shared}), flush=True)
   if args.expect_control_hashes:

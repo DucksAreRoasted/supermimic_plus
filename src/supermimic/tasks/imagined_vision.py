@@ -29,7 +29,7 @@ def noise_ranges(ranges):
 class DepthVision(nn.Module):
   """The WM optimizer owns the image autoencoder and the optional action-conditioned transition."""
 
-  def __init__(self, mode, state_dim, action_dim):
+  def __init__(self, mode, state_dim, action_dim, *, joint=False):
     super().__init__()
     self.mode = mode
     if mode not in ("render", "latent"):
@@ -62,7 +62,7 @@ class DepthVision(nn.Module):
         nn.ELU(),
         nn.Linear(128, LATENT_DIM),
       )
-      if mode == "latent"
+      if mode == "latent" and not joint
       else None
     )
 
@@ -80,11 +80,15 @@ class DepthVision(nn.Module):
     delta = self.transition(torch.cat((z, state, action), -1))
     return F.layer_norm(z + delta, (LATENT_DIM,))
 
-  def losses(self, pixels, predicted_states, actions):
+  def reconstruction(self, pixels):
     # A sampled sequence contains consecutive frames within the same episode.
     z = self.encode(noise_ranges(unpack_depth(pixels)))
     reconstruction = self.decoder(z.flatten(0, 1)).reshape_as(pixels)
     recon_loss = F.mse_loss(reconstruction, pixels.float() / 255)
+    return z, recon_loss
+
+  def losses(self, pixels, predicted_states, actions):
+    z, recon_loss = self.reconstruction(pixels)
     if self.transition is None:
       return recon_loss, None
     current = z[:, 0].detach()

@@ -78,6 +78,11 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     super()._on_reset(batch)
 
   def _wm_step(self, rep_state, aux_state, action, last_action, sim_ctx):
+    if self.vision is not None and self.dynamics.visual_input is not None:
+      aux, state, z = self.dynamics.joint_step(rep_state, action, aux_state, sim_ctx, self.camera_latent,
+                                                sensed_terrain=self._sensed_terrain)
+      self.camera_latent = z.detach()
+      return self._score_step(aux, state, action, last_action)
     result = super()._wm_step(rep_state, aux_state, action, last_action, sim_ctx,
                               sensed_terrain=self._sensed_terrain)
     vision = self.vision

@@ -185,6 +185,9 @@ class WorldModelEnv(ABC):
       next_aux_state, next_rep_state = self.dynamics(
         rep_state, action, aux_state, sim_ctx, sensed_terrain=sensed_terrain
       )
+    return self._score_step(next_aux_state, next_rep_state, action, last_action)
+
+  def _score_step(self, next_aux_state, next_rep_state, action, last_action):
     next_joint_state = self.representation.joint_state(next_rep_state)
     ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
       self._ref_body_state

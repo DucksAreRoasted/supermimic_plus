@@ -117,6 +117,8 @@ class Dynamics(nn.Module):
       output_dim=representation.prediction_dim,
     )
     self.vision = None
+    self.visual_input = None
+    self.visual_delta = None
     self.shared_head_width = shared_head_width
     if shared_head_width < 0 or (shared_head_width and not (residual_correction and residual_shared_trunk)):
       raise ValueError("Nonlinear heads require a positive width and a shared residual trunk")
@@ -169,6 +171,31 @@ class Dynamics(nn.Module):
         if last_linear.bias is not None:
           nn.init.zeros_(last_linear.bias)
 
+  def enable_joint_vision(self, width):
+    if self.residual_head is None:
+      raise ValueError("Joint vision requires the shared dynamics trunk")
+    self.visual_input = nn.Linear(width, self.mlp[0].out_features, bias=False)
+    self.visual_delta = nn.Linear(self.mlp[-1].in_features, width)
+    nn.init.zeros_(self.visual_input.weight)
+    nn.init.zeros_(self.visual_delta.weight)
+    nn.init.zeros_(self.visual_delta.bias)
+
+  def joint_step(self, state, action, aux, ctx, z, *, sensed_terrain=None):
+    features = self._features(state, action, aux, ctx, sensed_terrain)
+    hidden = self.mlp[0](features) + self.visual_input(z)
+    trunk = self.mlp[1:-1](hidden)
+    next_aux, next_state = self._apply_prediction(aux, state, self._physical_heads(trunk), self.dt)
+    next_z = torch.nn.functional.layer_norm(z + self.visual_delta(trunk), (z.shape[-1],))
+    return next_aux, next_state, next_z
+
+  def _physical_heads(self, trunk):
+    prediction = self.mlp[-1](trunk)
+    correction = self.residual_head(trunk)
+    if self.shared_head_width:
+      prediction = prediction + self.head_mlps[0](trunk)
+      correction = correction + self.head_mlps[1](trunk)
+    return prediction + self.residual_scale * correction
+
   def proc(self, action: torch.Tensor) -> torch.Tensor:
     """Map raw policy output to proc joint commands: ``action * scale + offset``."""
     return action * self.action_scale + self.action_offset
@@ -190,6 +217,17 @@ class Dynamics(nn.Module):
     sim_ctx: torch.Tensor, *, sensed_terrain: torch.Tensor | None = None,
   ) -> torch.Tensor:
     """Predict velocity increments using supplied depth features or the training terrain."""
+    if self.visual_input is not None:
+      raise ValueError("Joint dynamics requires a camera latent; call joint_step")
+    features = self._features(rep_state, action, aux_state, sim_ctx, sensed_terrain)
+    if self.residual_head is not None:
+      return self._physical_heads(self.mlp[:-1](features))
+    prediction = self.mlp(features)
+    if self.residual_mlp is not None:
+      prediction = prediction + self.residual_scale * self.residual_mlp(features)
+    return prediction
+
+  def _features(self, rep_state, action, aux_state, sim_ctx, sensed_terrain):
     state_norm = self.state_normalizer(rep_state)
     action_norm = self.action_normalizer(self.proc(action))
     features = torch.cat([state_norm, action_norm, sim_ctx], dim=-1)
@@ -200,19 +238,7 @@ class Dynamics(nn.Module):
         else sensed_terrain
       )
       features = torch.cat([features, terrain], dim=-1)
-    if self.residual_head is not None:
-      trunk = self.mlp[:-1](features)
-      prediction = self.mlp[-1](trunk)
-      correction = self.residual_head(trunk)
-      if self.shared_head_width:
-        prediction = prediction + self.head_mlps[0](trunk)
-        correction = correction + self.head_mlps[1](trunk)
-      prediction = prediction + self.residual_scale * correction
-    else:
-      prediction = self.mlp(features)
-      if self.residual_mlp is not None:
-        prediction = prediction + self.residual_scale * self.residual_mlp(features)
-    return prediction
+    return features
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
     return [self.state_normalizer, self.action_normalizer]

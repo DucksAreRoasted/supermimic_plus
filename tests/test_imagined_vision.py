@@ -118,3 +118,29 @@ def test_flat_dual_head_transfer_preserves_actions_and_rejects_missing_base_weig
   torch.save(base_actor, tmp_path / "actor.pt")
   with pytest.raises(RuntimeError, match="decoder.0.bias"):
     SuperMimicRunner._load_initial_model(runner)
+
+
+def test_joint_world_model_starts_at_physics_control_and_learns_visual_dynamics():
+  from supermimic.models import Dynamics
+
+  rep = SimpleNamespace(rep_state_dim=7, prediction_dim=7, dt=.02,
+                        apply_prediction=lambda aux, state, delta, dt: (aux, state + delta))
+  wm = Dynamics(rep, 3, 2, torch.ones(3), torch.zeros(3), (16, 16),
+                residual_correction=True, residual_shared_trunk=True, shared_head_width=8)
+  args = (torch.randn(4, 7), torch.randn(4, 3), torch.randn(4, 6), torch.randn(4, 2))
+  original = wm(*args)
+  wm.enable_joint_vision(32)
+  z = torch.randn(4, 32)
+  aux, state, forecast = wm.joint_step(*args, z)
+  torch.testing.assert_close(aux, original[0], atol=0, rtol=0)
+  torch.testing.assert_close(state, original[1], atol=0, rtol=0)
+  target = torch.randn_like(forecast)
+  (forecast-target).square().mean().backward()
+  assert wm.visual_delta.weight.grad.norm() > 0
+  with torch.no_grad():
+    wm.visual_delta.weight.sub_(wm.visual_delta.weight.grad)
+  wm.zero_grad(set_to_none=True)
+  aux, state, z1 = wm.joint_step(*args, z)
+  _, _, z2 = wm.joint_step(state, args[1], aux, args[3], z1)
+  (z2-target).square().mean().backward()
+  assert wm.mlp[0].weight.grad.norm() > 0 and wm.visual_input.weight.grad.norm() > 0

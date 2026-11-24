@@ -121,7 +121,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     if runner.imagined_vision != "none":
       from supermimic.tasks.imagined_vision import DepthVision
 
-      vision = DepthVision(runner.imagined_vision, representation.rep_state_dim, 29).to(device).eval()
+      vision = DepthVision(runner.imagined_vision, representation.rep_state_dim, 29, joint=runner.joint_visual_dynamics).to(device).eval()
       bundle = torch.load(checkpoint / "world_model.pt", map_location=device, weights_only=True)
       vision.load_state_dict({k.removeprefix("vision."): v for k, v in bundle["dynamics"].items()
                               if k.startswith("vision.")})
