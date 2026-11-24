@@ -86,9 +86,11 @@ def scratch_config(iterations, batch, seed, root_waypoints, num_envs, *, terrain
   return cfg
 
 
-def initial_parameter_hash(module, *, omit_waypoint_columns=False):
+def initial_parameter_hash(module, *, omit_waypoint_columns=False, exclude_prefix=None):
   digest = hashlib.sha256()
   for name, param in module.named_parameters():
+    if exclude_prefix and name.startswith(exclude_prefix):
+      continue
     if omit_waypoint_columns and name == "decoder.0.weight":
       if not module.use_root_waypoints or param[:, -4:].count_nonzero().item():
         raise ValueError("Expected four zero-initialized waypoint columns")
@@ -165,6 +167,8 @@ def main():
   parser.add_argument("--official-backends", action="store_true",
                       help="Use the same Torch backend and TF32 configuration as the official entry point")
   parser.add_argument("--vision-base-checkpoint", type=Path, help="Initialize the two physical heads, Actor and Critic from an existing checkpoint")
+  parser.add_argument("--flat-depth-arm", choices=("base", "aux", "full"),
+                      help="Flat ground with leg fusion; compare no vision, auxiliary-only, or full latent")
   parser.add_argument("--imagined-vision", choices=("none", "render", "latent"), default="none")
   parser.add_argument("--lafan40-protocol", type=Path, help="Use all 40 checksum-verified clips, in protocol order")
   parser.add_argument("--seed", type=int, default=42)
@@ -197,6 +201,15 @@ def main():
                        terrain_height_reset=args.terrain_height_reset, official_backends=args.official_backends,
                        cache_reference=args.cache_reference, wm_lr=args.wm_lr, actor_input=actor_input,
                        pelvis_motion_goal=goal_width == 68)
+  if args.flat_depth_arm:
+    if (args.vision_base_checkpoint or args.terrain_height_reset or args.root_waypoints
+        or args.imagined_vision != "none"):
+      parser.error("--flat-depth-arm configures flat geometry and vision from scratch")
+    cfg.flat_depth_arm = args.flat_depth_arm
+    cfg.terrain_height = cfg.terrain_lateral_height = 0.0
+    cfg.terrain_landscape_seed = None
+    cfg.run_name = f"g1-flat-{args.flat_depth_arm}-{args.iterations}it-seed{args.seed}"
+    args.imagined_vision = "none" if args.flat_depth_arm == "base" else "latent"
   if args.policy_batch is not None and args.policy_batch != args.batch:
     cfg.policy.batch_size = args.policy_batch
     cfg.run_name += f"-actorbatch{args.policy_batch}"
@@ -233,6 +246,25 @@ def main():
     )
   }
   print(json.dumps({"initial_parameter_sha256": initial}), flush=True)
+  if args.flat_depth_arm:
+    from tensordict import TensorDict
+
+    # Fixed nonzero inputs exercise both leg modulators and the optional visual projection.
+    def probe_input(*shape):
+      return torch.linspace(-1, 1, math.prod(shape), device=runner.device).reshape(shape)
+
+    obs = TensorDict({
+      "history": probe_input(4, cfg.history_length, actor.obs_normalizer.mean.numel()),
+      "goal_motion": probe_input(4, actor.task_specs[0].goal_dim),
+      "terrain": probe_input(4, 15), "future_feet": probe_input(4, 2, 3, 9),
+      "depth_tokens": probe_input(4, 49, 4), "camera_latent": probe_input(4, 32),
+    }, batch_size=[4])
+    with torch.no_grad():
+      action = actor(obs).contiguous().cpu().numpy()
+    shared = dict(actor=initial_parameter_hash(actor, exclude_prefix="visual_action."),
+                  dynamics=initial_parameter_hash(runner._dynamics, exclude_prefix="vision."),
+                  critic=initial["critic"], action=hashlib.sha256(action.tobytes()).hexdigest())
+    print(json.dumps({"shared_initialization": shared}), flush=True)
   if args.expect_control_hashes:
     if not args.root_waypoints:
       parser.error("--expect-control-hashes requires --root-waypoints")

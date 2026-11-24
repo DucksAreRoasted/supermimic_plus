@@ -49,6 +49,9 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     cfg.scene.env_spacing = 0.0
     cfg.commands["motion"] = TerrainResetMotionCommandCfg.from_motion(cfg.commands["motion"])
     cfg.sim.mujoco.iterations = cfg.sim.mujoco.ls_iterations = 60
+  if runner.flat_depth_arm is not None:
+    cfg.scene.env_spacing = 0.0
+    cfg.sim.mujoco.iterations = cfg.sim.mujoco.ls_iterations = 60
   cfg.seed = protocol["seed"]
   cfg.events = {}
   cfg.sim.nconmax = max(cfg.sim.nconmax or 0, 256)
@@ -81,15 +84,13 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     motion.update_relative_body_poses()
     obs = sim.observation_manager.compute(update_history=True)
     if save_starts:
-      if rough_seed is None:
-        raise ValueError("Recording starts is only supported for a new rough terrain panel")
       starts_file.parent.mkdir(parents=True, exist_ok=True)
       with starts_file.open("xb") as out:
         np.savez(out, qpos=sim.sim.data.qpos.cpu().numpy(), qvel=sim.sim.data.qvel.cpu().numpy(),
                  frames=motion.time_steps.cpu().numpy(), full_state=obs["full_state"].cpu().numpy(),
-                 goal=obs["goal"].cpu().numpy(), rough_seed=rough_seed)
+                 goal=obs["goal"].cpu().numpy(), rough_seed=-1 if rough_seed is None else rough_seed)
     with np.load(starts_file) as saved:
-      if rough_seed is not None and int(saved["rough_seed"]) != rough_seed:
+      if (rough_seed is not None or "rough_seed" in saved) and int(saved["rough_seed"]) != (-1 if rough_seed is None else rough_seed):
         raise ValueError("Saved starts belong to a different terrain")
       for key, states in [
         ("qpos", sim.sim.data.qpos),
@@ -105,6 +106,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     representation = GenCoordRepresentation(29, motion.robot.data.default_joint_pos[0])
     # The physical Actor only needs the reference FK joint order for foot fusion.
     representation.fk = motion.motion.fk
+    representation.pelvis_motion_goal = runner.pelvis_motion_goal
     world = SimpleNamespace(
       representation=representation, num_actions=29, num_goals=obs["goal"].shape[-1]
     )
@@ -138,7 +140,23 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       for k in (*metrics, "return")
     }
     xy_error = torch.zeros(n, device=device, dtype=torch.float64)
+    history = None
+    slip_distance = torch.zeros_like(xy_error)
+    stance_time = torch.zeros_like(xy_error)
+    measure_slip = runner.flat_depth_arm is not None and rough_seed is None
+    if measure_slip:
+      foot_ids, _ = motion.robot.find_sites(["left_foot", "right_foot"])
+      if len(foot_ids) != 2:
+        raise ValueError("Expected both sole sites for the stance-slip metric")
+      previous_feet = None
     for t in range(max(frames)):
+      if measure_slip:
+        feet = motion.robot.data.site_pos_w[:, foot_ids]
+        if previous_feet is not None:
+          stance = (feet[..., 2] < .02) & (previous_feet[..., 2] < .02) & active[:, None]
+          slip_distance += ((feet[..., :2] - previous_feet[..., :2]).norm(dim=-1) * stance).sum(1)
+          stance_time += stance.sum(1) * sim.step_dt
+        previous_feet = feet.clone()
       motion._update_metrics()
       xy = (motion.motion.root_pos_w[motion.time_steps, :2] + sim.scene.env_origins[:, :2]
             - sim.sim.data.qpos[:, :2]).norm(dim=-1)
@@ -146,7 +164,17 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       for key in metrics:
         totals[key] += torch.where(active, motion.metrics[key], 0.0)
       rep = world.representation.represent(obs["full_state"])
-      td = build_actor_obs_td({"motion": extract_actor_goal(obs["goal"])}, rep[:, None])
+      aux = representation.extract_aux_state(obs["full_state"])
+      if runner.pelvis_motion_goal:
+        _, goal = representation.compute_wm_goal(motion.motion, motion.time_steps, aux)
+      else:
+        goal = extract_actor_goal(obs["goal"])
+      sensor = obs["actor"] if runner.actor_obs == "proprio" else rep
+      if history is None:
+        history = sensor[:, None].repeat(1, runner.history_length, 1)
+      else:
+        history = torch.cat((history[:, 1:], sensor[:, None]), 1)
+      td = build_actor_obs_td({"motion": goal}, history)
       if camera_cfg is not None:
         data = camera.data
         memory.update(data.distances, data.pos_w, data.quat_w)
@@ -195,6 +223,10 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       )
       for i in range(n)
     ]
+    if measure_slip:
+      for i, row in enumerate(rows):
+        row["stance_sole_speed_m_s"] = float(slip_distance[i] / stance_time[i]) if stance_time[i] > 0 else None
+        row["stance_foot_seconds"] = float(stance_time[i])
     return dict(
       checkpoint=str(checkpoint),
       actor_sha256=hashlib.sha256((checkpoint / "actor.pt").read_bytes()).hexdigest(),
@@ -220,7 +252,7 @@ if __name__ == "__main__":
     p.add_argument(arg, type=Path)
   p.add_argument("--device", default="cuda:0")
   p.add_argument("--rough-seed", type=int, help="Evaluate all clips on an irregular 9/4 cm field")
-  p.add_argument("--save-starts", action="store_true", help="Create a new paired rough-ground snapshot")
+  p.add_argument("--save-starts", action="store_true", help="Create a new paired start snapshot")
   a = p.parse_args()
   result = evaluate(
     a.checkpoint, json.loads(a.protocol.read_text()), a.starts, a.device,

@@ -85,6 +85,7 @@ class BaseRunnerCfg:
   shared_head_width: int = 0
   """Hidden width per nonlinear world-model head; zero uses the original linear heads."""
   imagined_vision: Literal["none", "render", "latent"] = "none"
+  flat_depth_arm: Literal["base", "aux", "full"] | None = None
   depth_fusion: Literal["none", "concat"] = "none"
   cache_motion_reference: bool = False
   terrain_landscape_seed: int | None = None
@@ -111,6 +112,12 @@ class BaseRunnerCfg:
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
   def configure_terrain(self, env_cfg) -> None:
+    if self.flat_depth_arm is not None:
+      expected = "none" if self.flat_depth_arm == "base" else "latent"
+      if (self.imagined_vision != expected or self.depth_fusion != "concat"
+          or self.terrain_height != 0 or self.terrain_lateral_height != 0
+          or self.terrain_landscape_seed is not None or self.representation != "gencoord"):
+        raise ValueError("Invalid flat depth ablation configuration")
     if self.imagined_vision != "none" and (self.depth_fusion != "concat" or not self.shared_head_width):
       raise ValueError("Imagined vision requires the camera-enabled dual-head G1 model")
     if self.terrain_height_reset and (self.terrain_height <= 0 or self.cuda_graph_collection):
@@ -126,7 +133,7 @@ class BaseRunnerCfg:
       env_cfg.scene.sensors = (*env_cfg.scene.sensors, walking_camera())
     if self.terrain_height == 0 and self.terrain_inputs == "blind":
       return
-    if self.terrain_height <= 0 or self.representation != "gencoord":
+    if self.flat_depth_arm is None and (self.terrain_height <= 0 or self.representation != "gencoord"):
       raise ValueError("Terrain conditioning requires a positive G1 walking-course height")
     if env_cfg.scene.spec_fn is not None:
       raise ValueError("The scene already has a custom MuJoCo model")
@@ -359,7 +366,7 @@ def build_actor(
   ).to(device)
   if cfg.depth_fusion != "none":
     actor.foot_depth_fusion = FootDepthFusion(cfg.depth_fusion, representation.fk.joint_names).to(device)
-  if cfg.imagined_vision != "none":
+  if cfg.imagined_vision != "none" and cfg.flat_depth_arm != "aux":
     from supermimic.tasks.imagined_vision import LATENT_DIM
     with torch.random.fork_rng(devices=[]):
       actor.visual_action = nn.Linear(LATENT_DIM, wm.num_actions, bias=False).to(device)
@@ -549,7 +556,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       + self._num_goals
       + self._sim_context.output_dim
     )
-    if self.cfg.terrain_height:
+    if self._wm.terrain_query is not None:
       critic_dim += TerrainObservation.num_features
     return actor_dim, critic_dim
 
@@ -889,7 +896,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       from supermimic.tasks.imagined_vision import ImaginedCamera
       self.wm_env.imagined_camera = ImaginedCamera(self.env, self.device, policy_cfg.batch_size)
     if (
-      self.cfg.imagined_vision != "none" and self.cfg.representation == "gencoord"
+      (self.cfg.imagined_vision != "none" or self.cfg.flat_depth_arm is not None)
+      and self.cfg.representation == "gencoord"
       and torch.device(self.device).type == "cuda"
       and (os.getenv("SUPERMIMIC_DISABLE_COMPILE") == "1" or os.getenv("TORCH_COMPILE_DISABLE") == "1")
     ):
@@ -1019,7 +1027,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self.motion, motion_times, aux_state
     )
     parts = [rep_state, wm_goal, sim_ctx]
-    if self.cfg.terrain_height:
+    if self._wm.terrain_query is not None:
       parts.append(self._wm.terrain_query.features(aux_state))
     return torch.cat(parts, dim=-1)
 
