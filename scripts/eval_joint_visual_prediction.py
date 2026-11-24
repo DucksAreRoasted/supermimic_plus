@@ -40,7 +40,7 @@ def score(runner, batch):
   rep, wm = runner._representation, runner._dynamics
   truth = rep.represent(batch["state"])
   aux_truth = rep.extract_aux_state(batch["state"])
-  encoded = wm.vision.encode(unpack_depth(batch["camera_pixels"]))
+  encoded = wm.vision.encode(batch["camera_pixels"] if wm.vision.aligned else unpack_depth(batch["camera_pixels"]))
   state, aux, z = truth[:, 0], aux_truth[:, 0], encoded[:, 0]
   runner.world_model_learner.depth_patch.bind_replay(batch[:, 0])
   metrics = {}

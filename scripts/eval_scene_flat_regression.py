@@ -35,7 +35,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
              rough_scale=1.0, leg_ablation=None, base_terrain=None):
   cfg = load_env_cfg("SuperMimic-GenCoord-G1", play=True)
   runner = checkpoint_config(checkpoint)
-  camera_cfg = walking_camera() if runner.depth_fusion != "none" else None
+  camera_cfg = walking_camera(runner.camera_profile) if runner.depth_fusion != "none" else None
   if camera_cfg is not None or rough_seed is not None:
     cfg.scene.sensors = (*cfg.scene.sensors, camera_cfg or walking_camera())
   clips = protocol["clips"]
@@ -121,7 +121,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     if runner.imagined_vision != "none":
       from supermimic.tasks.imagined_vision import DepthVision
 
-      vision = DepthVision(runner.imagined_vision, representation.rep_state_dim, 29, joint=runner.joint_visual_dynamics).to(device).eval()
+      vision = DepthVision(runner.imagined_vision, representation.rep_state_dim, 29, joint=runner.joint_visual_dynamics, camera_profile=runner.camera_profile).to(device).eval()
       bundle = torch.load(checkpoint / "world_model.pt", map_location=device, weights_only=True)
       vision.load_state_dict({k.removeprefix("vision."): v for k, v in bundle["dynamics"].items()
                               if k.startswith("vision.")})
@@ -215,7 +215,11 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       td = build_actor_obs_td({"motion": goal}, history)
       if camera_cfg is not None:
         data = camera.data
-        memory.update(data.distances, data.pos_w, data.quat_w)
+        if runner.camera_profile == "instinct":
+          cnn_image, _ = camera.observe(memory, aux)
+        else:
+          cnn_image = data.distances
+          memory.update(data.distances, data.pos_w, data.quat_w)
         patch.bind(*patch.capture(memory))
         aux = representation.extract_aux_state(obs["full_state"])
         td["depth_tokens"] = patch.tokens(aux)
@@ -260,7 +264,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
           root_history[t % 12] = aux
           group_history[t % 12] = group
         if vision is not None:
-          td["camera_latent"] = vision.encode(data.distances)
+          td["camera_latent"] = vision.encode(cnn_image)
       elif runner.terrain_inputs != "blind":
         td["terrain"] = (ground.features(representation.extract_aux_state(obs["full_state"]))
                          if rough_seed is not None else rep.new_zeros(n, TerrainObservation.num_features))
@@ -319,7 +323,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     return dict(
       checkpoint=str(checkpoint),
       actor_sha256=hashlib.sha256((checkpoint / "actor.pt").read_bytes()).hexdigest(),
-      depth_input="noiseless_pelvis_camera" if camera_cfg is not None else None,
+      depth_input=("instinct_torso_camera" if runner.camera_profile == "instinct" else "noiseless_pelvis_camera") if camera_cfg is not None else None,
       completed=int(completed.sum()),
       motions=n,
       terrain_seed=rough_seed,

@@ -121,6 +121,8 @@ class WorldModelLearner:
       keys += ["depth_image", "depth_origin"]
     if self.dynamics.vision is not None:
       keys.append("camera_pixels")
+      if self.dynamics.vision.aligned:
+        keys.append("camera_clean")
     batches = torch.stack([td.select(*keys) for td in data])
     return self._captured_update(batches)
 
@@ -167,7 +169,7 @@ class WorldModelLearner:
 
       joint = self.dynamics.visual_input is not None
       if joint:
-        encoded, recon = self.dynamics.vision.reconstruction(td["camera_pixels"])
+        encoded, recon = self.dynamics.vision.reconstruction(td["camera_pixels"], td.get("camera_clean", None))
         pred_rep_states, pred_aux_states, forecasts = self._compiled_joint_rollout(
           init_rep_state, actions, init_aux, sim_ctx, encoded[:, 0].detach())
         forecast = torch.nn.functional.mse_loss(forecasts, encoded[:, 1:].detach())
@@ -187,7 +189,7 @@ class WorldModelLearner:
       if self.dynamics.vision is not None:
         if not joint:
           visual_states = pred_rep_states.detach() if self.cfg.detach_visual_state else pred_rep_states
-          recon, forecast = self.dynamics.vision.losses(td["camera_pixels"], visual_states, actions)
+          recon, forecast = self.dynamics.vision.losses(td["camera_pixels"], visual_states, actions, td.get("camera_clean", None))
         loss = loss + recon
         recon_losses.append(recon.detach())
         if forecast is not None:

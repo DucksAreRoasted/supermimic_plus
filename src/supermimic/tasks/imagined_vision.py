@@ -29,9 +29,12 @@ def noise_ranges(ranges):
 class DepthVision(nn.Module):
   """The WM optimizer owns the image autoencoder and the optional action-conditioned transition."""
 
-  def __init__(self, mode, state_dim, action_dim, *, joint=False):
+  def __init__(self, mode, state_dim, action_dim, *, joint=False, camera_profile="pelvis"):
     super().__init__()
     self.mode = mode
+    self.aligned = camera_profile == "instinct"
+    self.image_shape = (18,32) if self.aligned else (CAMERA.height,CAMERA.width)
+    hidden_h, hidden_w = (3,4) if self.aligned else (4,6)
     if mode not in ("render", "latent"):
       raise ValueError(f"Unknown imagined vision mode {mode}")
     self.encoder = nn.Sequential(
@@ -42,13 +45,13 @@ class DepthVision(nn.Module):
       nn.Conv2d(16, 16, 3, stride=2, padding=1),
       nn.ELU(),
       nn.Flatten(),
-      nn.Linear(16 * 4 * 6, LATENT_DIM),
+      nn.Linear(16 * hidden_h * hidden_w, LATENT_DIM),
       nn.LayerNorm(LATENT_DIM),
     )
     self.decoder = nn.Sequential(
-      nn.Linear(LATENT_DIM, 16 * 4 * 6),
+      nn.Linear(LATENT_DIM, 16 * hidden_h * hidden_w),
       nn.ELU(),
-      nn.Unflatten(1, (16, 4, 6)),
+      nn.Unflatten(1, (16, hidden_h, hidden_w)),
       nn.ConvTranspose2d(16, 16, 4, stride=2, padding=1),
       nn.ELU(),
       nn.ConvTranspose2d(16, 8, 4, stride=2, padding=1),
@@ -71,7 +74,8 @@ class DepthVision(nn.Module):
       nn.init.zeros_(self.transition[-1].bias)
 
   def encode(self, ranges):
-    img = pack_depth(ranges).float().reshape(-1, 1, CAMERA.height, CAMERA.width) / 255
+    pixels = ranges.float() if self.aligned else pack_depth(ranges).float() / 255
+    img = pixels.reshape(-1, 1, *self.image_shape)
     return self.encoder(img).reshape(*ranges.shape[:-1], LATENT_DIM)
 
   def next_latent(self, z, state, action):
@@ -80,15 +84,17 @@ class DepthVision(nn.Module):
     delta = self.transition(torch.cat((z, state, action), -1))
     return F.layer_norm(z + delta, (LATENT_DIM,))
 
-  def reconstruction(self, pixels):
+  def reconstruction(self, pixels, clean=None):
     # A sampled sequence contains consecutive frames within the same episode.
-    z = self.encode(noise_ranges(unpack_depth(pixels)))
-    reconstruction = self.decoder(z.flatten(0, 1)).reshape_as(pixels)
-    recon_loss = F.mse_loss(reconstruction, pixels.float() / 255)
+    z = self.encode(pixels if self.aligned else noise_ranges(unpack_depth(pixels)))
+    decoded = self.decoder(z.flatten(0, 1))
+    if self.aligned:
+      decoded = F.interpolate(decoded, size=self.image_shape, mode="bilinear", align_corners=False)
+    recon_loss = F.mse_loss(decoded.reshape_as(pixels), clean.float() if self.aligned else pixels.float()/255)
     return z, recon_loss
 
-  def losses(self, pixels, predicted_states, actions):
-    z, recon_loss = self.reconstruction(pixels)
+  def losses(self, pixels, predicted_states, actions, clean=None):
+    z, recon_loss = self.reconstruction(pixels, clean)
     if self.transition is None:
       return recon_loss, None
     current = z[:, 0].detach()

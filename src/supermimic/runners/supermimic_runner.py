@@ -87,6 +87,7 @@ class BaseRunnerCfg:
   imagined_vision: Literal["none", "render", "latent"] = "none"
   max_iteration_compute_seconds: float = 0.0
   joint_visual_dynamics: bool = False
+  camera_profile: Literal["pelvis", "instinct"] = "pelvis"
   vision_hidden_fusion: bool = False
   hold_imagined_vision: bool = False
   terrain_curriculum: tuple[tuple[int, float], ...] = ()
@@ -146,7 +147,7 @@ class BaseRunnerCfg:
       if (self.terrain_inputs != "actor-world" or self.reference_residual_policy
           or self.mirror_augmentation or self.cuda_graph_collection):
         raise ValueError("Depth fusion needs actor-world terrain and a camera-enabled collection step")
-      env_cfg.scene.sensors = (*env_cfg.scene.sensors, walking_camera())
+      env_cfg.scene.sensors = (*env_cfg.scene.sensors, walking_camera(self.camera_profile))
     if self.terrain_height == 0 and self.terrain_inputs == "blind":
       return
     if self.flat_depth_arm is None and (self.terrain_height <= 0 or self.representation != "gencoord"):
@@ -343,7 +344,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     from supermimic.tasks.imagined_vision import DepthVision, LATENT_DIM
     with torch.random.fork_rng(devices=[]):
       dynamics.vision = DepthVision(cfg.imagined_vision, representation.rep_state_dim, num_actions,
-                                   joint=cfg.joint_visual_dynamics)
+                                   joint=cfg.joint_visual_dynamics, camera_profile=cfg.camera_profile)
       if cfg.joint_visual_dynamics:
         dynamics.enable_joint_vision(LATENT_DIM)
       dynamics.to(device)
@@ -650,7 +651,12 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     if getattr(self.cfg, "depth_fusion", "none") != "none":
       if self.cfg.imagined_vision != "none":
         from supermimic.tasks.imagined_vision import PIXELS
-        schema["camera_pixels"] = FieldSpec(PIXELS, torch.uint8)
+        if self.cfg.camera_profile == "instinct":
+          schema["camera_pixels"] = FieldSpec(576, torch.float16)
+          schema["camera_clean"] = FieldSpec(576, torch.float16)
+          schema["camera_env"] = FieldSpec(dtype=torch.long)
+        else:
+          schema["camera_pixels"] = FieldSpec(PIXELS, torch.uint8)
       schema["depth_image"] = FieldSpec(2 * 25 * 25, torch.float16)
       schema["depth_origin"] = FieldSpec(6)
     if self._stores_actor_obs:
@@ -928,7 +934,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     self.wm_env.hold_imagined_vision = self.cfg.hold_imagined_vision
     if self.cfg.imagined_vision == "render":
       from supermimic.tasks.imagined_vision import ImaginedCamera
-      self.wm_env.imagined_camera = ImaginedCamera(self.env, self.device, policy_cfg.batch_size)
+      if self.cfg.camera_profile == "instinct":
+        from supermimic.tasks.instinct_camera import TorsoRenderer
+        self.wm_env.imagined_camera = TorsoRenderer(self.env.unwrapped, policy_cfg.batch_size, self.device)
+      else:
+        self.wm_env.imagined_camera = ImaginedCamera(self.env, self.device, policy_cfg.batch_size)
     if (
       (self.cfg.imagined_vision != "none" or self.cfg.flat_depth_arm is not None)
       and self.cfg.representation == "gencoord"
@@ -1027,11 +1037,16 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       if self.cfg.depth_fusion == "none":
         obs["terrain"] = self._wm.terrain_query.features(aux_state)
       else:
-        data = self.env.unwrapped.scene["walk_depth"].data
-        ranges = data.distances
-        noisy = torch.where(ranges > 0, ranges + .005 * torch.randn_like(ranges), ranges)
-        noisy = noisy.masked_fill(torch.rand_like(ranges) < .15, -1)
-        self.depth_memory.update(noisy, data.pos_w, data.quat_w)
+        camera = self.env.unwrapped.scene["walk_depth"]
+        if self.cfg.camera_profile == "instinct":
+          noisy, self._camera_clean = camera.observe(self.depth_memory, aux_state)
+          self._camera_pixels = noisy
+        else:
+          data = self.env.unwrapped.scene["walk_depth"].data
+          ranges = data.distances
+          noisy = torch.where(ranges > 0, ranges + .005 * torch.randn_like(ranges), ranges)
+          noisy = noisy.masked_fill(torch.rand_like(ranges) < .15, -1)
+          self.depth_memory.update(noisy, data.pos_w, data.quat_w)
         if self._dynamics.vision is not None:
           obs["camera_latent"] = self._dynamics.vision.encode(noisy).detach()
         self.sim_depth.bind(*self.sim_depth.capture(self.depth_memory))
@@ -1119,7 +1134,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         extra_fields["depth_origin"] = self.sim_depth.origin
         if self._dynamics.vision is not None:
           from supermimic.tasks.imagined_vision import pack_depth
-          extra_fields["camera_pixels"] = pack_depth(self.env.unwrapped.scene["walk_depth"].data.distances)
+          if self.cfg.camera_profile == "instinct":
+            extra_fields.update(camera_pixels=self._camera_pixels.half(), camera_clean=self._camera_clean.half(),
+                                camera_env=torch.arange(len(curr_states),device=self.device))
+          else:
+            extra_fields["camera_pixels"] = pack_depth(self.env.unwrapped.scene["walk_depth"].data.distances)
       if self._stores_actor_obs:
         extra_fields["actor_obs"] = self._representation.append_pelvis_sensor(sim_actor_obs, rep_state)
 

@@ -26,7 +26,12 @@ class WalkingCameraPattern(PinholeCameraPatternCfg):
     return origins + origins.new_tensor([0.12, 0, 0.15]), directions
 
 
-def walking_camera():
+def walking_camera(profile="pelvis"):
+  if profile == "instinct":
+    from supermimic.tasks.instinct_camera import camera_config
+    return camera_config()
+  if profile != "pelvis":
+    raise ValueError(f"Unknown G1 camera: {profile}")
   return RayCastSensorCfg(
     name="walk_depth",
     frame=ObjRef(type="body", name="pelvis", entity="robot"),
@@ -63,14 +68,17 @@ class DepthMemory:
     )
 
   def update(self, ranges, pos, quat):
-    self.tick += 1
-    self.pos = pos.clone()
-    self.yaw = yaw_quat(quat)
     valid = (ranges > 0) & torch.isfinite(ranges) & (ranges <= 2.5)
     rays = self.origins + self.directions * torch.where(valid, ranges, 0.0)[..., None]
     cloud = pos[:, None, :] + quat_apply(
       quat[:, None, :].expand(-1, rays.shape[1], -1), rays
     )
+    self.update_cloud(cloud, valid, pos, quat)
+
+  def update_cloud(self, cloud, valid, pos, quat):
+    self.tick += 1
+    self.pos = pos.clone()
+    self.yaw = yaw_quat(quat)
     cells = (cloud[..., :2] / self.resolution).round().long()
     address = self._address(cells)
     # Pick the highest visible point in each occupied cell; misses never erase hits.
@@ -469,6 +477,9 @@ class DepthTrackingController:
 
   def observe(self, ranges, position, quaternion, offsets):
     self.memory.update(ranges, position, quaternion)
+    return self.observe_map(offsets)
+
+  def observe_map(self, offsets):
     heights, valid = self.view.at(offsets)
     self.gate = self.balance.terrain_gate(heights, valid)
     if self.unconditional:

@@ -178,6 +178,7 @@ def main():
                       help="Flat ground with leg fusion; compare no vision, auxiliary-only, or full latent")
   parser.add_argument("--max-iteration-compute-seconds", type=float, default=0.0)
   parser.add_argument("--joint-visual-dynamics", action="store_true")
+  parser.add_argument("--camera-profile", choices=("pelvis","instinct"), default="pelvis")
   parser.add_argument("--vision-hidden-fusion", action="store_true")
   parser.add_argument("--detach-visual-state", action="store_true")
   parser.add_argument("--imagined-vision", choices=("none", "render", "latent"), default="none")
@@ -228,6 +229,9 @@ def main():
   cfg.joint_visual_dynamics = args.joint_visual_dynamics
   if cfg.joint_visual_dynamics:
     cfg.run_name += "-jointwm"
+  cfg.camera_profile = args.camera_profile
+  if cfg.camera_profile == "instinct":
+    cfg.run_name += "-torso-camera"
   cfg.vision_hidden_fusion = args.vision_hidden_fusion
   cfg.wm.detach_visual_state = args.detach_visual_state
   if cfg.vision_hidden_fusion:

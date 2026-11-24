@@ -155,7 +155,7 @@ def evaluate(args):
     cfg.scene.sensors = (*cfg.scene.sensors, walking_scan())
   depth = args.perception.startswith("depth")
   if depth:
-    camera_cfg = walking_camera()
+    camera_cfg = walking_camera(actor_cfg.camera_profile)
     cfg.scene.sensors = (*cfg.scene.sensors, camera_cfg)
   cfg.sim.nconmax = max(
     cfg.sim.nconmax or 0, 256 if args.landscape_seed is not None else 128
@@ -335,28 +335,35 @@ def evaluate(args):
       state = rep.represent(obs["full_state"])
       if t % 32 == 0:
         predictions = dict.fromkeys(models, (aux, state))
+        predicted_z = {}
       if actor_cfg.pelvis_motion_goal:
         _, goal = driver_wm.representation.compute_wm_goal(m.motion, m.time_steps, aux)
       else:
         goal = extract_actor_goal(obs["goal"])
       if sensed:
         if depth:
-          data = camera.data
-          ranges = data.distances
-          if args.depth_noise_m:
-            noise = torch.randn(ranges.shape, device=device, generator=camera_rng)
-            ranges = torch.where(
-              ranges > 0, ranges + args.depth_noise_m * noise, ranges
+          if actor_cfg.camera_profile == "instinct":
+            if args.depth_noise_m or args.depth_dropout:
+              raise ValueError("Instinct camera already has a calibrated noise pipeline")
+            ranges, _ = camera.observe(memory, aux)
+            terrain, heights, valid = controller.observe_map(offsets)
+          else:
+            data = camera.data
+            ranges = data.distances
+            if args.depth_noise_m:
+              noise = torch.randn(ranges.shape, device=device, generator=camera_rng)
+              ranges = torch.where(
+                ranges > 0, ranges + args.depth_noise_m * noise, ranges
+              )
+            if args.depth_dropout:
+              missing = (
+                torch.rand(ranges.shape, device=device, generator=camera_rng)
+                < args.depth_dropout
+              )
+              ranges = ranges.masked_fill(missing, -1.0)
+            terrain, heights, valid = controller.observe(
+              ranges, data.pos_w, data.quat_w, offsets
             )
-          if args.depth_dropout:
-            missing = (
-              torch.rand(ranges.shape, device=device, generator=camera_rng)
-              < args.depth_dropout
-            )
-            ranges = ranges.masked_fill(missing, -1.0)
-          terrain, heights, valid = controller.observe(
-            ranges, data.pos_w, data.quat_w, offsets
-          )
           if fusion_eval:
             image, origin = patch.capture(memory)
             patch.bind(image, origin)
@@ -449,7 +456,13 @@ def evaluate(args):
         initial_scan_action_delta = float((actions - actor(td)).abs().mean())
       for name, model in models.items():
         pred_aux, pred_state = predictions[name]
-        predictions[name] = model.dynamics(pred_state, actions, pred_aux, ctx)
+        if model.dynamics.visual_input is not None:
+          if t % 32 == 0:
+            predicted_z[name] = model.dynamics.vision.encode(ranges)
+          a, s, predicted_z[name] = model.dynamics.joint_step(pred_state, actions, pred_aux, ctx, predicted_z[name])
+          predictions[name] = a, s
+        else:
+          predictions[name] = model.dynamics(pred_state, actions, pred_aux, ctx)
       m._update_metrics()
       body_error += torch.where(active, m.metrics["error_body_pos"], 0.0)
       if learned_fusion:

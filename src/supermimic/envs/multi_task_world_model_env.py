@@ -72,9 +72,15 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     if self.vision is not None:
       from supermimic.tasks.imagined_vision import noise_ranges, unpack_depth
       with torch.no_grad():
-        ranges = (self.imagined_camera.ranges(self.aux_state) if self.imagined_camera is not None
-                  else unpack_depth(batch["camera_pixels"]))
-        self.camera_latent = self.vision.encode(noise_ranges(ranges))
+        if self.vision.aligned:
+          self.camera_env = batch["camera_env"]
+          image = (self.imagined_camera.image(self.aux_state, self.rep_state, self.camera_env)
+                   if self.imagined_camera is not None else batch["camera_pixels"])
+        else:
+          ranges = (self.imagined_camera.ranges(self.aux_state) if self.imagined_camera is not None
+                    else unpack_depth(batch["camera_pixels"]))
+          image = noise_ranges(ranges)
+        self.camera_latent = self.vision.encode(image)
     super()._on_reset(batch)
 
   def _wm_step(self, rep_state, aux_state, action, last_action, sim_ctx):
@@ -92,7 +98,9 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       with torch.no_grad():
         next_aux, next_state = result[:2]
         if self.imagined_camera is not None:
-          self.camera_latent = vision.encode(noise_ranges(self.imagined_camera.ranges(next_aux)))
+          image = (self.imagined_camera.image(next_aux,next_state,self.camera_env) if vision.aligned
+                   else noise_ranges(self.imagined_camera.ranges(next_aux)))
+          self.camera_latent = vision.encode(image)
         elif not self.hold_imagined_vision:
           self.camera_latent = vision.next_latent(self.camera_latent, next_state, action)
     return result

@@ -29,6 +29,7 @@ def fixed_starts(runner, batch_size):
   runner._build_sim_obs_td(
     rep.represent(state), rep.extract_aux_state(state), obs["actor"], times, ctx
   )
+  aligned = runner.cfg.camera_profile == "instinct"
   rows = TensorDict(
     {
       "state": state,
@@ -37,12 +38,14 @@ def fixed_starts(runner, batch_size):
       "sim_ctx": ctx,
       "depth_image": runner.sim_depth.image.flatten(1).half(),
       "depth_origin": runner.sim_depth.origin,
-      "camera_pixels": pack_depth(
+      "camera_pixels": runner._camera_pixels if aligned else pack_depth(
         runner.env.unwrapped.scene["walk_depth"].data.distances
       ),
     },
     batch_size=[len(state)],
   )
+  if aligned:
+    rows["camera_env"] = torch.arange(len(state), device=state.device)
   if runner.cfg.history_length > 1:
     length = runner.cfg.history_length
     rows["sensor_window"] = obs["actor"][:, None].expand(-1, length, -1)
