@@ -21,6 +21,7 @@ class FutureFeet:
       command.cfg.body_names.index(side + "_ankle_roll_link")
       for side in ("left", "right")
     ]
+    self.body_indices = feet
     positions, rotations, body_chunks = [], [], []
     frames = torch.arange(
       len(self.motion.joint_pos), device=self.motion.joint_pos.device
@@ -109,7 +110,7 @@ class MeasuredPatch(nn.Module):
 
   def sample(self, root, xy):
     offsets = F.pad(xy, (0, 1)).expand(len(root), -1, -1)
-    yaw = yaw_quat(root[:, 3:7].contiguous())[:, None].expand(-1, len(xy), -1)
+    yaw = yaw_quat(root[:, 3:7].contiguous())[:, None].expand(-1, offsets.shape[1], -1)
     world_offset = quat_apply(yaw, offsets) + F.pad(
       root[:, None, :2] - self.origin[:, None, :2], (0, 1)
     )

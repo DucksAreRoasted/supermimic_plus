@@ -156,6 +156,9 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       memory = DepthMemory(n, device, sim.step_dt, camera_cfg.pattern)
       patch = MeasuredPatch(ground.offsets)
       future_feet = FutureFeet(motion)
+      from supermimic.tasks.rough_reference import RoughFootReference
+      rough_ref = (None if runner.rough_reference in ("off", "nominal") else
+                   RoughFootReference(future_feet, runner.rough_reference, ground))
     if base_terrain is not None:
       grid_min, grid_max = ground.offsets.amin(0), ground.offsets.amax(0)
     active = torch.ones(n, dtype=torch.bool, device=device)
@@ -216,14 +219,15 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       if camera_cfg is not None:
         data = camera.data
         if runner.camera_profile == "instinct":
-          cnn_image, _ = camera.observe(memory, aux)
+          cnn_image, _ = camera.observe(memory, aux, terrain_only=runner.rough_reference != "off")
         else:
           cnn_image = data.distances
           memory.update(data.distances, data.pos_w, data.quat_w)
         patch.bind(*patch.capture(memory))
         aux = representation.extract_aux_state(obs["full_state"])
         td["depth_tokens"] = patch.tokens(aux)
-        td["future_feet"] = future_feet(motion.time_steps)
+        td["future_feet"] = (future_feet(motion.time_steps) if rough_ref is None else
+                              rough_ref.targets(motion.time_steps, aux, patch)[0])
         base_samples = patch.sample(aux, patch.base_offsets)
         heights = base_samples[..., 0]
         td["terrain"] = torch.zeros_like(heights) if base_terrain == "off" else heights

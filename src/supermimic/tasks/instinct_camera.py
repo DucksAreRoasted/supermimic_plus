@@ -43,6 +43,7 @@ class TorsoCamera(GroupedRayCasterCamera):
     self.ray_directions = quat_apply(
       rotation[:, None].expand(-1, self.num_rays, -1), self.ray_directions
     )
+    self.static_geom = torch.as_tensor(mj_model.geom_bodyid == 0, device=device)
     self.pipeline = DepthPipeline(device)
     self.noisy_image = torch.zeros(data.nworld, 576, device=device)
 
@@ -52,7 +53,7 @@ class TorsoCamera(GroupedRayCasterCamera):
     fresh = self.pipeline.noised(raw).flatten(1)
     self.noisy_image = torch.where(self.refresh_mask[:, None], fresh, self.noisy_image)
 
-  def observe(self, memory, root):
+  def observe(self, memory, root, *, terrain_only=False):
     data = self.data
     plane = data.output["distance_to_image_plane"].flatten(1)
     distance = plane / self.ray_directions[..., 0]
@@ -60,7 +61,12 @@ class TorsoCamera(GroupedRayCasterCamera):
     points = data.pos_w[:, None] + quat_apply(
       data.quat_w_world[:, None].expand(-1, self.num_rays, -1), local
     )
-    memory.update_cloud(points, (plane > 0) & (plane <= 2), root[:, :3], root[:, 3:7])
+    valid = (plane > 0) & (plane <= 2)
+    if terrain_only:
+      # The image still sees the robot; do not write robot returns into terrain memory.
+      geom = self._read_backend_hit_geom_ids().long()
+      valid = valid & (geom >= 0) & self.static_geom[geom.clamp_min(0)]
+    memory.update_cloud(points, valid, root[:, :3], root[:, 3:7])
     return self.noisy_image, self.pipeline.clean(plane.view(-1, 27, 48, 1)).flatten(1)
 
 

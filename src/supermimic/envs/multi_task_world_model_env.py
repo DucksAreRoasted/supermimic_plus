@@ -49,6 +49,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     self.hold_imagined_vision = False
     self.imagined_camera = None
     self.future_feet = None
+    self.rough_reference = None
     self._sensed_terrain = None
     self.task_specs = task_specs
     self.terrain_query = terrain_query
@@ -107,6 +108,13 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
 
   def _build_task_goals(self) -> None:
     # The anchor task's goal is the actor goal already built in _update_goal; reuse it.
+    if self.rough_reference is not None:
+      self._rough_future, now, after = self.rough_reference.targets(
+        self.motion_times, self.aux_state, self.terrain_query
+      )
+      self._ref_body_state = self.rough_reference.body_targets(
+        self._ref_body_state, now, after, self.representation.dt
+      )
     anchor, *rest = self.task_specs
     self._task_goal_obs: dict[str, torch.Tensor] = {anchor.name: self._actor_goal_obs}
     for ts in rest:
@@ -122,7 +130,10 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       if self.future_feet is not None:
         patch, tokens = self.terrain_query.features_and_tokens(self.aux_state)
         obs["depth_tokens"] = tokens
-        obs["future_feet"] = self.future_feet(self.motion_times)
+        if self.rough_reference is None:
+          obs["future_feet"] = self.future_feet(self.motion_times)
+        else:
+          obs["future_feet"] = self._rough_future
         # reset() and step() both rebuild observations from the current pose.
         self._sensed_terrain = patch if self.dynamics.terrain_query is self.terrain_query else None
       else:

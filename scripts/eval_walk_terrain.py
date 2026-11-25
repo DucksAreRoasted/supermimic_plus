@@ -241,6 +241,9 @@ def evaluate(args):
       records = []
       if learned_fusion:
         reference_feet = FutureFeet(m)
+        from supermimic.tasks.rough_reference import RoughFootReference
+        rough_ref = (None if actor_cfg.rough_reference in ("off", "nominal") else
+                     RoughFootReference(reference_feet, actor_cfg.rough_reference, TerrainObservation(cfg.scene.spec_fn).to(device)))
         fusion_mode = actor_cfg.depth_fusion if embedded else load_fusion(
           actor,
           args.fusion_checkpoint,
@@ -345,7 +348,7 @@ def evaluate(args):
           if actor_cfg.camera_profile == "instinct":
             if args.depth_noise_m or args.depth_dropout:
               raise ValueError("Instinct camera already has a calibrated noise pipeline")
-            ranges, _ = camera.observe(memory, aux)
+            ranges, _ = camera.observe(memory, aux, terrain_only=actor_cfg.rough_reference != "off")
             terrain, heights, valid = controller.observe_map(offsets)
           else:
             data = camera.data
@@ -425,7 +428,8 @@ def evaluate(args):
         td["root_waypoints"] = root_waypoints(obs["goal"])
       if learned_fusion:
         td["depth_tokens"] = patch.tokens(aux)
-        td["future_feet"] = reference_feet(m.time_steps)
+        td["future_feet"] = (reference_feet(m.time_steps) if rough_ref is None else
+                              rough_ref.targets(m.time_steps, aux, patch)[0])
       if actor_cfg.imagined_vision != "none":
         if not depth:
           raise ValueError("The visual policy needs its real depth sensor")

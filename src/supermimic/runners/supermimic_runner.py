@@ -117,7 +117,16 @@ class BaseRunnerCfg:
   """Add the current and near-future reference root XY to the terrain policy."""
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
+  rough_reference: Literal["off", "nominal", "camera", "oracle"] = "off"
+
   def configure_terrain(self, env_cfg) -> None:
+    if self.rough_reference != "off":
+      from supermimic.tasks.rough_reference import configure_rough_rewards
+
+      if self.depth_fusion == "none":
+        raise ValueError("Rough foot references require the depth-enabled Actor")
+      if self.rough_reference != "nominal":
+        configure_rough_rewards(env_cfg)
     if self.joint_visual_dynamics and (self.imagined_vision != "latent" or self.hold_imagined_vision or self.wm.detach_visual_state):
       raise ValueError("Joint dynamics requires autoregressive latent vision and joint gradients")
     if self.vision_hidden_fusion and (self.imagined_vision == "none" or self.flat_depth_arm == "aux"):
@@ -527,12 +536,17 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       },
     )
 
+    self.rough_reference = None
     self.depth_memory = None
     if self.cfg.depth_fusion != "none":
       sensor = self.env.unwrapped.scene["walk_depth"]
       self.depth_memory = DepthMemory(self.env.num_envs, self.device, self.env.unwrapped.step_dt, sensor.cfg.pattern)
       self.sim_depth = MeasuredPatch(wm.terrain_query.offsets)
       self.future_feet = FutureFeet(self.motion_cmd, cache_reference=self.cfg.cache_motion_reference)
+      if self.cfg.rough_reference in ("camera", "oracle"):
+        from supermimic.tasks.rough_reference import RoughFootReference
+
+        self.rough_reference = RoughFootReference(self.future_feet, self.cfg.rough_reference, self._wm.terrain_query)
       self.imagination_depth = MeasuredPatch(wm.terrain_query.offsets)
       self._dynamics.terrain_query = self.imagination_depth
       self.world_model_learner.depth_patch = self.imagination_depth
@@ -929,6 +943,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     if self.cfg.depth_fusion != "none":
       self.wm_env.terrain_query = self.imagination_depth
       self.wm_env.future_feet = self.future_feet
+      self.wm_env.rough_reference = self.rough_reference
       if self.cfg.cache_motion_reference:
         self.wm_env.reference_body_state = self.future_feet.body_state
     self.wm_env.hold_imagined_vision = self.cfg.hold_imagined_vision
@@ -1039,7 +1054,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       else:
         camera = self.env.unwrapped.scene["walk_depth"]
         if self.cfg.camera_profile == "instinct":
-          noisy, self._camera_clean = camera.observe(self.depth_memory, aux_state)
+          noisy, self._camera_clean = camera.observe(self.depth_memory, aux_state, terrain_only=self.cfg.rough_reference != "off")
           self._camera_pixels = noisy
         else:
           data = self.env.unwrapped.scene["walk_depth"].data
@@ -1052,7 +1067,14 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         self.sim_depth.bind(*self.sim_depth.capture(self.depth_memory))
         obs["terrain"] = self.sim_depth.features(aux_state)
         obs["depth_tokens"] = self.sim_depth.tokens(aux_state)
-        obs["future_feet"] = self.future_feet(motion_times)
+        if self.rough_reference is None:
+          obs["future_feet"] = self.future_feet(motion_times)
+        else:
+          future, now, after = self.rough_reference.targets(motion_times, aux_state, self.sim_depth)
+          obs["future_feet"] = future
+          self.motion_cmd.rough_ankle_targets = (
+            self.future_feet.body_indices, now, (after - now) / self.env.unwrapped.step_dt
+          )
     if self.cfg.use_root_waypoints:
       full_goal, _ = self._representation.compute_wm_goal(self.motion, motion_times, aux_state)
       obs["root_waypoints"] = root_waypoints(full_goal)

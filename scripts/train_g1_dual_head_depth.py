@@ -178,6 +178,8 @@ def main():
                       help="Flat ground with leg fusion; compare no vision, auxiliary-only, or full latent")
   parser.add_argument("--max-iteration-compute-seconds", type=float, default=0.0)
   parser.add_argument("--joint-visual-dynamics", action="store_true")
+  parser.add_argument("--rough-reference", choices=("off", "nominal", "camera", "oracle"), default="off",
+                      help="Vertical ankle targets. nominal uses the same self-hit mask as camera/oracle with original targets.")
   parser.add_argument("--camera-profile", choices=("pelvis","instinct"), default="pelvis")
   parser.add_argument("--vision-hidden-fusion", action="store_true")
   parser.add_argument("--detach-visual-state", action="store_true")
@@ -288,6 +290,9 @@ def main():
       if [Path(p).name for p in source["motion_files"]] != [p.name for p in clips]:
         raise ValueError("Base checkpoint motions differ from the requested LAFAN40 protocol")
     cfg.run_name = cfg.run_name.replace("-scratch-", "-from-base-")
+  cfg.rough_reference = args.rough_reference
+  if cfg.rough_reference != "off":
+    cfg.run_name += f"-roughref-{cfg.rough_reference}"
   runner = build_scratch_runner(cfg, args.num_envs, args.seed, clips=clips)
   actor = runner.policy_learner.actor
   initial = {
