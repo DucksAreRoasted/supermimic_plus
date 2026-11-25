@@ -16,7 +16,8 @@ from scipy.ndimage import gaussian_filter1d, median_filter
 from supermimic.tasks.terrain_reference import TerrainLegReference
 
 
-def adapt_window(adapter, original, height, fps=50.0, *, swing_clearance_only=False):
+def adapt_window(adapter, original, height, fps=50.0, *, swing_clearance_only=False,
+                 multipoint_contact=False):
   ankles, rotations, soles = geometry(adapter, original)
   floor = height(soles[..., :2])
   clearance = (soles[..., 2] - floor).min(axis=(-1, -2))
@@ -46,13 +47,39 @@ def adapt_window(adapter, original, height, fps=50.0, *, swing_clearance_only=Fa
     )
   seed = original.copy()
   seed[:, 2] += root_delta
-  fitted = solve_window(adapter, seed, target, rotations, support)
+  contact = {}
+  if multipoint_contact:
+    # Select the physical front and rear sole extremes from the active MuJoCo
+    # collision geometry. A point participates only when the original motion
+    # planted that part of the foot; toe-off and heel-strike remain possible.
+    offsets = np.empty((2, 2, 3))
+    for side in range(2):
+      local = (soles[0, side].reshape(-1, 3) - ankles[0, side]) @ rotations[0, side]
+      x = local[:, 0]
+      for point, extreme in enumerate((x.max(), x.min())):
+        offsets[side, point] = local[np.abs(x - extreme) < 0.002].mean(axis=0)
+    raw_points = ankles[:, :, None] + np.einsum(
+      "tsij,spj->tspi", rotations, offsets
+    )
+    point_targets = raw_points.copy()
+    point_targets[..., :2] += (target - ankles)[:, :, None, :2]
+    floor = height(point_targets[..., :2])
+    valid = np.isfinite(floor)
+    point_targets[..., 2] = (
+      np.where(valid, floor, 0.0) + np.maximum(raw_points[..., 2], 0.004)
+    )
+    weights = 6.0 * (support[:, :, None] & (raw_points[..., 2] < 0.012) & valid)
+    contact = dict(contact_targets=point_targets, contact_offsets=offsets,
+                   contact_weights=weights)
+  fitted = solve_window(adapter, seed, target, rotations, support, **contact)
   if not np.isfinite(fitted).all():
     raise RuntimeError("Nonfinite support-aware reference")
   return dict(original=original, clearance_optimized=fitted), dict(
     support_samples=int(support.sum()),
     flight_frames=int((~support.any(1)).sum()),
     peak_root_target_m=float(np.abs(root_delta).max()),
+    multipoint_contact=bool(multipoint_contact),
+    active_contact_points=int(np.count_nonzero(contact.get("contact_weights", []))),
   )
 
 

@@ -30,9 +30,17 @@ def geometry(adapter, poses):
 
 
 def solve_window(
-  adapter, poses, target, rotations, support, *, root_xy=False, root_z=True
+  adapter, poses, target, rotations, support, *, root_xy=False, root_z=True,
+  contact_targets=None, contact_offsets=None, contact_weights=None,
 ):
   """Fit foot pose with joint bounds and temporal regularization on corrections."""
+  if any(x is not None for x in (contact_targets, contact_offsets, contact_weights)):
+    if any(x is None for x in (contact_targets, contact_offsets, contact_weights)):
+      raise ValueError("Contact targets, offsets and weights must be supplied together")
+    if contact_targets.shape != (len(poses), 2, 2, 3):
+      raise ValueError("Expected two contact targets per foot and frame")
+    if contact_offsets.shape != (2, 2, 3) or contact_weights.shape != (len(poses), 2, 2):
+      raise ValueError("Invalid contact offset or weight shape")
   model, data = adapter.model, adapter.data
   root = (
     np.array([0, 1, 2])
@@ -83,6 +91,7 @@ def solve_window(
   corrected = poses.copy()
   pos_jac = np.zeros((3, model.nv))
   rot_jac = np.zeros_like(pos_jac)
+  point_jac = np.zeros_like(pos_jac)
   for _ in range(3):
     jacobians, errors = [], []
     for i, pose in enumerate(corrected):
@@ -103,6 +112,17 @@ def solve_window(
         )
         blocks.append(weight[:, None] * np.vstack((pos_jac[:, dofs], rot_jac[:, dofs])))
         residuals.append(weight * np.r_[dp, dr])
+        if contact_targets is not None:
+          orientation = data.xmat[ankle].reshape(3, 3)
+          for point in range(2):
+            strength = contact_weights[i, side, point]
+            if strength <= 0:
+              continue
+            world = data.xpos[ankle] + orientation @ contact_offsets[side, point]
+            mujoco.mj_jac(model, data, point_jac, None, world, ankle)
+            scale = np.sqrt(strength)
+            blocks.append(scale * point_jac[:, dofs])
+            residuals.append(scale * (contact_targets[i, side, point] - world))
       jacobians.append(np.vstack(blocks))
       errors.append(np.concatenate(residuals))
     task = sparse.block_diag(jacobians, format="csr")
