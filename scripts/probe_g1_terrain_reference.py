@@ -17,11 +17,14 @@ from supermimic.tasks.walk_terrain import TerrainObservation
 from train_g1_dual_head_depth import CLIPS, ROOT, load_env_cfg, protocol_clips, scratch_config
 
 
-def collision_scene(terrain_seed, *, flat=False):
+def collision_scene(terrain_seed, *, flat=False, rough_scale=1.0):
   cfg = load_env_cfg("SuperMimic-GenCoord-G1", play=False)
   scratch_config(20000, 1024, 42, True, 4096).configure_terrain(cfg)
   cfg.scene.num_envs = 1
-  cfg.scene.spec_fn = replace(cfg.scene.spec_fn, landscape_seed=terrain_seed)
+  course = cfg.scene.spec_fn
+  cfg.scene.spec_fn = replace(course, landscape_seed=terrain_seed,
+                              height=course.height * rough_scale,
+                              lateral_height=course.lateral_height * rough_scale)
   if flat:
     cfg.scene.spec_fn = replace(cfg.scene.spec_fn, height=0.0, lateral_height=0.0)
   return Scene(cfg.scene, device="cpu").compile(), TerrainObservation(cfg.scene.spec_fn)
