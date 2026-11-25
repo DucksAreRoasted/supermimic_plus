@@ -44,11 +44,19 @@ def test_relative_height_and_support(mode):
     patch.bind(image, origin)
     ref = RoughFootReference(feet, mode, SimpleNamespace(height_at=height))
     future, now, after = ref.targets(time, root, patch)
+    if mode == "camera":
+      replay = MeasuredPatch(torch.zeros(1, 2))
+      replay.bind_replay({
+        "depth_image": image.flatten(1).half(),
+        "depth_origin": origin,
+      })
+      for live, restored in zip((future, now, after), ref.targets(time, root, replay), strict=True):
+        torch.testing.assert_close(live, restored, atol=0.0003, rtol=0)
     delta = future - feet(time)
     assert not delta[..., [0, 1, 3, 4, 5, 6, 7, 8]].any()
     assert not delta[:, 1].any()
     torch.testing.assert_close(
-      delta[0, 0, :, 2], slope * torch.tensor([0.24, 0.40, 0.56])
+      delta[0, 0, :, 2], (slope * torch.tensor([0.24, 0.40, 0.56]) - 0.001).clamp_min(0)
     )
     torch.testing.assert_close(after[-1], now[-1])
     if slope == 0:
@@ -125,3 +133,44 @@ def test_no_support_or_clip_boundary_leak():
   dz = future[..., 2] - feet(time)[..., 2]
   torch.testing.assert_close(dz, now.unsqueeze(-1).expand_as(dz))
   torch.testing.assert_close(after, now)
+
+
+def test_support_switch_uses_continuous_position_and_velocity():
+  feet = Feet()
+  feet.xyz[:, :, 0] = torch.tensor([0.2, -0.2])
+  feet.xyz[0, :, 2] = torch.tensor([0., 0.001])
+  feet.xyz[1, :, 2] = torch.tensor([0.001, 0.])
+  root = torch.tensor([[0., 0., 0., 1., 0., 0., 0.]])
+  ground = SimpleNamespace(height_at=lambda xy: xy[..., 0] * 0.125)
+  reference = RoughFootReference(feet, "oracle", ground)
+  _, now, after = reference.targets(torch.tensor([0]), root, None)
+  _, next_now, _ = reference.targets(torch.tensor([1]), root, None)
+  torch.testing.assert_close(after, next_now, atol=1e-7, rtol=0)
+  assert (after - now).abs().max() < 0.003
+  body = (torch.zeros(1, 4, 3), None, torch.zeros(1, 4, 3), None)
+  _, _, velocity, _ = reference.body_targets(body, now, after, 0.02)
+  torch.testing.assert_close(velocity[0, feet.body_indices, 2], ((next_now - now) / 0.02)[0])
+
+
+def test_terrain_observe_drops_stale_hits_and_robot_returns():
+  from supermimic.tasks.instinct_camera import TorsoCamera
+
+  root = torch.tensor([[0., 0., 0., 1., 0., 0., 0.]]).expand(2, -1)
+  data = SimpleNamespace(
+    output={"distance_to_image_plane": torch.ones(2, 27, 48, 1)},
+    pos_w=root[:, :3], quat_w_world=root[:, 3:7],
+  )
+  rays = torch.tensor([1., 0., 0.]).expand(2, 1296, -1)
+  hits = torch.zeros(2, 1296, dtype=torch.long)
+  hits[1, 1], hits[1, 2] = 1, -1
+  camera = SimpleNamespace(
+    data=data, ray_directions=rays, ray_starts=torch.zeros_like(rays), num_rays=1296,
+    static_geom=torch.tensor([True, False]), refresh_mask=torch.tensor([False, True]),
+    _read_backend_hit_geom_ids=lambda: hits, noisy_image=torch.empty(2, 576),
+    pipeline=SimpleNamespace(clean=lambda image: image),
+  )
+  masks = []
+  memory = SimpleNamespace(update_cloud=lambda points, valid, pos, quat: masks.append(valid))
+  TorsoCamera.observe(camera, memory, root, terrain_only=True)
+  assert not masks[0][0].any()
+  assert masks[0][1, 0] and not masks[0][1, 1:3].any()

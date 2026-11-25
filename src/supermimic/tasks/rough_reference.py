@@ -11,6 +11,7 @@ class RoughFootReference:
     if mode not in ("camera", "oracle"):
       raise ValueError(f"Unknown rough reference source: {mode}")
     self.feet = feet
+    self.body_indices = torch.as_tensor(feet.body_indices, dtype=torch.long, device=feet.xyz.device)
     self.ground = ground if mode == "oracle" else None
     self.offsets = torch.cat((feet.ahead.new_tensor([0, 1]), feet.ahead))
 
@@ -42,14 +43,18 @@ class RoughFootReference:
       heights = self.ground.height_at(world).reshape_as(local[..., 2])
       valid = torch.ones_like(heights, dtype=torch.bool)
 
-    # Lower nominal ankle approximates the current support foot. All frames in
-    # this preview share its ground level, including the upcoming touchdown.
-    support = nominal[:, 0, :, 2].argmin(-1, keepdim=True)
-    baseline = heights[:, 0].gather(1, support)[:, None]
-    visible = valid & valid[:, 0].gather(1, support)[:, None]
+    # Blend support continuously when the ankles are close in height. Compute the
+    # baseline at each horizon so the velocity uses the same target as position.
+    ankle_z = nominal[..., 2]
+    support_mix = ((ankle_z[..., 1] - ankle_z[..., 0]) / 0.08 + 0.5).clamp(0, 1)
+    support_mix = support_mix.square() * (3 - 2 * support_mix)
+    weights = torch.stack((support_mix, 1 - support_mix), -1)
+    baseline = (weights * heights).sum(-1, keepdim=True)
+    support_visible = (valid | (weights == 0)).all(-1, keepdim=True)
+    visible = valid & support_visible
     delta = (heights - baseline).clamp(-0.10, 0.10)
-    # Suppress submillimetre interpolation noise on level ground.
-    delta = torch.where(visible & (delta.abs() > 0.001), delta, 0.0)
+    # Continuous dead zone for submillimetre interpolation noise.
+    delta = torch.where(visible, delta.sign() * (delta.abs() - 0.001).clamp_min(0), 0.0)
     # In swing, preserve nominal clearance over depressions. Blend continuously
     # as the feet approach equal height, allowing a lower upcoming touchdown.
     swing = ((nominal[..., 2] - nominal[..., 2].flip(-1)) / 0.04).clamp(0, 1)
@@ -64,8 +69,8 @@ class RoughFootReference:
   def body_targets(self, body, now, after, dt):
     pos, rot, vel, ang = body
     pos, vel = pos.clone(), vel.clone()
-    pos[:, self.feet.body_indices, 2] += now
-    vel[:, self.feet.body_indices, 2] += (after - now) / dt
+    pos[:, self.body_indices, 2] += now
+    vel[:, self.body_indices, 2] += (after - now) / dt
     return pos, rot, vel, ang
 
 

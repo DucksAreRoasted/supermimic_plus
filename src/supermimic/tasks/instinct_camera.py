@@ -65,7 +65,8 @@ class TorsoCamera(GroupedRayCasterCamera):
     if terrain_only:
       # The image still sees the robot; do not write robot returns into terrain memory.
       geom = self._read_backend_hit_geom_ids().long()
-      valid = valid & (geom >= 0) & self.static_geom[geom.clamp_min(0)]
+      # Depth and pose are cached for stale worlds, but the ray backend IDs are not.
+      valid = valid & self.refresh_mask[:, None] & (geom >= 0) & self.static_geom[geom.clamp_min(0)]
     memory.update_cloud(points, valid, root[:, :3], root[:, 3:7])
     return self.noisy_image, self.pipeline.clean(plane.view(-1, 27, 48, 1)).flatten(1)
 

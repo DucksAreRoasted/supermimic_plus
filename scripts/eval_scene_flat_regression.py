@@ -171,6 +171,12 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       for k in (*metrics, "return")
     }
     xy_error = torch.zeros(n, device=device, dtype=torch.float64)
+    measure_ankles = runner.rough_reference != "off"
+    if measure_ankles:
+      ankle_correction = torch.zeros_like(xy_error)
+      corrected_steps = torch.zeros_like(counts)
+      switch_error = torch.zeros_like(xy_error)
+      switch_steps = torch.zeros_like(counts)
     history = None
     slip_distance = torch.zeros_like(xy_error)
     stance_time = torch.zeros_like(xy_error)
@@ -226,8 +232,23 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
         patch.bind(*patch.capture(memory))
         aux = representation.extract_aux_state(obs["full_state"])
         td["depth_tokens"] = patch.tokens(aux)
-        td["future_feet"] = (future_feet(motion.time_steps) if rough_ref is None else
-                              rough_ref.targets(motion.time_steps, aux, patch)[0])
+        if rough_ref is None:
+          td["future_feet"] = future_feet(motion.time_steps)
+        else:
+          td["future_feet"], ankle_delta, _ = rough_ref.targets(motion.time_steps, aux, patch)
+        if measure_ankles:
+          ankles = future_feet.body_indices
+          target_z = motion.body_pos_relative_w[:, ankles, 2]
+          if rough_ref is None:
+            ankle_delta = torch.zeros_like(target_z)
+          error = (target_z + ankle_delta - motion.robot_body_pos_w[:, ankles, 2]).abs().mean(-1)
+          nominal = future_feet.xyz[motion.time_steps, :, 2]
+          near_switch = (nominal[:, 0] - nominal[:, 1]).abs() < 0.04
+          on_switch = active & near_switch
+          ankle_correction += ankle_delta.abs().mean(-1) * active
+          corrected_steps += active & ankle_delta.ne(0).any(-1)
+          switch_error += error * on_switch
+          switch_steps += on_switch
         base_samples = patch.sample(aux, patch.base_offsets)
         heights = base_samples[..., 0]
         td["terrain"] = torch.zeros_like(heights) if base_terrain == "off" else heights
@@ -324,6 +345,14 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
           for group, (step_count, valid, inside, total), coverage
           in zip(motion_groups, measurements, touchdowns, strict=True)
         }
+    if measure_ankles:
+      for i, row in enumerate(rows):
+        row.update(
+          mean_abs_ankle_correction_m=float(ankle_correction[i] / counts[i]),
+          ankle_correction_step_fraction=float(corrected_steps[i] / counts[i]),
+          near_switch_ankle_z_error_m=float(switch_error[i] / switch_steps[i]) if switch_steps[i] else None,
+          near_switch_steps=int(switch_steps[i]),
+        )
     return dict(
       checkpoint=str(checkpoint),
       actor_sha256=hashlib.sha256((checkpoint / "actor.pt").read_bytes()).hexdigest(),

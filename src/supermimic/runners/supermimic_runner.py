@@ -1073,7 +1073,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           future, now, after = self.rough_reference.targets(motion_times, aux_state, self.sim_depth)
           obs["future_feet"] = future
           self.motion_cmd.rough_ankle_targets = (
-            self.future_feet.body_indices, now, (after - now) / self.env.unwrapped.step_dt
+            self.rough_reference.body_indices, now, (after - now) / self.env.unwrapped.step_dt
           )
     if self.cfg.use_root_waypoints:
       full_goal, _ = self._representation.compute_wm_goal(self.motion, motion_times, aux_state)
