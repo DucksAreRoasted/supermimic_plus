@@ -55,12 +55,12 @@ class AnkleRollout:
       ramp = np.minimum(np.arange(len(raw)), np.arange(len(raw))[::-1]) / 4
       blend = 0.5 - 0.5 * np.cos(np.pi * np.clip(ramp, 0, 1))
       delta = (adapted - raw) * blend[:, None]
-      dz = self.weights.new_tensor(delta[:, 2])
+      root_delta = self.weights.new_tensor(delta[:, :3])
       dq = self.weights.new_tensor(delta[:, addresses])
-      dz_dt = torch.gradient(dz, spacing=self.dt)[0]
+      root_velocity_delta = torch.gradient(root_delta, spacing=self.dt, dim=0)[0]
       dq_dt = torch.gradient(dq, spacing=self.dt, dim=0)[0]
-      self.motion.root_pos_w[indices, 2] += dz
-      self.motion.root_lin_vel_w[indices, 2] += dz_dt
+      self.motion.root_pos_w[indices] += root_delta
+      self.motion.root_lin_vel_w[indices] += root_velocity_delta
       self.motion.joint_pos[indices] += dq
       self.motion.joint_vel[indices] += dq_dt
       self.weights[indices] = self.weights.new_tensor(blend)
@@ -127,13 +127,9 @@ def contact_comparison(clips, baseline, optimized):
   return rows
 
 
-def main():
-  parser = argparse.ArgumentParser(description=__doc__)
-  for name in ("checkpoint", "offline", "protocol", "output"):
-    parser.add_argument(name, type=Path)
-  args = parser.parse_args()
-  report = json.loads((args.offline / "report.json").read_text())
-  protocol = json.loads(args.protocol.read_text())
+def load_windows(offline, protocol_file):
+  report = json.loads((offline / "report.json").read_text())
+  protocol = json.loads(protocol_file.read_text())
   clips, trajectories = [], []
   for entry in protocol["clips"]:
     name = Path(entry["path"]).stem
@@ -147,11 +143,20 @@ def main():
     warmup = max(0, optimization_start - 12)
     clips.append({**entry, "local_start": warmup, "optimization_start": optimization_start,
                   "center_step": center - warmup, "horizon": center - warmup + 22})
-    with np.load(args.offline / f"{name}.npz") as sequence:
+    with np.load(offline / f"{name}.npz") as sequence:
       trajectories.append(dict(sequence))
   if len(clips) != 9:
     raise ValueError("Expected the nine paired disagreement clips")
   protocol["clips"] = clips
+  return protocol, clips, trajectories, report
+
+
+def main():
+  parser = argparse.ArgumentParser(description=__doc__)
+  for name in ("checkpoint", "offline", "protocol", "output"):
+    parser.add_argument(name, type=Path)
+  args = parser.parse_args()
+  protocol, clips, trajectories, report = load_windows(args.offline, args.protocol)
   args.output.mkdir(parents=True, exist_ok=True)
   starts = args.output / "starts.npz"
   baseline, optimized = AnkleRollout(clips), AnkleRollout(clips, trajectories)
