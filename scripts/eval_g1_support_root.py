@@ -16,11 +16,11 @@ from scipy.ndimage import gaussian_filter1d, median_filter
 from supermimic.tasks.terrain_reference import TerrainLegReference
 
 
-def adapt_window(adapter, original, height):
+def adapt_window(adapter, original, height, fps=50.0):
   ankles, rotations, soles = geometry(adapter, original)
   floor = height(soles[..., :2])
   clearance = (soles[..., 2] - floor).min(axis=(-1, -2))
-  foot_speed = np.linalg.norm(np.gradient(ankles, axis=0), axis=-1) / 0.02
+  foot_speed = np.linalg.norm(np.gradient(ankles, axis=0), axis=-1) * fps
   support = median_filter(
     (soles[..., 2].min(axis=(-1, -2)) < 0.03) & (foot_speed < 0.35), size=(3, 1)
   )
@@ -78,7 +78,9 @@ def main():
       for row in rows
     ]
     geometry_report[arm] = dict(
-      penetration_over_5mm=int(sum(np.count_nonzero(np.array(x) > 0.005) for x in depths)),
+      penetration_over_5mm=int(
+        sum(np.count_nonzero(np.array(x) > 0.005) for x in depths)
+      ),
       peak_penetration_m=float(max(max(x) for x in depths)),
     )
   probes = {}

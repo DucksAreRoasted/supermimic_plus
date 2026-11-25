@@ -112,6 +112,24 @@ def protocol_clips(path):
   return paths
 
 
+def generated_reference_clips(directory, protocol_path):
+  """Load one fixed-terrain reference set with its source and output checksums."""
+  manifest = json.loads((directory / "manifest.json").read_text())
+  protocol = json.loads(protocol_path.read_text())["clips"]
+  if len(protocol) != 40 or len(manifest["motion_clips"]) != 40:
+    raise ValueError("Expected a complete LAFAN40 generated reference set")
+  clips = []
+  for item in protocol:
+    name = Path(item["path"]).stem
+    record = manifest["motion_clips"][name]
+    path = directory / (name + ".npz")
+    if (record["source_sha256"] != item["sha256"] or record["frames"] != item["frames"]
+        or file_hash(path) != record["adapted_sha256"]):
+      raise ValueError(f"Generated reference checksum or length mismatch: {name}")
+    clips.append(path)
+  return clips, manifest
+
+
 def build_scratch_runner(cfg, num_envs, seed, *, clips=None):
   task = "SuperMimic-GenCoord-G1"
   env_cfg = load_env_cfg(task, play=False)
@@ -174,6 +192,8 @@ def main():
   parser.add_argument("--vision-base-checkpoint", type=Path, help="Initialize the two physical heads, Actor and Critic from an existing checkpoint")
   parser.add_argument("--training-reference", type=Path,
                       help="Use replay and optimization settings from an archived run manifest")
+  parser.add_argument("--generated-reference-dir", type=Path,
+                      help="Use a complete checksum-verified fixed-terrain LAFAN40 reference set")
   parser.add_argument("--flat-depth-arm", choices=("base", "aux", "full"),
                       help="Flat ground with leg fusion; compare no vision, auxiliary-only, or full latent")
   parser.add_argument("--max-iteration-compute-seconds", type=float, default=0.0)
@@ -273,10 +293,22 @@ def main():
     cfg.log_interval = ref["log_interval"]
     cfg.run_name += "-reference-training"
   clips = None
-  if args.lafan40_protocol:
+  if args.lafan40_protocol and not args.generated_reference_dir:
     clips = protocol_clips(args.lafan40_protocol)
     cfg.run_name = cfg.run_name.replace("rough7", "rough-lafan40")
     cfg.policy.horizon = 32
+  if args.generated_reference_dir:
+    if args.terrain_curriculum or args.terrain_height_reset or args.rough_reference != "off":
+      parser.error("Generated references require fixed terrain and direct motion targets")
+    reference_protocol = args.lafan40_protocol or ROOT / "docs/experiments/lafan40_seed42.json"
+    clips, reference_manifest = generated_reference_clips(args.generated_reference_dir, reference_protocol)
+    if not math.isfinite(reference_manifest["rough_scale"]) or reference_manifest["rough_scale"] <= 0:
+      raise ValueError("Generated reference rough scale must be positive and finite")
+    cfg.terrain_height = .09 * reference_manifest["rough_scale"]
+    cfg.terrain_lateral_height = .04 * reference_manifest["rough_scale"]
+    cfg.terrain_landscape_seed = reference_manifest["terrain_seed"]
+    cfg.policy.horizon = 32
+    cfg.run_name = cfg.run_name.replace("rough7", "rough-lafan40") + "-adapted-reference"
   if args.imagined_vision != "none":
     cfg.imagined_vision = args.imagined_vision
     cfg.run_name += f"-vision-{cfg.imagined_vision}"
