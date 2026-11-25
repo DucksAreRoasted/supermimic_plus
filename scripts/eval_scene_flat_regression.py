@@ -9,9 +9,9 @@ from types import SimpleNamespace
 import mjlab.tasks  # noqa: F401
 import numpy as np
 import torch
-from mjlab.utils.lab_api.math import quat_apply_inverse, yaw_quat
 from eval_walk_terrain import checkpoint_config
 from mjlab.tasks.registry import load_env_cfg
+from mjlab.utils.lab_api.math import quat_apply_inverse, yaw_quat
 
 from supermimic.representations import (
   GenCoordRepresentation,
@@ -33,7 +33,10 @@ from supermimic.tasks.walk_terrain import (
 @torch.inference_mode()
 def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save_starts=False,
              rough_scale=1.0, leg_ablation=None, base_terrain=None,
-             camera_diagnostic=None, max_steps=None, rollout_probe=None):
+             camera_diagnostic=None, max_steps=None, rollout_probe=None,
+             direct_reference=False):
+  if direct_reference and rough_seed is None:
+    raise ValueError("A generated terrain reference requires its fixed terrain seed")
   cfg = load_env_cfg("SuperMimic-GenCoord-G1", play=True)
   runner = checkpoint_config(checkpoint)
   camera_cfg = walking_camera(runner.camera_profile) if runner.depth_fusion != "none" else None
@@ -50,11 +53,12 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
         raise ValueError(f"Motion checksum differs for {clip['path']}")
   cfg.scene.spec_fn = WalkTerrain(0.0)
   if rough_seed is not None:
-    from supermimic.tasks.terrain_reset import TerrainResetMotionCommandCfg
-
     cfg.scene.spec_fn = IrregularWalkTerrain(height=0.09 * rough_scale, lateral_height=0.04 * rough_scale, landscape_seed=rough_seed)
     cfg.scene.env_spacing = 0.0
-    cfg.commands["motion"] = TerrainResetMotionCommandCfg.from_motion(cfg.commands["motion"])
+    if not direct_reference:
+      from supermimic.tasks.terrain_reset import TerrainResetMotionCommandCfg
+
+      cfg.commands["motion"] = TerrainResetMotionCommandCfg.from_motion(cfg.commands["motion"])
     cfg.sim.mujoco.iterations = cfg.sim.mujoco.ls_iterations = 60
   if runner.flat_depth_arm is not None:
     cfg.scene.env_spacing = 0.0
@@ -187,7 +191,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     history = None
     slip_distance = torch.zeros_like(xy_error)
     stance_time = torch.zeros_like(xy_error)
-    measure_slip = (runner.flat_depth_arm is not None and rough_seed is None) or leg_ablation is not None or base_terrain is not None
+    measure_slip = (direct_reference or (runner.flat_depth_arm is not None and rough_seed is None)
+                    or leg_ablation is not None or base_terrain is not None)
     if measure_slip:
       foot_ids, _ = motion.robot.find_sites(["left_foot", "right_foot"])
       if len(foot_ids) != 2:
@@ -376,6 +381,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       motions=n,
       terrain_seed=rough_seed,
       rough_scale=rough_scale if rough_seed is not None else None,
+      direct_reference=direct_reference,
       leg_ablation=leg_ablation,
       base_terrain=base_terrain,
       starts_sha256=hashlib.sha256(starts_file.read_bytes()).hexdigest(),
@@ -398,15 +404,39 @@ if __name__ == "__main__":
   p.add_argument("--rough-seed", type=int, help="Evaluate all clips on an irregular 9/4 cm field")
   p.add_argument("--save-starts", action="store_true", help="Create a new paired start snapshot")
   p.add_argument("--rough-scale", type=float, default=1.0)
+  p.add_argument("--generated-reference-dir", type=Path,
+                 help="Evaluate checksum-verified terrain-adapted clips without a second root-height reset")
   p.add_argument("--leg-ablation", choices=("on", "off"))
   p.add_argument("--base-terrain", choices=("on", "off"), help="Measure or zero only the Actor terrain input")
   a = p.parse_args()
   if not np.isfinite(a.rough_scale) or a.rough_scale <= 0:
     p.error("rough-scale must be finite and positive")
+  protocol = json.loads(a.protocol.read_text())
+  if a.generated_reference_dir is not None:
+    manifest = json.loads((a.generated_reference_dir / "manifest.json").read_text())
+    if len(protocol["clips"]) != 40 or len(manifest["motion_clips"]) != 40:
+      raise ValueError("Expected a complete LAFAN40 generated reference set")
+    if a.rough_seed is not None or a.rough_scale != 1.0:
+      p.error("Generated references set their own terrain seed and scale")
+    a.rough_seed = int(manifest["terrain_seed"])
+    a.rough_scale = float(manifest["rough_scale"])
+    if not np.isfinite(a.rough_scale) or a.rough_scale <= 0:
+      raise ValueError("Generated terrain scale must be finite and positive")
+    for clip in protocol["clips"]:
+      name = Path(clip["path"]).stem
+      record = manifest["motion_clips"][name]
+      generated = a.generated_reference_dir / f"{name}.npz"
+      if (record["source_sha256"] != clip["sha256"] or
+          record["frames"] != clip["frames"] or
+          hashlib.sha256(generated.read_bytes()).hexdigest() != record["adapted_sha256"]):
+        raise ValueError(f"Generated reference does not match the protocol: {name}")
+      clip["path"] = str(generated.resolve())
+      clip["sha256"] = record["adapted_sha256"]
   result = evaluate(
-    a.checkpoint, json.loads(a.protocol.read_text()), a.starts, a.device,
+    a.checkpoint, protocol, a.starts, a.device,
     rough_seed=a.rough_seed, save_starts=a.save_starts,
     rough_scale=a.rough_scale, leg_ablation=a.leg_ablation, base_terrain=a.base_terrain,
+    direct_reference=a.generated_reference_dir is not None,
   )
   a.output.parent.mkdir(exist_ok=True, parents=True)
   a.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")

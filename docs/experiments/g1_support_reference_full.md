@@ -15,3 +15,5 @@
 服务器独立工作目录 `/root/gpufree-data/g1-support-main-code` 使用提交 `97f9cc03f6b2552b80959d22e3bff5d329cc07b2`，原实验工作目录未改动。单轮冒烟训练已完成并保存 checkpoint，确认 40 个动作、单帧本体输入、68 维参考目标和固定地形种子均被加载。
 
 从零训练配置：`--generated-reference-dir /root/gpufree-data/g1-support-lafan40-seed1701 --iterations 10000 --num-envs 2048 --batch 2048 --policy-batch 2048 --actor-input state1 --goal-width 68 --camera-profile instinct --cache-reference --official-backends --training-reference /root/gpufree-data/g1-rough-reference-5k/training-reference.json --seed 42`。日志为 `/root/gpufree-data/g1-support-train-10k.log`。这里的地形适配目标是由仿真真值预计算得到的特权参考，训练结果只检验其闭环跟踪效果；尚不能证明深度图本身能合成参考。
+
+闭环评估使用 `scripts/eval_scene_flat_regression.py CHECKPOINT docs/experiments/lafan40_seed42.json STARTS OUTPUT --generated-reference-dir /root/gpufree-data/g1-support-lafan40-seed1701 --save-starts`。评估器从生成清单核对 40 个文件的来源、长度和输出哈希，使用清单里的固定地形，直接回放已适配的参考，避免再次进行骨盆高度重置。汇总包含动作完成数、完成帧数、全身位置与关节误差、脚底支撑期滑动速度，以及每个动作的提前终止原因。用单动作、两步的本地回放检查了该路径可运行；正式 checkpoint 的 40 动作结果仍待训练完成后测量。
