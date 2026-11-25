@@ -32,10 +32,13 @@ from supermimic.tasks.walk_terrain import (
 
 @torch.inference_mode()
 def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save_starts=False,
-             rough_scale=1.0, leg_ablation=None, base_terrain=None):
+             rough_scale=1.0, leg_ablation=None, base_terrain=None,
+             camera_diagnostic=None, max_steps=None):
   cfg = load_env_cfg("SuperMimic-GenCoord-G1", play=True)
   runner = checkpoint_config(checkpoint)
   camera_cfg = walking_camera(runner.camera_profile) if runner.depth_fusion != "none" else None
+  if camera_diagnostic is not None and (camera_cfg is None or runner.camera_profile != "instinct"):
+    raise ValueError("Camera diagnostics require an Instinct camera checkpoint")
   if camera_cfg is not None or rough_seed is not None:
     cfg.scene.sensors = (*cfg.scene.sensors, camera_cfg or walking_camera())
   clips = protocol["clips"]
@@ -189,7 +192,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       landing_history = torch.zeros((5, n), device=device, dtype=torch.long)
       landings = torch.zeros_like(counts)
       failed_landings = torch.zeros_like(counts)
-    for t in range(max(frames)):
+    limit = max(frames) if max_steps is None else min(max_steps, max(frames))
+    for t in range(limit):
       if measure_slip:
         previous_stance_at_start = previous_stance
         feet = motion.robot.data.site_pos_w[:, foot_ids]
@@ -231,6 +235,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
           memory.update(data.distances, data.pos_w, data.quat_w)
         patch.bind(*patch.capture(memory))
         aux = representation.extract_aux_state(obs["full_state"])
+        if camera_diagnostic is not None:
+          camera_diagnostic.record(sim, camera, motion, future_feet, ground, patch, aux, active)
         td["depth_tokens"] = patch.tokens(aux)
         if rough_ref is None:
           td["future_feet"] = future_feet(motion.time_steps)
@@ -315,7 +321,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
         print(f"Frame {t}, {active.sum().item()} remaining", flush=True)
       if not active.any():
         break
-    if active.any():
+    if active.any() and limit == max(frames):
       raise RuntimeError("At least one reference did not reach an episode boundary")
     rows = [
       dict(
