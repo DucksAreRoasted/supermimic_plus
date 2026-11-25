@@ -33,7 +33,7 @@ from supermimic.tasks.walk_terrain import (
 @torch.inference_mode()
 def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save_starts=False,
              rough_scale=1.0, leg_ablation=None, base_terrain=None,
-             camera_diagnostic=None, max_steps=None):
+             camera_diagnostic=None, max_steps=None, rollout_probe=None):
   cfg = load_env_cfg("SuperMimic-GenCoord-G1", play=True)
   runner = checkpoint_config(checkpoint)
   camera_cfg = walking_camera(runner.camera_profile) if runner.depth_fusion != "none" else None
@@ -41,6 +41,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     raise ValueError("Camera diagnostics require an Instinct camera checkpoint")
   if camera_cfg is not None or rough_seed is not None:
     cfg.scene.sensors = (*cfg.scene.sensors, camera_cfg or walking_camera())
+  if rollout_probe is not None:
+    rollout_probe.configure(cfg)
   clips = protocol["clips"]
   for clip in clips:
     with open(clip["path"], "rb") as source:
@@ -162,6 +164,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       from supermimic.tasks.rough_reference import RoughFootReference
       rough_ref = (None if runner.rough_reference in ("off", "nominal") else
                    RoughFootReference(future_feet, runner.rough_reference, ground))
+    if rollout_probe is not None:
+      rollout_probe.bind(sim, motion, future_feet)
     if base_terrain is not None:
       grid_min, grid_max = ground.offsets.amin(0), ground.offsets.amax(0)
     active = torch.ones(n, dtype=torch.bool, device=device)
@@ -301,10 +305,15 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
                          if rough_seed is not None else rep.new_zeros(n, TerrainObservation.num_features))
       if runner.use_root_waypoints:
         td["root_waypoints"] = root_waypoints(obs["goal"])
+      if rollout_probe is not None:
+        rollout_probe.record(t, active)
+        rollout_probe.adapt(td, representation, motion.time_steps, aux)
       action = torch.where(active[:, None], actor(td), 0.0)
       obs, reward, terminated, truncated, _ = sim.step(action)
       ended = sim.termination_manager.get_term("motion_end")
       done = terminated | truncated
+      if rollout_probe is not None:
+        rollout_probe.record_end(t + 1, active, terminated)
       if camera_cfg is not None:
         memory.reset(done)
       for name, mask in reasons.items():
