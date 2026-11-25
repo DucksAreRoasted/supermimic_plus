@@ -9,11 +9,11 @@ from types import SimpleNamespace
 import mujoco
 import numpy as np
 import torch
+from probe_g1_terrain_reference import Clearance, collision_scene, poses_from_clip
 from scipy import sparse
 from scipy.optimize import lsq_linear
 from scipy.spatial.transform import Rotation
 
-from probe_g1_terrain_reference import Clearance, collision_scene, poses_from_clip
 from supermimic.tasks.rough_reference import RoughFootReference
 from supermimic.tasks.terrain_reference import TerrainLegReference
 
@@ -29,22 +29,26 @@ def geometry(adapter, poses):
   return tuple(map(np.stack, (ankles, rotations, soles)))
 
 
-def solve_window(adapter, poses, target, rotations, support):
+def solve_window(adapter, poses, target, rotations, support, *, root_xy=False):
   """Fit foot pose with joint bounds and temporal regularization on corrections."""
   model, data = adapter.model, adapter.data
-  addr = np.r_[2, adapter.qaddr.ravel()]
-  dofs = np.r_[2, adapter.daddr.ravel()]
+  root = np.array([0, 1, 2]) if root_xy else np.array([2])
+  addr = np.r_[root, adapter.qaddr.ravel()]
+  dofs = np.r_[root, adapter.daddr.ravel()]
   count, width = len(poses), len(addr)
   nominal = poses[:, addr]
   limit_lo, limit_hi = adapter.limits.reshape(-1, 2).T
-  lower = np.c_[np.full(count, -.06), np.minimum(limit_lo - nominal[:, 1:], 0.)]
-  upper = np.c_[np.full(count, .06), np.maximum(limit_hi - nominal[:, 1:], 0.)]
+  root_width = len(root)
+  root_limit = np.array([.025, .025, .06]) if root_xy else np.array([.06])
+  lower = np.c_[np.tile(-root_limit, (count, 1)), np.minimum(limit_lo - nominal[:, root_width:], 0.)]
+  upper = np.c_[np.tile(root_limit, (count, 1)), np.maximum(limit_hi - nominal[:, root_width:], 0.)]
   # Retain pre-existing violations, but permit only movement toward joint limits.
-  lower[:, 1:] = np.maximum(lower[:, 1:], -.25)
-  upper[:, 1:] = np.minimum(upper[:, 1:], .25)
-  penalty = sparse.diags(np.tile(np.r_[.6, np.full(width - 1, .035)], count))
+  lower[:, root_width:] = np.maximum(lower[:, root_width:], -.25)
+  upper[:, root_width:] = np.minimum(upper[:, root_width:], .25)
+  root_penalty = np.array([2., 2., .6]) if root_xy else np.array([.6])
+  penalty = sparse.diags(np.tile(np.r_[root_penalty, np.full(width - root_width, .035)], count))
   diff = sparse.diags([-np.ones(count - 1), np.ones(count - 1)], [0, 1], shape=(count - 1, count))
-  smooth = sparse.kron(diff, sparse.diags(np.r_[1., np.full(width - 1, .09)]))
+  smooth = sparse.kron(diff, sparse.diags(np.r_[np.ones(root_width), np.full(width - root_width, .09)]))
   corrected = poses.copy()
   pos_jac = np.zeros((3, model.nv))
   rot_jac = np.zeros_like(pos_jac)
