@@ -16,4 +16,14 @@
 
 从零训练配置：`--generated-reference-dir /root/gpufree-data/g1-support-lafan40-seed1701 --iterations 10000 --num-envs 2048 --batch 2048 --policy-batch 2048 --actor-input state1 --goal-width 68 --camera-profile instinct --cache-reference --official-backends --training-reference /root/gpufree-data/g1-rough-reference-5k/training-reference.json --seed 42`。日志为 `/root/gpufree-data/g1-support-train-10k.log`。这里的地形适配目标是由仿真真值预计算得到的特权参考，训练结果只检验其闭环跟踪效果；尚不能证明深度图本身能合成参考。
 
-闭环评估使用 `scripts/eval_scene_flat_regression.py CHECKPOINT docs/experiments/lafan40_seed42.json STARTS OUTPUT --generated-reference-dir /root/gpufree-data/g1-support-lafan40-seed1701 --save-starts`。评估器从生成清单核对 40 个文件的来源、长度和输出哈希，使用清单里的固定地形，直接回放已适配的参考，避免再次进行骨盆高度重置。汇总包含动作完成数、完成帧数、全身位置与关节误差、脚底支撑期滑动速度，以及每个动作的提前终止原因。用单动作、两步的本地回放检查了该路径可运行；正式 checkpoint 的 40 动作结果仍待训练完成后测量。
+闭环评估使用 `scripts/eval_scene_flat_regression.py CHECKPOINT docs/experiments/lafan40_seed42.json STARTS OUTPUT --generated-reference-dir /root/gpufree-data/g1-support-lafan40-seed1701 --save-starts`。评估器从生成清单核对 40 个文件的来源、长度和输出哈希，使用清单里的固定地形，直接回放已适配的参考，避免再次进行骨盆高度重置。汇总包含动作完成数、完成帧数、全身位置与关节误差、脚底支撑期滑动速度，以及每个动作的提前终止原因。正式结果和复跑差异记录如下。
+
+## 10K 闭环训练与参考消融
+
+固定地形参考的从零训练完成 10K 轮，2048 个环境，约 26 分钟；最终 checkpoint 在服务器训练目录的 `checkpoints/iter-010000`。第 5K 和 10K 轮用本地同一组起点回放 40 个动作，首次结果的完成数为 15 和 20，平均完成帧比例为 63.9% 和 71.8%，平均身体位置误差为 8.3 cm 和 5.8 cm，平均支撑期脚底速度为 0.183 和 0.155 m/s。最终训练奖励约 31–33，不能代替物理回放指标。
+
+评估的**运行间波动很大**：同一 10K Actor、同一适配参考、相同起点和校验值，40 环境 GPU 回放重跑的完成数从 20 变为 30。MuJoCo Warp 的随机种子接口本身注明物理仿真未完全确定。因而一次原始参考的 28/40、一次“18 个移动动作适配、22 个其他动作保留原版”的 24/40，不能证明某种参考稳定优于另一种。该混合版由 `scripts/compose_g1_support_reference.py` 构造，只用于消融；不作为训练定档。
+
+为降低长时程波动，在 `fightAndSports1_subject4`、`jumps1_subject1`、`jumps1_subject2`、`fallAndGetUp1_subject4` 的指定参考帧 900、1200、500、1100 上，分别用单环境 CPU 回放 300 步。相同配置的重复回放逐值一致，原始与完整适配都存活 4/4。按四段等权，原始参考的身体位置误差为 8.21 cm、脚底支撑期速度为 0.219 m/s；完整适配分别为 8.87 cm 和 0.178 m/s。适配参考消除了这四个完整动作超过 5 mm 的静态脚部穿地，并降低脚滑，但有约 0.66 cm 跟踪误差代价。这些是选中的开发窗口，不能外推为 40 动作总体因果效应。
+
+两个修正消融都未胜出：非移动动作保留 50% 几何修正时，40 个动作仍有 61192 帧脚部穿地超过 5 mm；`--swing-clearance-only` 仅在非支撑脚将穿地时修正，四个动作都保持 0 帧超过 5 mm 穿地，CPU 短窗口平均身体位置误差为 8.75 cm，但脚底速度回升至 0.222 m/s。故当前仍使用完整适配生成器；接下来的实验应优先验证视野递推与长期策略效果，并在新的参考算法上同时设立几何、跟踪和脚滑门槛。

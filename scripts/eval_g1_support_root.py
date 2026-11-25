@@ -16,7 +16,7 @@ from scipy.ndimage import gaussian_filter1d, median_filter
 from supermimic.tasks.terrain_reference import TerrainLegReference
 
 
-def adapt_window(adapter, original, height, fps=50.0):
+def adapt_window(adapter, original, height, fps=50.0, *, swing_clearance_only=False):
   ankles, rotations, soles = geometry(adapter, original)
   floor = height(soles[..., :2])
   clearance = (soles[..., 2] - floor).min(axis=(-1, -2))
@@ -27,6 +27,10 @@ def adapt_window(adapter, original, height, fps=50.0):
   # Preserve the nominal swing clearance while avoiding visible terrain collision.
   native_clearance = np.maximum(soles[..., 2].min(axis=(-1, -2)), 0.0)
   foot_lift = np.maximum(native_clearance - clearance, 0.0)
+  if swing_clearance_only:
+    # Flight and swing feet retain their mocap path unless the terrain would
+    # actually intersect the sole. Stance feet retain their native clearance.
+    foot_lift = np.where(support, foot_lift, np.maximum(0.005 - clearance, 0.0))
   target = ankles.copy()
   target[..., 2] += foot_lift
   weights = gaussian_filter1d(support.astype(float), 1.0, axis=0, mode="nearest")

@@ -17,7 +17,8 @@ def sha256(path):
   return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def adapt_clip(adapter, poses, height, fps, window=256, overlap=32):
+def adapt_clip(adapter, poses, height, fps, window=256, overlap=32, *,
+               swing_clearance_only=False):
   """Blend overlapping IK corrections so independently solved windows join smoothly."""
   if not 0 < overlap < window // 2:
     raise ValueError("Expected overlap below half the window")
@@ -37,7 +38,9 @@ def adapt_clip(adapter, poses, height, fps, window=256, overlap=32):
   for start in starts:
     stop = min(start + window, len(poses))
     source = poses[start:stop]
-    result, meta = adapt_window(adapter, source, height, fps)
+    result, meta = adapt_window(
+      adapter, source, height, fps, swing_clearance_only=swing_clearance_only
+    )
     delta = result["clearance_optimized"] - source
     ramp = np.ones(len(source))
     if start:
@@ -86,6 +89,8 @@ def main():
   parser.add_argument("--terrain-seed", type=int, default=1702)
   parser.add_argument("--rough-scale", type=float, default=0.25)
   parser.add_argument("--clip", help="Generate one named motion for an initial audit")
+  parser.add_argument("--swing-clearance-only", action="store_true",
+                      help="Preserve swing/flight ankle targets unless their soles would penetrate")
   parser.add_argument(
     "--replacement-dir",
     type=Path,
@@ -115,6 +120,7 @@ def main():
   manifest = dict(
     terrain_seed=args.terrain_seed,
     rough_scale=args.rough_scale,
+    swing_clearance_only=args.swing_clearance_only,
     generator_sha256=sha256(Path(__file__)),
     motion_clips={},
   )
@@ -133,7 +139,10 @@ def main():
       fields = dict(motion)
     poses = poses_from_clip(fields, np.arange(len(fields["joint_pos"])), model)
     fps = float(fields["fps"].item())
-    adapted, support_count = adapt_clip(adapter, poses, height, fps)
+    adapted, support_count = adapt_clip(
+      adapter, poses, height, fps,
+      swing_clearance_only=args.swing_clearance_only,
+    )
     adapted, repair_frames, peak_repair = repair_foot_collisions(adapter, adapted)
     joint = np.array(
       [
