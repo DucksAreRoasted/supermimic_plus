@@ -107,7 +107,12 @@ class DepthMemory:
     world = self.pos[:, None, :] + quat_apply(
       self.yaw[:, None, :].expand(-1, local.shape[1], -1), local
     )
-    frac = world[..., :2] / self.resolution
+    return self.at_world(world[..., :2].reshape(*shape, 2))
+
+  def at_world(self, world_xy, *, max_age=None):
+    """Query measured world XY using a maximum number of camera update ticks."""
+    shape = world_xy.shape[:-1]
+    frac = world_xy.reshape(len(self.z), -1, 2) / self.resolution
     base = frac.floor().long()
     corners = base[:, :, None, :] + base.new_tensor([[0, 0], [1, 0], [0, 1], [1, 1]])
     address = self._address(corners)
@@ -116,7 +121,7 @@ class DepthMemory:
       return board.gather(1, address.flatten(1)).view_as(address)
 
     known = (
-      (self.tick - gather(self.age) <= self.max_age)
+      (self.tick - gather(self.age) <= (self.max_age if max_age is None else max_age))
       & (gather(self.x) == corners[..., 0])
       & (gather(self.y) == corners[..., 1])
     )

@@ -41,12 +41,16 @@ def test_pinhole_ranges_reconstruct_slope_after_motion_and_expire():
     atol=0.007,
     rtol=0,
   )
+  world = torch.tensor([[[0.65, 0.12]], [[-0.12, 0.65]]])
+  assert memory.at_world(world, max_age=0)[1].all()
   # A point that just moved behind both virtual cameras is still in memory.
   moved = p + torch.tensor([[0.8, 0.0, 0.0], [0.0, 0.8, 0.0]])
   memory.update(torch.full_like(ranges, -1.0), moved, q)
   old, known = memory.at(query - torch.tensor([0.8, 0.0]))
   torch.testing.assert_close(old, z)
   assert known.all()
+  assert not memory.at_world(world, max_age=0)[1].any()
+  torch.testing.assert_close(memory.at_world(world)[0], old)
   memory.reset(torch.tensor([True, False]))
   _, known = memory.at(query - torch.tensor([0.8, 0.0]))
   assert known[:, 0].tolist() == [False, True]
