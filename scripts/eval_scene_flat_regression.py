@@ -105,12 +105,15 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     with np.load(starts_file) as saved:
       if (rough_seed is not None or "rough_seed" in saved) and int(saved["rough_seed"]) != (-1 if rough_seed is None else rough_seed):
         raise ValueError("Saved starts belong to a different terrain")
-      for key, states in [
-        ("qpos", sim.sim.data.qpos),
-        ("qvel", sim.sim.data.qvel),
-        ("frames", motion.time_steps),
-      ]:
-        np.testing.assert_array_equal(states.cpu(), saved[key], err_msg=key)
+      np.testing.assert_array_equal(motion.time_steps.cpu(), saved["frames"], err_msg="frames")
+      for key, states in (("qpos", sim.sim.data.qpos), ("qvel", sim.sim.data.qvel)):
+        # GPU reset arithmetic can vary by an ulp. Use the saved simulator state
+        # so every arm still starts from exactly the same position and velocity.
+        np.testing.assert_allclose(states.cpu(), saved[key], rtol=0, atol=1e-6, err_msg=key)
+        states.copy_(torch.as_tensor(saved[key], device=device))
+      sim.sim.forward()
+      sim.sim.sense()
+      motion.update_relative_body_poses()
       for key in ("full_state", "goal"):
         np.testing.assert_allclose(
           obs[key].cpu(), saved[key], rtol=0, atol=1e-6, err_msg=key
