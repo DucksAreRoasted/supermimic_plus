@@ -116,6 +116,11 @@ def train(args, clips, manifest, runner, initial):
   motion_cfg.motion_file = [c["path"] for c in clips]
   motion_cfg.sampling_mode = "uniform"
   motion_cfg.pose_range, motion_cfg.velocity_range, motion_cfg.joint_position_range = {}, {}, (0.0, 0.0)
+  if args.recovery_reset:
+    motion_cfg.pose_range = {"x": (-0.035, 0.035), "y": (-0.035, 0.035),
+                             "roll": (-0.12, 0.12), "pitch": (-0.12, 0.12)}
+    motion_cfg.velocity_range = {"x": (-0.3, 0.3), "y": (-0.3, 0.3),
+                                 "roll": (-0.3, 0.3), "pitch": (-0.3, 0.3)}
   cfg.commands["motion"] = motion_cfg
   cfg.rewards.update(
     online_stance_slip=RewardTermCfg(func=StanceSlip, weight=-args.slip_weight),
@@ -199,6 +204,8 @@ def main():
                         ("max-root-drift", 0.18)):
     parser.add_argument(f"--{name}", type=float, default=default)
   parser.add_argument("--device", default="cuda:0")
+  parser.add_argument("--recovery-reset", action="store_true",
+                      help="Perturb planar pelvis pose and velocity at training resets")
   args = parser.parse_args()
   if min(args.envs, args.steps, args.iterations, args.save_interval) < 1 or args.envs * args.steps % 4:
     parser.error("Need positive counts and a rollout batch divisible by four")
