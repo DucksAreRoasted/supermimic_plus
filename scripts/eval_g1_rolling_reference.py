@@ -21,6 +21,8 @@ from train_g1_online_terrain_ppo import CONTACTS, contact_config
 from supermimic.tasks.depth_mimic import DepthMemory, walking_camera
 from supermimic.tasks.terrain_reference import TerrainLegReference
 
+SCENES = {"forward": 9121, "return": 9518, "backward": 9587, "slow_backward": 11650}
+
 
 def digest(path):
   return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -32,9 +34,14 @@ class RollingReference:
   horizon = 50
   period = 4
 
-  def __init__(self, clip, enabled):
+  def __init__(self, clip, enabled, support_brake=False, blind_steps=0):
+    self.blind_steps = blind_steps
     self.clip = clip
     self.enabled = enabled
+    self.support_brake = support_brake
+    self.brake_target = None
+    self.release_count = 0
+    self.contact_ticks = np.zeros(2, dtype=int)
     self.trace = []
     self.plans = []
     self.phase = 0
@@ -55,12 +62,20 @@ class RollingReference:
     self.memory = DepthMemory(
       1, sim.device, sim.step_dt, walking_camera("instinct").pattern
     )
+    if self.support_brake:
+      # The simulator supplies local odometry on static terrain. Retain identity-
+      # tagged measured cells through a walking step and a subsequent reversal.
+      self.memory.max_age = round(2.0 / sim.step_dt)
+      self.memory.reset(torch.ones(1, device=sim.device, dtype=torch.bool))
     self.contacts = [sim.scene[k] for k in CONTACTS]
     order = [str(name).split("/")[-1] for name in self.contacts[0].primary_names]
     self.order = [order.index(f"{side}_ankle_roll_link") for side in ("left", "right")]
     self.robot = command.robot
     self.body_ids = self.robot.find_bodies(
       ["left_ankle_roll_link", "right_ankle_roll_link"], preserve_order=True
+    )[0]
+    self.sole_ids = self.robot.find_sites(
+      ["left_foot", "right_foot"], preserve_order=True
     )[0]
     model = sim.sim.mj_model
     self.ik = TerrainLegReference(model, None)
@@ -92,6 +107,9 @@ class RollingReference:
       .numpy()
       .astype(bool)
     )
+    self.pelvis = self.robot.data.root_link_pos_w[0].cpu().numpy() - self.origin
+    self.contact_ticks = np.where(self.contact, self.contact_ticks + 1, 0)
+    self.velocity = self.robot.data.root_link_lin_vel_w[0].cpu().numpy()
     self.actual = (
       self.robot.data.body_link_pos_w[0, self.body_ids].cpu().numpy() - self.origin
     )
@@ -132,6 +150,95 @@ class RollingReference:
     )
     return mode, z, recent
 
+  def shorter_landing(self, frame, foot):
+    support_xy = self.xyz[frame, 1 - foot, :2]
+    target_xy = self.xyz[frame, foot, :2]
+    direction = support_xy - target_xy
+    distance = np.linalg.norm(direction)
+    lengths = np.minimum([0.03, 0.06, 0.09], 0.35 * distance)
+    offsets = lengths[:, None] * direction / max(distance, 1e-6)
+    if self.support_brake:
+      # Also search the swing foot's actual approach line. Side-to-side
+      # shortening alone misses previously observed cells in front of a retreat.
+      approach = self.actual[foot, :2] - target_xy
+      travel = np.linalg.norm(approach)
+      along = approach / max(travel, 1e-6)
+      across = np.array([-along[1], along[0]])
+      offsets = np.vstack(
+        (
+          offsets,
+          [
+            length * along + lateral * across
+            for length in np.minimum([0.035, 0.07, 0.11, 0.15], 0.5 * travel)
+            for lateral in (0.0, -0.035, 0.035, -0.065, 0.065)
+          ],
+        )
+      )
+      offsets = offsets[np.argsort(np.linalg.norm(offsets, axis=1), kind="stable")]
+    candidates = np.zeros((len(offsets), 2, 2))
+    candidates[:, foot] = offsets
+    choices, heights, hits = self.query(np.repeat(frame, len(offsets)), candidates)
+    samples, mask = heights[:, foot], hits[:, foot]
+    span = np.where(mask, samples, -np.inf).max(1) - np.where(
+      mask, samples, np.inf
+    ).min(1)
+    viable = (choices[:, foot] > 0) & (span < 0.025)
+    if self.support_brake:
+      # Keep the swing foot on its own side and within its nominal reach.
+      left_axis = Rotation.from_quat(
+        self.raw[frame, 3:7], scalar_first=True
+      ).as_matrix()[:2, 1]
+      signed_width = (
+        (target_xy + offsets - support_xy) @ left_axis * (1 if foot == 0 else -1)
+      )
+      viable &= signed_width >= 0.09
+    known = np.flatnonzero(viable)
+    return offsets[known[0]] if len(known) else None
+
+  def apply_support_reference(self, poses, orientation, target):
+    # Keep both measured ankles planted. Advance the pelvis smoothly from the
+    # measured moving state toward the midpoint of the support segment.
+    if self.brake_target is None:
+      self.release_count = 0
+      self.brake_target = np.mean(self.anchors, axis=0)[:2]
+      self.brake_step = self.step
+      self.brake_velocity = self.velocity[:2].copy()
+      self.brake_pose = self.sim.sim.data.qpos[0].cpu().numpy().copy()
+      self.brake_pose[:3] -= self.origin
+      self.brake_feet = np.stack(self.anchors)
+      _, rotations, _ = geometry(self.ik, self.brake_pose[None])
+      self.brake_orientation = rotations[0]
+    # Starting IK from an airborne mocap pose can leave a planted foot above
+    # the ground at the joint correction bound. Seed from measured support.
+    elapsed = (self.step - self.brake_step + np.arange(len(poses))) * self.sim.step_dt
+    duration = 0.40
+    u = np.minimum(elapsed / duration, 1.0)[:, None]
+    blend = u * u * (3.0 - 2.0 * u)
+    poses[:] = self.brake_pose
+    # Keep planted joints reachable and limit the trunk attitude change.
+    # Only the roll/pitch from the moving capture are eased toward upright.
+    rot = Rotation.from_quat(self.brake_pose[3:7], scalar_first=True)
+    ypr = rot.as_euler("ZYX")
+    angles = np.tile(ypr, (len(poses), 1))
+    angles[:, 1:] -= blend * np.clip(ypr[1:], -0.12, 0.12)
+    poses[:, 3:7] = Rotation.from_euler("ZYX", angles).as_quat(scalar_first=True)
+
+    orientation[:] = self.brake_orientation
+    # A new physical touchdown defines a new support anchor after a recovery step.
+    for side, anchor in enumerate(self.anchors):
+      if anchor is not None and np.linalg.norm(anchor - self.brake_feet[side]) > 0.035:
+        self.brake_feet[side] = anchor
+    center = self.brake_feet.mean(0)[:2]
+    # Preserve the sagittal ankle-to-pelvis offset (the ankle sits behind
+    # the pressure center), without moving beyond a small support polygon.
+    center += np.clip(self.brake_pose[:2] - self.brake_target, -0.045, 0.045)
+    poses[:, :2] = (
+      (1.0 - blend) * self.brake_pose[:2]
+      + blend * center
+      + duration * u * (1.0 - u) ** 2 * self.brake_velocity
+    )
+    target[:] = self.brake_feet
+
   def replan(self):
     start = self.phase
     end = len(self.raw) - 1
@@ -140,9 +247,19 @@ class RollingReference:
     stance = self.support[ids]
     touchdowns = np.argwhere(stance[1:] & ~stance[:-1])
     landing = None
-    if len(touchdowns):
-      offset, foot = map(int, touchdowns[0])
-      landing = (offset + 1, foot)
+    # Once the expected foot has physically landed at that location, occlusion
+    # beneath the sole must not hold the phase at the same touchdown forever.
+    for offset, foot in touchdowns.tolist():
+      at = offset + 1
+      already_landed = (
+        self.support_brake
+        and at <= self.period
+        and self.contact_ticks[foot] >= 3
+        and np.linalg.norm(self.actual[foot, :2] - self.xyz[ids[at], foot, :2]) < 0.16
+      )
+      if not already_landed:
+        landing = (at, foot)
+        break
     stop = None
     shift = np.zeros((len(ids), 2, 2))
     decision = "no_touchdown_in_window"
@@ -154,24 +271,8 @@ class RollingReference:
       if observed == 0:
         # Shorten along the nominal step toward the other (support) foot, within
         # the small-perturbation range of leg IK. Check all candidate sole areas.
-        support_xy = self.xyz[ids[at], 1 - foot, :2]
-        target_xy = self.xyz[ids[at], foot, :2]
-        direction = support_xy - target_xy
-        distance = np.linalg.norm(direction)
-        lengths = np.minimum([0.03, 0.06, 0.09], 0.35 * distance)
-        offsets = lengths[:, None] * direction / max(distance, 1e-6)
-        candidates = np.zeros((len(offsets), 2, 2))
-        candidates[:, foot] = offsets
-        choices, heights, hits = self.query(
-          np.repeat(ids[at], len(offsets)), candidates
-        )
-        samples, mask = heights[:, foot], hits[:, foot]
-        span = np.where(mask, samples, -np.inf).max(1) - np.where(
-          mask, samples, np.inf
-        ).min(1)
-        known = np.flatnonzero((choices[:, foot] > 0) & (span < 0.025))
-        if len(known):
-          delta = offsets[known[0]]
+        delta = self.shorter_landing(ids[at], foot)
+        if delta is not None:
           # Keep the correction through stance and taper during the next swing.
           liftoff = np.flatnonzero(~stance[at:, foot])
           release = at + int(liftoff[0]) if len(liftoff) else len(ids)
@@ -194,6 +295,18 @@ class RollingReference:
             if stop == start
             else "finish_to_support"
           )
+    if self.support_brake and self.brake_target is not None:
+      # A dropped contact sample must not resume the moving mocap reference.
+      # Confirm a usable landing on two consecutive maps before releasing.
+      self.release_count = (
+        self.release_count + 1
+        if decision in ("shorten", "visible", "remembered", "no_touchdown_in_window")
+        else 0
+      )
+      if self.release_count < 2:
+        stop = start
+        shift.fill(0)
+        decision = "brake_hold"
     if stop is not None:
       ids = np.minimum(ids, stop)
       mode, z, valid = self.query(ids)
@@ -226,6 +339,15 @@ class RollingReference:
     root_dz = (lift * stance).sum(1) / stance.sum(1).clip(1)
     poses = src.copy()
     poses[:, 2] += gaussian_filter1d(root_dz, 2, mode="nearest").clip(-0.045, 0.045)
+    if (
+      self.support_brake
+      and stop == start
+      and (self.contact.all() or self.brake_target is not None)
+    ):
+      self.apply_support_reference(poses, orientation, target)
+      src = poses.copy()
+    elif stop != start:
+      self.brake_target = None
     # Bounded damped least squares on the two six-DoF legs. Keep upper body and root XY.
     m, d = self.ik.model, self.ik.data
     for i, pose in enumerate(poses):
@@ -301,7 +423,8 @@ class RollingReference:
     self.cache = xyz
 
   def adapt(self, obs, representation, motion_times, aux):
-    self.camera.observe(self.memory, aux, terrain_only=True)
+    if self.step >= self.blind_steps:
+      self.camera.observe(self.memory, aux, terrain_only=True)
     if self.enabled and self.step % self.period == 0:
       before = perf_counter()
       self.replan()
@@ -322,7 +445,13 @@ class RollingReference:
           self.cache[local + 4] if self.enabled else self.xyz[self.step + 4]
         ).tolist(),
         actual=self.actual.tolist(),
+        pelvis=self.pelvis.tolist(),
+        pelvis_velocity=self.velocity.tolist(),
         contact=self.contact.tolist(),
+        sole_xy_speed=self.robot.data.site_lin_vel_w[0, self.sole_ids, :2]
+        .norm(dim=-1)
+        .cpu()
+        .tolist(),
       )
     )
     if not self.enabled or self.stop is None or self.phase < self.stop:
@@ -337,6 +466,20 @@ def main():
   )
   p.add_argument("--output", type=Path, required=True)
   p.add_argument("--steps", type=int, default=100)
+  p.add_argument(
+    "--planner-blind-steps",
+    type=int,
+    default=0,
+    help="Suppress only planner camera updates at startup to test reacquisition",
+  )
+  p.add_argument(
+    "--scenes",
+    nargs="+",
+    choices=SCENES,
+    default=("forward", "return", "backward"),
+  )
+  p.add_argument("--seed", type=int, default=42)
+  p.add_argument("--terrain-seed", type=int, default=1715)
   p.add_argument("--device", default="cuda:0")
   args = p.parse_args()
   if args.motion.stem != "walk2_subject1":
@@ -347,6 +490,8 @@ def main():
     or manifest["max_iterations"] != 30000
   ):
     p.error("expected the 30K latent checkpoint")
+  if not 0 <= args.planner_blind_steps <= args.steps:
+    p.error("blind steps must be between zero and the evaluation horizon")
   if args.steps < 1:
     p.error("--steps must be positive")
   args.output.mkdir(parents=True, exist_ok=False)
@@ -356,11 +501,15 @@ def main():
     dirty=bool(subprocess.check_output(["git", "status", "--porcelain"])),
     actor_sha256=digest(args.checkpoint / "actor.pt"),
     source_sha256=digest(args.motion),
-    scene_seed=1715,
+    scene_seed=args.terrain_seed,
+    seed=args.seed,
+    planner_blind_steps=args.planner_blind_steps,
     rough_scale=0.45,
     steps=args.steps,
   )
-  for name, first in (("forward", 9121), ("return", 9518), ("backward", 9587)):
+  for name, first in SCENES.items():
+    if name not in args.scenes:
+      continue
     folder = args.output / name
     folder.mkdir()
     path = folder / args.motion.name
@@ -375,19 +524,24 @@ def main():
     clip["root_pos_w"][:, :2] -= clip["root_pos_w"][0, :2].copy()
     np.savez(path, **clip)
     protocol = dict(
-      seed=42,
+      seed=args.seed,
       clips=[dict(path=str(path), frames=length, local_start=0, sha256=digest(path))],
     )
     results[name] = {}
-    for arm in ("raw", "online"):
-      torch.manual_seed(42)
-      probe = RollingReference(path, arm == "online")
+    for arm in ("raw", "online", "support"):
+      torch.manual_seed(args.seed)
+      probe = RollingReference(
+        path,
+        arm != "raw",
+        support_brake=arm == "support",
+        blind_steps=args.planner_blind_steps,
+      )
       row = evaluate(
         args.checkpoint,
         protocol,
         folder / "starts.npz",
         args.device,
-        rough_seed=1715,
+        rough_seed=args.terrain_seed,
         rough_scale=0.45,
         save_starts=arm == "raw",
         max_steps=args.steps,
@@ -403,6 +557,22 @@ def main():
         last_phase=probe.trace[-1]["phase"],
         ankle_z_mae_cm=float(np.abs(error[..., 2]).mean()),
         ankle_xyz_mean_distance_cm=float(np.linalg.norm(error, axis=-1).mean()),
+      )
+      held = np.r_[False, np.diff([x["phase"] for x in probe.trace]) == 0]
+      contacts = np.array([x["contact"] for x in probe.trace])
+      pelvis_speed = np.linalg.norm(
+        [x["pelvis_velocity"][:2] for x in probe.trace], axis=1
+      )
+      sole_speed = np.array([x["sole_xy_speed"] for x in probe.trace])
+      results[name][arm].update(
+        held_steps=int(held.sum()),
+        terminal_pelvis_speed_400ms=float(pelvis_speed[-20:].mean()),
+        terminal_double_support_fraction_400ms=float(contacts[-20:].all(1).mean()),
+        double_support_held_steps=int((held & contacts.all(1)).sum()),
+        mean_held_pelvis_speed=float(pelvis_speed[held].mean()) if held.any() else None,
+        mean_contact_sole_speed=float(sole_speed[contacts].mean())
+        if contacts.any()
+        else None,
       )
       if len(actual) > 4:
         issued = np.array([x["four_step_reference"] for x in probe.trace[:-4]])
