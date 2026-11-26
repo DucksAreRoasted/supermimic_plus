@@ -62,7 +62,10 @@ class OnlineTerrainAdapter(nn.Module):
     nn.init.zeros_(self.net[-1].bias)
 
   def forward(self, features: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
-    delta = self.max_delta_rad * self.net(features).tanh()
+    return self.decode(self.net(features), visible)
+
+  def decode(self, logits: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
+    delta = self.max_delta_rad * logits.tanh()
     return torch.where(visible, delta, 0.0)
 
 
@@ -90,7 +93,7 @@ class OnlineTerrainActions:
     self.origins = sim.scene.env_origins
     self.patch = patch
 
-  def act(self, actor, obs, representation, frames, aux, active, step):
+  def policy_inputs(self, actor, obs, frames, aux):
     base_action = actor(obs)
     foot_terrain = (sample_future_foot_terrain(self.patch, obs["future_feet"], self.motion,
                                               frames, aux, self.origins)
@@ -98,9 +101,15 @@ class OnlineTerrainActions:
     features, visible = adapter_inputs(obs, base_action, foot_terrain)
     if self.mask_depth:
       visible = torch.zeros_like(visible)
-    delta = self.model(features, visible)
+    return base_action, features, visible
+
+  def apply_residual(self, base_action, delta, frames, aux):
     if self.max_root_drift is not None:
       reference_xy = self.motion.root_pos_w[frames, :2] + self.origins[:, :2]
       drift = (reference_xy - aux[:, :2]).norm(dim=-1, keepdim=True)
       delta = delta * tracking_gate(drift, self.max_root_drift)
     return base_action + delta / self.scale
+
+  def act(self, actor, obs, representation, frames, aux, active, step):
+    base, features, visible = self.policy_inputs(actor, obs, frames, aux)
+    return self.apply_residual(base, self.model(features, visible), frames, aux)
