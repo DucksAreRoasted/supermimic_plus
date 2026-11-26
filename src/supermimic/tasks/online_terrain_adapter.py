@@ -3,12 +3,13 @@
 import hashlib
 
 import torch
+from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, yaw_quat
 from torch import nn
 
 from supermimic.utils.helpers import extract_action_scale_offset
 
 
-def adapter_inputs(obs, base_action):
+def adapter_inputs(obs, base_action, foot_terrain=None):
   """Build features in the robot frame, without any adapted reference inputs."""
   depth = obs["depth_tokens"]
   visible = depth[..., 3:4] > 0.5
@@ -18,7 +19,23 @@ def adapter_inputs(obs, base_action):
   context = torch.cat(tuple(value.flatten(1) for value in (
     obs["goal_motion"], obs["history"], obs["future_feet"], base_action,
   )), dim=-1)
-  return torch.cat((context, terrain), dim=-1), visible.any(dim=1)
+  parts = (context, terrain) if foot_terrain is None else (context, terrain, foot_terrain.flatten(1))
+  return torch.cat(parts, dim=-1), visible.any(dim=1)
+
+
+def sample_future_foot_terrain(patch, feet, motion, frames, aux, origins):
+  """Query measured heights at nominal future feet and nearby sole points."""
+  position, forward, lateral = feet.split(3, dim=-1)
+  # Foot positions and axes initially share the current reference pelvis frame.
+  offsets = feet.new_tensor([[0, 0], [0.08, 0], [-0.08, 0], [0, 0.04], [0, -0.04]])
+  xy_forward, xy_lateral = offsets.split(1, dim=-1)
+  points = (position[..., None, :] + forward[..., None, :] * xy_forward
+            + lateral[..., None, :] * xy_lateral).flatten(1, 3)
+  reference_yaw = yaw_quat(motion.root_quat_w[frames])[:, None].expand(-1, points.shape[1], -1)
+  world = quat_apply(reference_yaw, points) + (motion.root_pos_w[frames] + origins)[:, None]
+  current_yaw = yaw_quat(aux[:, 3:7].contiguous())[:, None].expand_as(reference_yaw)
+  current = quat_apply_inverse(current_yaw, world - aux[:, None, :3])
+  return patch.sample(aux, current[..., :2])
 
 
 class OnlineTerrainAdapter(nn.Module):
@@ -56,15 +73,22 @@ class OnlineTerrainActions:
     self.model.load_state_dict(bundle["adapter"])
     self.model.eval()
     self.mask_depth = mask_depth
+    self.foot_context = bundle.get("foot_context", False)
 
-  def bind(self, sim, motion, runner):
+  def bind(self, sim, motion, runner, patch):
     self.scale, _ = extract_action_scale_offset(sim)
     if self.scale.shape[-1] != 29 or not (self.scale > 0).all():
       raise ValueError("Expected 29 joint targets with positive action scales")
+    self.motion = motion.motion
+    self.origins = sim.scene.env_origins
+    self.patch = patch
 
   def act(self, actor, obs, representation, frames, aux, active, step):
     base_action = actor(obs)
-    features, visible = adapter_inputs(obs, base_action)
+    foot_terrain = (sample_future_foot_terrain(self.patch, obs["future_feet"], self.motion,
+                                              frames, aux, self.origins)
+                    if self.foot_context else None)
+    features, visible = adapter_inputs(obs, base_action, foot_terrain)
     if self.mask_depth:
       visible = torch.zeros_like(visible)
     return base_action + self.model(features, visible) / self.scale

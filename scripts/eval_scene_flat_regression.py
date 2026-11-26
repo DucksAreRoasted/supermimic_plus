@@ -176,7 +176,7 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     if rollout_probe is not None:
       rollout_probe.bind(sim, motion, future_feet)
     if action_controller is not None:
-      action_controller.bind(sim, motion, runner)
+      action_controller.bind(sim, motion, runner, patch)
     if base_terrain is not None:
       grid_min, grid_max = ground.offsets.amin(0), ground.offsets.amax(0)
     active = torch.ones(n, dtype=torch.bool, device=device)

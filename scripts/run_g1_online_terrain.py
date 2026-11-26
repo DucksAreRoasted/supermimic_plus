@@ -13,7 +13,11 @@ from eval_scene_flat_regression import evaluate
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
 
 from supermimic.tasks.foot_depth_actor import FutureFeet
-from supermimic.tasks.online_terrain_adapter import OnlineTerrainAdapter, adapter_inputs
+from supermimic.tasks.online_terrain_adapter import (
+  OnlineTerrainAdapter,
+  adapter_inputs,
+  sample_future_foot_terrain,
+)
 
 
 def digest(path):
@@ -46,14 +50,15 @@ def paired_protocol(protocol, generated, names=None):
 
 
 class PairedActions:
-  def __init__(self, paths, mode, adapter=None, stride=2):
+  def __init__(self, paths, mode, adapter=None, stride=2, foot_context=False):
     self.paths = paths
     self.mode = mode
     self.adapter = adapter
     self.stride = stride
+    self.foot_context = foot_context
     self.samples = []
 
-  def bind(self, sim, motion, runner):
+  def bind(self, sim, motion, runner, patch):
     if runner.use_root_waypoints or not runner.pelvis_motion_goal or runner.rough_reference != "off":
       raise ValueError("Expected the fixed 30K Actor observation layout")
     self.raw = MotionLoader(self.paths, motion.motion.fk, device=sim.device)
@@ -61,6 +66,8 @@ class PairedActions:
         or not torch.equal(self.raw.motion_ends, motion.motion.motion_ends)):
       raise ValueError("Raw and adapted motion indices must match")
     self.raw_feet = FutureFeet(SimpleNamespace(motion=self.raw, cfg=motion.cfg))
+    self.origins = sim.scene.env_origins
+    self.patch = patch
     manager = sim.action_manager
     if len(manager.active_terms) != 1:
       raise ValueError("Expected one G1 joint position action term")
@@ -83,7 +90,10 @@ class PairedActions:
     if self.mode == "masked":
       # Mask only the new branch, preserving the pretrained Actor's input.
       raw_obs["depth_tokens"] = torch.zeros_like(raw_obs["depth_tokens"])
-    features, visible = adapter_inputs(raw_obs, base_action)
+    foot_terrain = (sample_future_foot_terrain(self.patch, raw_obs["future_feet"], self.raw,
+                                              frames, aux, self.origins)
+                    if self.foot_context else None)
+    features, visible = adapter_inputs(raw_obs, base_action, foot_terrain)
     correction = (self.adapter(features, visible) / self.scale
                   if self.adapter is not None else 0.0)
     if self.mode == "collect" and step % self.stride == 0:
@@ -147,6 +157,7 @@ def main():
   parser.add_argument("--max-delta-rad", type=float, default=0.12)
   parser.add_argument("--seed", type=int, default=42)
   parser.add_argument("--weights", type=Path, help="Evaluate a saved student on a different terrain")
+  parser.add_argument("--foot-context", action="store_true", help="Sample terrain at future nominal sole positions")
   parser.add_argument("--train-only", action="store_true")
   args = parser.parse_args()
   if bool(args.rounds) == bool(args.weights):
@@ -157,6 +168,8 @@ def main():
     parser.error("Steps, stride, epochs, and maximum residual must be positive")
   if args.train_only and not args.rounds:
     parser.error("--train-only requires --rounds")
+  if args.foot_context and args.weights:
+    parser.error("Evaluation reads the foot context setting from the checkpoint")
   if args.train_terrain and (args.rounds < len(args.train_terrain) + 1 or args.starts):
     parser.error("Training terrains require at least one round each and independent starts")
   torch.manual_seed(args.seed)
@@ -179,12 +192,13 @@ def main():
     config=config,
   )
   write_json(args.output / "run_manifest.json", manifest)
+  foot_context = args.foot_context
 
   def replay(mode, adapter=None, terrain_index=0):
     protocol, paths, seed, scale = terrains[terrain_index]
     snapshot = "starts.npz" if terrain_index == 0 else f"starts-terrain-{terrain_index + 1}.npz"
     starts = args.starts or args.output / snapshot
-    controller = PairedActions(paths, mode, adapter, args.stride)
+    controller = PairedActions(paths, mode, adapter, args.stride, foot_context)
     result = evaluate(
       args.checkpoint, protocol, starts, args.device,
       rough_seed=seed, rough_scale=scale, save_starts=not starts.exists(),
@@ -206,7 +220,7 @@ def main():
     fit(model, optimizer, datasets, args.epochs, args.device)
     torch.save(dict(
       adapter=model.state_dict(), input_dim=input_dim, max_delta_rad=args.max_delta_rad,
-      actor_sha256=actor_hash, train_manifest=manifest, round=index + 1,
+      actor_sha256=actor_hash, train_manifest=manifest, round=index + 1, foot_context=foot_context,
     ), args.output / f"student-{index + 1}.pt")
   if args.train_only:
     return
@@ -217,6 +231,7 @@ def main():
     model = OnlineTerrainAdapter(bundle["input_dim"], 29, bundle["max_delta_rad"]).to(args.device)
     model.load_state_dict(bundle["adapter"])
     model.eval()
+    foot_context = bundle.get("foot_context", False)
   for arm in ("teacher", "raw", "student", "masked"):
     result, _ = replay(arm, model)
     write_json(args.output / f"{arm}.json", result)

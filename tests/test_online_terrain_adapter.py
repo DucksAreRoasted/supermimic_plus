@@ -1,6 +1,13 @@
+from math import sqrt
+from types import SimpleNamespace
+
 import torch
 
-from supermimic.tasks.online_terrain_adapter import OnlineTerrainAdapter, adapter_inputs
+from supermimic.tasks.online_terrain_adapter import (
+  OnlineTerrainAdapter,
+  adapter_inputs,
+  sample_future_foot_terrain,
+)
 
 
 def test_unknown_cells_keep_their_visibility_and_ignore_stale_heights():
@@ -29,3 +36,15 @@ def test_residual_starts_at_zero_and_stays_zero_without_depth():
   assert correction[0].abs().min() > 0
   assert correction[0].abs().max() <= 0.12
   torch.testing.assert_close(correction[1], torch.zeros(29), rtol=0, atol=0)
+
+
+def test_future_sole_samples_use_reference_heading_and_robot_position():
+  heading = sqrt(0.5)
+  motion = SimpleNamespace(root_quat_w=torch.tensor([[heading, 0.0, 0.0, heading]]),
+                           root_pos_w=torch.tensor([[1.0, 2.0, 0.0]]))
+  feet = torch.tensor([[[[1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]]]])
+  aux = torch.tensor([[2.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
+  patch = SimpleNamespace(sample=lambda root, xy: xy)
+  samples = sample_future_foot_terrain(patch, feet, motion, torch.tensor([0]), aux, torch.zeros(1, 3))
+  expected = torch.tensor([[[-1.0, 2.0], [-1.0, 2.08], [-1.0, 1.92], [-1.04, 2.0], [-0.96, 2.0]]])
+  torch.testing.assert_close(samples, expected)
