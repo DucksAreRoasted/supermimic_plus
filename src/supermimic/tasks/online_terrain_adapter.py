@@ -38,6 +38,12 @@ def sample_future_foot_terrain(patch, feet, motion, frames, aux, origins):
   return patch.sample(aux, current[..., :2])
 
 
+def tracking_gate(drift: torch.Tensor, limit_m: float) -> torch.Tensor:
+  """Smoothly hand control back to the tracking policy as planar drift grows."""
+  progress = (2.0 * drift / limit_m - 1.0).clamp(0.0, 1.0)
+  return 1.0 - progress.square() * (3.0 - 2.0 * progress)
+
+
 class OnlineTerrainAdapter(nn.Module):
   """Learn a bounded residual in PD target units (radians)."""
 
@@ -63,7 +69,7 @@ class OnlineTerrainAdapter(nn.Module):
 class OnlineTerrainActions:
   """Apply a saved student to an ordinary raw-reference MuJoCo rollout."""
 
-  def __init__(self, weights, actor_path, device, *, mask_depth=False):
+  def __init__(self, weights, actor_path, device, *, mask_depth=False, max_root_drift=None):
     bundle = torch.load(weights, map_location=device, weights_only=True)
     with actor_path.open("rb") as source:
       actor_hash = hashlib.file_digest(source, "sha256").hexdigest()
@@ -73,6 +79,7 @@ class OnlineTerrainActions:
     self.model.load_state_dict(bundle["adapter"])
     self.model.eval()
     self.mask_depth = mask_depth
+    self.max_root_drift = max_root_drift
     self.foot_context = bundle.get("foot_context", False)
 
   def bind(self, sim, motion, runner, patch):
@@ -91,4 +98,9 @@ class OnlineTerrainActions:
     features, visible = adapter_inputs(obs, base_action, foot_terrain)
     if self.mask_depth:
       visible = torch.zeros_like(visible)
-    return base_action + self.model(features, visible) / self.scale
+    delta = self.model(features, visible)
+    if self.max_root_drift is not None:
+      reference_xy = self.motion.root_pos_w[frames, :2] + self.origins[:, :2]
+      drift = (reference_xy - aux[:, :2]).norm(dim=-1, keepdim=True)
+      delta = delta * tracking_gate(drift, self.max_root_drift)
+    return base_action + delta / self.scale

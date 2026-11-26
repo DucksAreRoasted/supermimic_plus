@@ -7,6 +7,7 @@ from supermimic.tasks.online_terrain_adapter import (
   OnlineTerrainAdapter,
   adapter_inputs,
   sample_future_foot_terrain,
+  tracking_gate,
 )
 
 
@@ -48,3 +49,8 @@ def test_future_sole_samples_use_reference_heading_and_robot_position():
   samples = sample_future_foot_terrain(patch, feet, motion, torch.tensor([0]), aux, torch.zeros(1, 3))
   expected = torch.tensor([[[-1.0, 2.0], [-1.0, 2.08], [-1.0, 1.92], [-1.04, 2.0], [-0.96, 2.0]]])
   torch.testing.assert_close(samples, expected)
+
+
+def test_tracking_gate_fades_out_as_planar_error_increases():
+  errors = torch.tensor([0, 0.09, 0.135, 0.18, 0.3])
+  torch.testing.assert_close(tracking_gate(errors, 0.18), torch.tensor([1, 1, 0.5, 0, 0]))

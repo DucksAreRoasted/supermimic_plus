@@ -420,6 +420,8 @@ if __name__ == "__main__":
   p.add_argument("--base-terrain", choices=("on", "off"), help="Measure or zero only the Actor terrain input")
   p.add_argument("--online-student-weights", type=Path, help="Apply a trained student to raw motion clips")
   p.add_argument("--mask-online-depth", action="store_true", help="Disable the new residual using its depth mask")
+  p.add_argument("--max-online-root-drift", type=float,
+                 help="Fade out the learned residual from half this planar error to this limit, in meters")
   p.add_argument("--max-steps", type=int, help="Limit the evaluation horizon for each clip")
   a = p.parse_args()
   if not np.isfinite(a.rough_scale) or a.rough_scale <= 0:
@@ -428,6 +430,9 @@ if __name__ == "__main__":
     p.error("max-steps must be positive")
   if a.mask_online_depth and a.online_student_weights is None:
     p.error("mask-online-depth requires online-student-weights")
+  if a.max_online_root_drift is not None and (a.online_student_weights is None or
+      not np.isfinite(a.max_online_root_drift) or a.max_online_root_drift <= 0):
+    p.error("max-online-root-drift requires student weights and a finite positive limit")
   if a.online_student_weights is not None and a.generated_reference_dir is not None:
     p.error("Online evaluation uses raw clips, without generated references")
   protocol = json.loads(a.protocol.read_text())
@@ -456,7 +461,8 @@ if __name__ == "__main__":
     from supermimic.tasks.online_terrain_adapter import OnlineTerrainActions
 
     controller = OnlineTerrainActions(a.online_student_weights, a.checkpoint / "actor.pt", a.device,
-                                      mask_depth=a.mask_online_depth)
+                                      mask_depth=a.mask_online_depth,
+                                      max_root_drift=a.max_online_root_drift)
   result = evaluate(
     a.checkpoint, protocol, a.starts, a.device,
     rough_seed=a.rough_seed, save_starts=a.save_starts,
@@ -468,6 +474,7 @@ if __name__ == "__main__":
     with a.online_student_weights.open("rb") as source:
       result["online_student_sha256"] = hashlib.file_digest(source, "sha256").hexdigest()
     result["online_depth_masked"] = a.mask_online_depth
+    result["max_online_root_drift_m"] = a.max_online_root_drift
   a.output.parent.mkdir(exist_ok=True, parents=True)
   a.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
   print(result["completed"], result["means"])
