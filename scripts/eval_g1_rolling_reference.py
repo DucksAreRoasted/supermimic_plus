@@ -47,6 +47,7 @@ class RollingReference:
     self.phase = 0
     self.stop = None
     self.anchors = [None, None]
+    self.pivots = [None, None]
     self.last = None
 
   def configure(self, cfg):
@@ -90,6 +91,16 @@ class RollingReference:
       model.jnt_qposadr[model.joint("robot/" + n).id] for n in self.ref.fk.joint_names
     ]
     self.xyz, self.rot, soles = geometry(self.ik, self.raw)
+    # Preserve the mocap ankle arc about the planted sole's lowest material point.
+    # The ankle itself moves during heel strike and toe off.
+    contact_points = soles.reshape(len(soles), 2, -1, 3)
+    self.clearance = contact_points[..., 2].min(-1)
+    lowest = contact_points[..., 2].argmin(axis=2)
+    world_points = np.take_along_axis(
+      contact_points, lowest[..., None, None], axis=2
+    ).squeeze(2)
+    self.sole_offsets = np.einsum("tfji,tfj->tfi", self.rot, world_points - self.xyz)
+
     self.support = (soles[..., 2].min(axis=(-1, -2)) < 0.035) & (
       np.linalg.norm(np.gradient(self.xyz, axis=0), axis=-1) / sim.step_dt < 0.45
     )
@@ -118,6 +129,26 @@ class RollingReference:
         self.anchors[foot] = None
       elif self.anchors[foot] is None:
         self.anchors[foot] = self.actual[foot].copy()
+        if self.support_brake:
+          lever = self.sole_offsets[self.phase, foot]
+          quat = self.robot.data.body_link_quat_w[0, self.body_ids[foot]].cpu().numpy()
+          pivot = self.actual[foot] + Rotation.from_quat(quat, scalar_first=True).apply(
+            lever
+          )
+          # Root tracking error can exceed the leg correction bound. Anchor in
+          # the nominal footprint neighborhood rather than twisting the stance
+          # leg to absorb the full horizontal odometry-to-reference discrepancy.
+          reference = self.xyz[self.phase, foot] + self.rot[self.phase, foot] @ lever
+          delta = pivot[:2] - reference[:2]
+          future = min(self.phase + 10, len(self.raw) - 1)
+          travel = self.raw[future, :2] - self.raw[self.phase, :2]
+          speed = np.linalg.norm(travel) / (10 * self.sim.step_dt)
+          # Faster strides provide a shorter stance interval for correction.
+          limit = np.clip(0.045 / max(speed, 0.25), 0.025, 0.12)
+          pivot[:2] = reference[:2] + delta * min(
+            1.0, limit / max(np.linalg.norm(delta), 1e-8)
+          )
+          self.pivots[foot] = pivot, lever
 
   def record_end(self, step, active, terminated):
     pass
@@ -317,6 +348,14 @@ class RollingReference:
     target[..., :2] += shift
     floor = np.where(valid, z, -np.inf).max(-1)
     lift = np.where(mode > 0, np.clip(floor, -0.05, 0.07), 0.0)
+    if self.support_brake:
+      # Mid-swing already has clearance. Taper the landing height correction as
+      # nominal clearance rises, keeping a 12 mm measured-obstacle margin.
+      gap = self.clearance[ids]
+      near = np.clip(1.0 - np.maximum(gap, 0.0) / 0.045, 0.0, 1.0)
+      required = np.maximum(lift + 0.012 - gap, 0.0)
+      swing = np.maximum(lift * near, np.minimum(lift, required))
+      lift = np.where(stance, lift, swing)
     # Unknown swing samples keep nominal clearance; no zero-height observation enters IK.
     target[..., 2] += lift
     orientation = self.rot[ids].copy()
@@ -336,6 +375,11 @@ class RollingReference:
       if self.anchors[foot] is not None and stance[0, foot]:
         planted = np.logical_and.accumulate(stance[:, foot])
         target[planted, foot] = self.anchors[foot]
+        if self.support_brake:
+          # A constant ankle in world coordinates overconstrains toe-off. Keep
+          # the pivot fixed and let the ankle follow the reference orientation.
+          pivot, lever = self.pivots[foot]
+          target[planted, foot] = pivot - orientation[planted, foot] @ lever
     root_dz = (lift * stance).sum(1) / stance.sum(1).clip(1)
     poses = src.copy()
     poses[:, 2] += gaussian_filter1d(root_dz, 2, mode="nearest").clip(-0.045, 0.045)
