@@ -34,7 +34,7 @@ from supermimic.tasks.walk_terrain import (
 def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save_starts=False,
              rough_scale=1.0, leg_ablation=None, base_terrain=None,
              camera_diagnostic=None, max_steps=None, rollout_probe=None,
-             direct_reference=False):
+             direct_reference=False, action_controller=None):
   if direct_reference and rough_seed is None:
     raise ValueError("A generated terrain reference requires its fixed terrain seed")
   cfg = load_env_cfg("SuperMimic-GenCoord-G1", play=True)
@@ -42,6 +42,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
   camera_cfg = walking_camera(runner.camera_profile) if runner.depth_fusion != "none" else None
   if camera_diagnostic is not None and (camera_cfg is None or runner.camera_profile != "instinct"):
     raise ValueError("Camera diagnostics require an Instinct camera checkpoint")
+  if action_controller is not None and (camera_cfg is None or not direct_reference):
+    raise ValueError("Paired action evaluation requires measured depth and matched references")
   if camera_cfg is not None or rough_seed is not None:
     cfg.scene.sensors = (*cfg.scene.sensors, camera_cfg or walking_camera())
   if rollout_probe is not None:
@@ -170,6 +172,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
                    RoughFootReference(future_feet, runner.rough_reference, ground))
     if rollout_probe is not None:
       rollout_probe.bind(sim, motion, future_feet)
+    if action_controller is not None:
+      action_controller.bind(sim, motion, runner)
     if base_terrain is not None:
       grid_min, grid_max = ground.offsets.amin(0), ground.offsets.amax(0)
     active = torch.ones(n, dtype=torch.bool, device=device)
@@ -313,7 +317,9 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
       if rollout_probe is not None:
         rollout_probe.record(t, active)
         rollout_probe.adapt(td, representation, motion.time_steps, aux)
-      action = torch.where(active[:, None], actor(td), 0.0)
+      action = (actor(td) if action_controller is None else
+                action_controller.act(actor, td, representation, motion.time_steps, aux, active, t))
+      action = torch.where(active[:, None], action, 0.0)
       obs, reward, terminated, truncated, _ = sim.step(action)
       ended = sim.termination_manager.get_term("motion_end")
       done = terminated | truncated
