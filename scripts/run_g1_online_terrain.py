@@ -140,6 +140,8 @@ def main():
   parser.add_argument("--starts", type=Path, help="Reuse a matched snapshot for every arm")
   parser.add_argument("--steps", type=int)
   parser.add_argument("--rounds", type=int, default=0, help="Collect and fit this many rounds before evaluating")
+  parser.add_argument("--train-terrain", action="append", type=Path, default=[],
+                      help="Additional generated terrain to alternate between collection rounds")
   parser.add_argument("--epochs", type=int, default=5)
   parser.add_argument("--stride", type=int, default=2)
   parser.add_argument("--max-delta-rad", type=float, default=0.12)
@@ -155,23 +157,33 @@ def main():
     parser.error("Steps, stride, epochs, and maximum residual must be positive")
   if args.train_only and not args.rounds:
     parser.error("--train-only requires --rounds")
+  if args.train_terrain and (args.rounds < len(args.train_terrain) + 1 or args.starts):
+    parser.error("Training terrains require at least one round each and independent starts")
   torch.manual_seed(args.seed)
-  protocol, paths, seed, scale = paired_protocol(
-    json.loads(args.protocol.read_text()), args.generated, args.motion,
-  )
+  original = json.loads(args.protocol.read_text())
+  terrains = [paired_protocol(original, path, args.motion)
+              for path in (args.generated, *args.train_terrain)]
   args.output.mkdir(parents=True, exist_ok=False)
-  starts = args.starts or args.output / "starts.npz"
   actor_hash = digest(args.checkpoint / "actor.pt")
+  def json_path(value):
+    return str(value) if isinstance(value, Path) else value
+
+  config = {key: json_path(value) for key, value in vars(args).items()}
+  config["train_terrain"] = [str(path) for path in args.train_terrain]
   manifest = dict(
     commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-    actor_sha256=actor_hash, terrain_seed=seed, rough_scale=scale,
-    generated_manifest_sha256=digest(args.generated / "manifest.json"),
-    protocol_sha256=digest(args.protocol), clips=[Path(path).stem for path in paths],
-    config={key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+    actor_sha256=actor_hash, protocol_sha256=digest(args.protocol),
+    clips=[Path(path).stem for path in terrains[0][1]],
+    terrains=[dict(seed=seed, scale=scale, manifest_sha256=digest(path / "manifest.json"))
+              for path, (_, _, seed, scale) in zip((args.generated, *args.train_terrain), terrains, strict=True)],
+    config=config,
   )
   write_json(args.output / "run_manifest.json", manifest)
 
-  def replay(mode, adapter=None):
+  def replay(mode, adapter=None, terrain_index=0):
+    protocol, paths, seed, scale = terrains[terrain_index]
+    snapshot = "starts.npz" if terrain_index == 0 else f"starts-terrain-{terrain_index + 1}.npz"
+    starts = args.starts or args.output / snapshot
     controller = PairedActions(paths, mode, adapter, args.stride)
     result = evaluate(
       args.checkpoint, protocol, starts, args.device,
@@ -183,7 +195,7 @@ def main():
   model = optimizer = None
   datasets = []
   for index in range(args.rounds):
-    result, samples = replay("collect", model)
+    result, samples = replay("collect", model, index % len(terrains))
     write_json(args.output / f"collection-{index + 1}.json", result)
     datasets.extend(samples)
     if model is None:
