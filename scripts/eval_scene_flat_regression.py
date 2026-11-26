@@ -42,8 +42,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
   camera_cfg = walking_camera(runner.camera_profile) if runner.depth_fusion != "none" else None
   if camera_diagnostic is not None and (camera_cfg is None or runner.camera_profile != "instinct"):
     raise ValueError("Camera diagnostics require an Instinct camera checkpoint")
-  if action_controller is not None and (camera_cfg is None or not direct_reference):
-    raise ValueError("Paired action evaluation requires measured depth and matched references")
+  if action_controller is not None and camera_cfg is None:
+    raise ValueError("The action controller requires measured depth")
   if camera_cfg is not None or rough_seed is not None:
     cfg.scene.sensors = (*cfg.scene.sensors, camera_cfg or walking_camera())
   if rollout_probe is not None:
@@ -198,7 +198,8 @@ def evaluate(checkpoint, protocol, starts_file, device, *, rough_seed=None, save
     history = None
     slip_distance = torch.zeros_like(xy_error)
     stance_time = torch.zeros_like(xy_error)
-    measure_slip = (direct_reference or (runner.flat_depth_arm is not None and rough_seed is None)
+    measure_slip = (direct_reference or action_controller is not None
+                    or (runner.flat_depth_arm is not None and rough_seed is None)
                     or leg_ablation is not None or base_terrain is not None)
     if measure_slip:
       foot_ids, _ = motion.robot.find_sites(["left_foot", "right_foot"])
@@ -417,9 +418,18 @@ if __name__ == "__main__":
                  help="Evaluate checksum-verified terrain-adapted clips without a second root-height reset")
   p.add_argument("--leg-ablation", choices=("on", "off"))
   p.add_argument("--base-terrain", choices=("on", "off"), help="Measure or zero only the Actor terrain input")
+  p.add_argument("--online-student-weights", type=Path, help="Apply a trained student to raw motion clips")
+  p.add_argument("--mask-online-depth", action="store_true", help="Disable the new residual using its depth mask")
+  p.add_argument("--max-steps", type=int, help="Limit the evaluation horizon for each clip")
   a = p.parse_args()
   if not np.isfinite(a.rough_scale) or a.rough_scale <= 0:
     p.error("rough-scale must be finite and positive")
+  if a.max_steps is not None and a.max_steps <= 0:
+    p.error("max-steps must be positive")
+  if a.mask_online_depth and a.online_student_weights is None:
+    p.error("mask-online-depth requires online-student-weights")
+  if a.online_student_weights is not None and a.generated_reference_dir is not None:
+    p.error("Online evaluation uses raw clips, without generated references")
   protocol = json.loads(a.protocol.read_text())
   if a.generated_reference_dir is not None:
     manifest = json.loads((a.generated_reference_dir / "manifest.json").read_text())
@@ -441,12 +451,23 @@ if __name__ == "__main__":
         raise ValueError(f"Generated reference does not match the protocol: {name}")
       clip["path"] = str(generated.resolve())
       clip["sha256"] = record["adapted_sha256"]
+  controller = None
+  if a.online_student_weights is not None:
+    from supermimic.tasks.online_terrain_adapter import OnlineTerrainActions
+
+    controller = OnlineTerrainActions(a.online_student_weights, a.checkpoint / "actor.pt", a.device,
+                                      mask_depth=a.mask_online_depth)
   result = evaluate(
     a.checkpoint, protocol, a.starts, a.device,
     rough_seed=a.rough_seed, save_starts=a.save_starts,
     rough_scale=a.rough_scale, leg_ablation=a.leg_ablation, base_terrain=a.base_terrain,
-    direct_reference=a.generated_reference_dir is not None,
+    direct_reference=a.generated_reference_dir is not None, max_steps=a.max_steps,
+    action_controller=controller,
   )
+  if controller is not None:
+    with a.online_student_weights.open("rb") as source:
+      result["online_student_sha256"] = hashlib.file_digest(source, "sha256").hexdigest()
+    result["online_depth_masked"] = a.mask_online_depth
   a.output.parent.mkdir(exist_ok=True, parents=True)
   a.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
   print(result["completed"], result["means"])
