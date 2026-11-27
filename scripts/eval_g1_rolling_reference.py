@@ -49,6 +49,7 @@ class RollingReference:
     self.anchors = [None, None]
     self.pivots = [None, None]
     self.last = None
+    self.use_window = enabled
 
   def configure(self, cfg):
     cfg.scene.sensors = (
@@ -466,19 +467,22 @@ class RollingReference:
     )
     self.cache = xyz
 
+  def observe_map(self, aux):
+    self.camera.observe(self.memory, aux, terrain_only=True)
+
   def adapt(self, obs, representation, motion_times, aux):
     if self.step >= self.blind_steps:
-      self.camera.observe(self.memory, aux, terrain_only=True)
+      self.observe_map(aux)
     if self.enabled and self.step % self.period == 0:
       before = perf_counter()
       self.replan()
       self.plans[-1]["planning_ms"] = (perf_counter() - before) * 1000
     local = self.step % self.period
-    if self.enabled:
+    if self.use_window:
       at = torch.full_like(motion_times, local)
       obs["goal_motion"] = representation.compute_wm_goal(self.ref, at, aux)[1]
       obs["future_feet"] = self.feet(at)
-    planned = self.cache[local] if self.enabled else self.xyz[self.step]
+    planned = self.cache[local] if self.use_window else self.xyz[self.step]
     self.trace.append(
       dict(
         step=self.step,
@@ -486,7 +490,7 @@ class RollingReference:
         nominal=self.xyz[self.phase].tolist(),
         reference=planned.tolist(),
         four_step_reference=(
-          self.cache[local + 4] if self.enabled else self.xyz[self.step + 4]
+          self.cache[local + 4] if self.use_window else self.xyz[self.step + 4]
         ).tolist(),
         actual=self.actual.tolist(),
         pelvis=self.pelvis.tolist(),
@@ -502,6 +506,104 @@ class RollingReference:
       self.phase = min(self.phase + 1, len(self.raw) - 1)
 
 
+class ProprioceptiveDepthMemory(DepthMemory):
+  """Exclude likely self returns using only link poses and measured range points."""
+
+  def update_cloud(self, cloud, valid, pos, quat):
+    # Conservative body envelopes may discard ground close to a foot. Those
+    # cells remain unknown; simulated ray-hit labels are never consulted.
+    near_link = torch.cdist(cloud, self.links).amin(dim=-1) < 0.13
+    super().update_cloud(cloud, valid & self.fresh[:, None] & ~near_link, pos, quat)
+
+
+class PhaseLockedReference(RollingReference):
+  """Correct the raw reference locally in height while keeping its clock and XY."""
+
+  def bind(self, sim, command, feet):
+    super().bind(sim, command, feet)
+    self.memory = ProprioceptiveDepthMemory(
+      1, sim.device, sim.step_dt, walking_camera("instinct").pattern
+    )
+    self.original = command.motion
+    # Small vertical corrections around each nominal leg pose. Precompute the
+    # damped task Jacobian response using only the supplied motion and G1 model.
+    self.response = np.empty((len(self.raw), 2, 6))
+    model, data = self.ik.model, self.ik.data
+    for i, pose in enumerate(self.raw):
+      data.qpos[:] = pose
+      mujoco.mj_kinematics(model, data)
+      mujoco.mj_comPos(model, data)
+      for side, ankle in enumerate(self.ik.ankles):
+        mujoco.mj_jacBody(model, data, self.ik.jpos, self.ik.jrot, ankle)
+        J = np.vstack((self.ik.jpos, 0.16 * self.ik.jrot))[:, self.ik.daddr[side]]
+        self.response[i, side] = np.linalg.solve(J.T @ J + 0.002 * np.eye(6), J[2])
+
+  def observe_map(self, aux):
+    self.memory.links = self.robot.data.body_link_pos_w
+    self.memory.fresh = self.camera.refresh_mask
+    self.camera.observe(self.memory, aux, terrain_only=False)
+
+  def replan(self):
+    ids = np.minimum(self.phase + np.arange(self.horizon), len(self.raw) - 1)
+    mode, z, valid = self.query(ids)
+    floor = np.where(valid, z, -np.inf).max(-1)
+    height = np.where(mode > 0, np.clip(floor, -0.05, 0.07), 0.0)
+    # A uniformly elevated support surface translates the body and both feet
+    # together. Only a measured height difference should flex the legs.
+    gap = np.maximum(self.clearance[ids], 0.0)
+    weight = (mode > 0) * np.exp(-gap / 0.035)
+    count = gaussian_filter1d(weight.sum(1), 3, mode="nearest")
+    weighted = gaussian_filter1d((weight * height).sum(1), 3, mode="nearest")
+    root = np.divide(weighted, np.maximum(count, 0.25)).clip(-0.045, 0.045)
+    relative = height - root[:, None]
+    near = np.clip(1.0 - gap / 0.045, 0.0, 1.0)
+    dz = np.maximum(
+      relative * near, np.minimum(relative, np.maximum(0.0, relative + 0.012 - gap))
+    )
+    dz = gaussian_filter1d(np.where(mode > 0, dz, 0.0), 1.5, axis=0, mode="nearest")
+    poses = self.raw[ids].copy()
+    poses[:, 2] += root
+    joint = self.ik.qaddr
+    dq = self.response[ids] * dz[..., None]
+    base = poses[:, joint]
+    poses[:, joint] = np.clip(
+      base + dq.clip(-0.18, 0.18),
+      np.minimum(base, self.ik.limits[..., 0]),
+      np.maximum(base, self.ik.limits[..., 1]),
+    )
+    if self.last is not None:
+      overlap = self.period
+      alpha = np.linspace(0, 1, overlap)[:, None]
+      poses[:overlap] = (
+        self.last[overlap : 2 * overlap] * (1 - alpha) + poses[:overlap] * alpha
+      )
+    self.last = poses.copy()
+    self.set_window(poses)
+    # Preserve the recorded velocities under an identity correction, including
+    # window edges, and add only the derivative of the changed pose.
+    frames = torch.as_tensor(ids, device=self.device)
+    delta = poses - self.raw[ids]
+    self.use_window = bool(np.max(np.abs(delta)) > 1e-8)
+    vel = np.gradient(delta, self.sim.step_dt, axis=0)
+    self.ref.joint_vel = self.original.joint_vel[frames] + torch.as_tensor(
+      vel[:, self.address], device=self.device, dtype=torch.float32
+    )
+    self.ref.root_lin_vel_w = self.original.root_lin_vel_w[frames] + torch.as_tensor(
+      vel[:, :3], device=self.device, dtype=torch.float32
+    )
+    self.plans.append(
+      dict(
+        step=self.step,
+        phase=self.phase,
+        current=int((mode == 2).sum()),
+        remembered=int((mode == 1).sum()),
+        unknown=int((mode == 0).sum()),
+        peak_root_m=float(abs(delta[:, 2]).max()),
+        peak_joint_rad=float(abs(delta[:, joint]).max()),
+      )
+    )
+
+
 def main():
   p = argparse.ArgumentParser(description=__doc__)
   p.add_argument("--checkpoint", type=Path, required=True)
@@ -509,6 +611,11 @@ def main():
     "--motion", type=Path, required=True, help="Raw walk2_subject1 LAFAN G1 clip"
   )
   p.add_argument("--output", type=Path, required=True)
+  p.add_argument(
+    "--fixed-phase-pair",
+    action="store_true",
+    help="Pair raw with depth-updated references at the original phase",
+  )
   p.add_argument("--steps", type=int, default=100)
   p.add_argument(
     "--planner-blind-steps",
@@ -550,6 +657,7 @@ def main():
     planner_blind_steps=args.planner_blind_steps,
     rough_scale=0.45,
     steps=args.steps,
+    fixed_phase_pair=args.fixed_phase_pair,
   )
   for name, first in SCENES.items():
     if name not in args.scenes:
@@ -572,9 +680,13 @@ def main():
       clips=[dict(path=str(path), frames=length, local_start=0, sha256=digest(path))],
     )
     results[name] = {}
-    for arm in ("raw", "online", "support"):
+    arms = (
+      ("raw", "fixed_phase") if args.fixed_phase_pair else ("raw", "online", "support")
+    )
+    for arm in arms:
       torch.manual_seed(args.seed)
-      probe = RollingReference(
+      planner = PhaseLockedReference if arm == "fixed_phase" else RollingReference
+      probe = planner(
         path,
         arm != "raw",
         support_brake=arm == "support",
@@ -623,6 +735,20 @@ def main():
         results[name][arm]["ankle_z_mae_4step_cm"] = float(
           np.abs(actual[4:, ..., 2] - issued[..., 2]).mean() * 100
         )
+      # Score every arm against the same raw XY at the same wall-clock frames.
+      xy = np.array([x["pelvis"][:2] for x in probe.trace])
+      desired = clip["root_pos_w"][: args.steps, :2]
+      checkpoints = np.unique(np.r_[np.arange(24, args.steps, 25), args.steps - 1])
+      reached = [
+        i < len(xy) and np.linalg.norm(xy[i] - desired[i]) <= 0.15 for i in checkpoints
+      ]
+      results[name][arm].update(
+        waypoints_reached=int(sum(reached)),
+        waypoints=len(checkpoints),
+        final_xy_arrived=bool(reached[-1]),
+        actual_xy_displacement_m=(xy[-1] - xy[0]).tolist(),
+        raw_xy_mae_m=float(np.linalg.norm(xy - desired[: len(xy)], axis=1).mean()),
+      )
       print(name, arm, results[name][arm], flush=True)
   (args.output / "summary.json").write_text(
     json.dumps(dict(metadata=metadata, scenes=results), indent=2)
