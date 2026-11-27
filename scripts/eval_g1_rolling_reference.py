@@ -490,7 +490,9 @@ class RollingReference:
         nominal=self.xyz[self.phase].tolist(),
         reference=planned.tolist(),
         four_step_reference=(
-          self.cache[local + 4] if self.use_window else self.xyz[self.step + 4]
+          self.cache[local + 4]
+          if self.use_window
+          else self.xyz[min(self.step + 4, len(self.xyz) - 1)]
         ).tolist(),
         actual=self.actual.tolist(),
         pelvis=self.pelvis.tolist(),
@@ -607,16 +609,19 @@ class PhaseLockedReference(RollingReference):
 def main():
   p = argparse.ArgumentParser(description=__doc__)
   p.add_argument("--checkpoint", type=Path, required=True)
-  p.add_argument(
-    "--motion", type=Path, required=True, help="Raw walk2_subject1 LAFAN G1 clip"
-  )
+  p.add_argument("--motion", type=Path, required=True, help="Raw LAFAN G1 clip")
   p.add_argument("--output", type=Path, required=True)
   p.add_argument(
     "--fixed-phase-pair",
     action="store_true",
     help="Pair raw with depth-updated references at the original phase",
   )
-  p.add_argument("--steps", type=int, default=100)
+  p.add_argument(
+    "--full-motion",
+    action="store_true",
+    help="Pair both arms from frame zero through the episode boundary",
+  )
+  p.add_argument("--steps", type=int)
   p.add_argument(
     "--planner-blind-steps",
     type=int,
@@ -633,7 +638,15 @@ def main():
   p.add_argument("--terrain-seed", type=int, default=1715)
   p.add_argument("--device", default="cuda:0")
   args = p.parse_args()
-  if args.motion.stem != "walk2_subject1":
+  if args.full_motion:
+    if args.steps is not None:
+      p.error("--full-motion uses the original clip length")
+    args.fixed_phase_pair = True
+    with np.load(args.motion) as src:
+      args.steps = len(src["joint_pos"])
+  elif args.steps is None:
+    args.steps = 100
+  if not args.full_motion and args.motion.stem != "walk2_subject1":
     p.error("scenario frame indices refer to walk2_subject1")
   manifest = json.loads((args.checkpoint / "run_manifest.json").read_text())
   if (
@@ -658,22 +671,27 @@ def main():
     rough_scale=0.45,
     steps=args.steps,
     fixed_phase_pair=args.fixed_phase_pair,
+    full_motion=args.full_motion,
   )
-  for name, first in SCENES.items():
-    if name not in args.scenes:
+  scenes = {args.motion.stem: 0} if args.full_motion else SCENES
+  for name, first in scenes.items():
+    if not args.full_motion and name not in args.scenes:
       continue
     folder = args.output / name
     folder.mkdir()
     path = folder / args.motion.name
     with np.load(args.motion) as src:
-      length = args.steps + RollingReference.horizon + 2
+      length = (
+        args.steps if args.full_motion else args.steps + RollingReference.horizon + 2
+      )
       if first + length > len(src["joint_pos"]):
         raise ValueError("Requested horizon extends past the source clip")
       clip = {
         k: (v[first : first + length].copy() if k not in ("joint_names", "fps") else v)
         for k, v in src.items()
       }
-    clip["root_pos_w"][:, :2] -= clip["root_pos_w"][0, :2].copy()
+    if not args.full_motion:
+      clip["root_pos_w"][:, :2] -= clip["root_pos_w"][0, :2].copy()
     np.savez(path, **clip)
     protocol = dict(
       seed=args.seed,
@@ -749,6 +767,12 @@ def main():
         actual_xy_displacement_m=(xy[-1] - xy[0]).tolist(),
         raw_xy_mae_m=float(np.linalg.norm(xy - desired[: len(xy)], axis=1).mean()),
       )
+      if args.full_motion:
+        if not results[name][arm]["termination_terms"]:
+          raise RuntimeError("Full motion ended without an episode boundary")
+        results[name][arm]["final_phase_fraction"] = probe.trace[-1]["phase"] / (
+          length - 1
+        )
       print(name, arm, results[name][arm], flush=True)
   (args.output / "summary.json").write_text(
     json.dumps(dict(metadata=metadata, scenes=results), indent=2)
